@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "drm-uapi/drm_fourcc.h"
 #include "util/u_debug.h"
 #include "vk_format.h"
 #include "vk_format_info.h"
@@ -370,7 +371,8 @@ rd_image_parameters(VkFormat format, VkImageType type, VkImageTiling tiling,
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
    if ((usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                  VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) &&
-       tiling != VK_IMAGE_TILING_OPTIMAL)
+         tiling != VK_IMAGE_TILING_OPTIMAL &&
+         tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return false;
    VkImageUsageFlags2KHR supported = rd_image_shader_usage(format);
    if ((flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) &&
@@ -400,7 +402,8 @@ rd_image_parameters(VkFormat format, VkImageType type, VkImageTiling tiling,
    }
    return rd_image_texel_size(format) &&
           (type == VK_IMAGE_TYPE_1D || type == VK_IMAGE_TYPE_2D || type == VK_IMAGE_TYPE_3D) &&
-          (tiling == VK_IMAGE_TILING_LINEAR || tiling == VK_IMAGE_TILING_OPTIMAL) &&
+          (tiling == VK_IMAGE_TILING_LINEAR || tiling == VK_IMAGE_TILING_OPTIMAL ||
+           tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) &&
           usage && !(usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                               VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | shader_usage)) &&
           !(flags & ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
@@ -427,6 +430,20 @@ rd_image_sample_counts(VkFormat format, VkImageType type, VkImageTiling tiling,
        !(flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
       samples |= VK_SAMPLE_COUNT_4_BIT;
    return samples;
+}
+
+static bool
+rd_drm_modifier_format_supported(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -484,6 +501,35 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
          properties->bufferFeatures = buffer;
       }
    }
+   VkFormatFeatureFlags2 modifier_features = flags2 | attachment;
+   VkDrmFormatModifierPropertiesListEXT *modifier_list =
+      vk_find_struct(out->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
+   if (modifier_list) {
+      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, modifier_out,
+                             modifier_list->pDrmFormatModifierProperties,
+                             &modifier_list->drmFormatModifierCount);
+      if (rd_drm_modifier_format_supported(format)) {
+         vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &modifier_out, mod) {
+            mod->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+            mod->drmFormatModifierPlaneCount = 1;
+            mod->drmFormatModifierTilingFeatures = modifier_features;
+         }
+      }
+   }
+   VkDrmFormatModifierPropertiesList2EXT *modifier_list2 =
+      vk_find_struct(out->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
+   if (modifier_list2) {
+      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, modifier_out,
+                             modifier_list2->pDrmFormatModifierProperties,
+                             &modifier_list2->drmFormatModifierCount);
+      if (rd_drm_modifier_format_supported(format)) {
+         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &modifier_out, mod) {
+            mod->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+            mod->drmFormatModifierPlaneCount = 1;
+            mod->drmFormatModifierTilingFeatures = modifier_features;
+         }
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -493,8 +539,18 @@ rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
    out->imageFormatProperties = (VkImageFormatProperties){0};
    const VkPhysicalDeviceExternalImageFormatInfo *external =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier_info =
+      vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+   if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+       (!modifier_info || modifier_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
+        !rd_drm_modifier_format_supported(info->format)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   const VkExternalMemoryHandleTypeFlags external_handles =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
    if (!rd_image_parameters(info->format, info->type, info->tiling, info->usage, info->flags) ||
-       (external && external->handleType))
+       (external && external->handleType &&
+        (info->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+         (external->handleType & ~external_handles))))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    uint32_t side = info->type == VK_IMAGE_TYPE_3D ? 256 : 4096;
    out->imageFormatProperties = (VkImageFormatProperties) {
@@ -509,10 +565,19 @@ rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
       out->imageFormatProperties.maxMipLevels = 1;
       out->imageFormatProperties.maxArrayLayers = 1;
    }
+   VkExternalMemoryProperties external_memory = {0};
+   if (external && external->handleType) {
+      external_memory = (VkExternalMemoryProperties) {
+         .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                                   VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+         .exportFromImportedHandleTypes = external_handles,
+         .compatibleHandleTypes = external_handles,
+      };
+   }
    vk_foreach_struct(sType, next, out->pNext) {
       if (sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES)
          ((VkExternalImageFormatProperties *)next)->externalMemoryProperties =
-            (VkExternalMemoryProperties){0};
+            external_memory;
    }
    return VK_SUCCESS;
 }
@@ -594,6 +659,39 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
    VK_FROM_HANDLE(rd_device, device, handle);
    *out = VK_NULL_HANDLE;
    VkImageCreateFlags2KHR flags = vk_image_create_flags(info);
+   const VkImageDrmFormatModifierListCreateInfoEXT *modifier_list =
+      vk_find_struct_const(info->pNext, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *modifier_explicit =
+      vk_find_struct_const(info->pNext, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+   uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+   if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      if (info->imageType != VK_IMAGE_TYPE_2D || info->samples != VK_SAMPLE_COUNT_1_BIT ||
+          info->mipLevels != 1 || info->arrayLayers != 1 ||
+          !rd_drm_modifier_format_supported(info->format) ||
+          (!!modifier_list == !!modifier_explicit))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+      if (modifier_list) {
+         if (!modifier_list->drmFormatModifierCount || !modifier_list->pDrmFormatModifiers)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+         for (uint32_t i = 0; i < modifier_list->drmFormatModifierCount; i++) {
+            if (modifier_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR) {
+               modifier = DRM_FORMAT_MOD_LINEAR;
+               break;
+            }
+         }
+      } else if (modifier_explicit->drmFormatModifier == DRM_FORMAT_MOD_LINEAR &&
+                 modifier_explicit->drmFormatModifierPlaneCount == 1 &&
+                 modifier_explicit->pPlaneLayouts) {
+         modifier = DRM_FORMAT_MOD_LINEAR;
+      }
+
+      if (modifier == DRM_FORMAT_MOD_INVALID)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   } else if (modifier_list || modifier_explicit) {
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+
    if (!rd_image_parameters(info->format, info->imageType, info->tiling,
                             vk_image_usage_flags(info), flags) ||
        (info->samples != VK_SAMPLE_COUNT_1_BIT && info->samples != VK_SAMPLE_COUNT_4_BIT) ||
@@ -620,15 +718,53 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    const VkExternalMemoryImageCreateInfo *external =
       vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-   if (external && external->handleTypes)
+   if (external && external->handleTypes &&
+       (modifier != DRM_FORMAT_MOD_LINEAR ||
+        (external->handleTypes & ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct rd_image *image = vk_image_create(&device->vk, info, allocator, sizeof(*image));
    if (!image)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   image->vk.drm_format_mod = modifier;
    image->texel_size = rd_image_texel_size(info->format);
    if (!rd_image_layout(image)) {
       vk_image_destroy(&device->vk, allocator, &image->vk);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   if (modifier_explicit) {
+      const VkSubresourceLayout *plane = &modifier_explicit->pPlaneLayouts[0];
+      const uint64_t row_bytes = (uint64_t)image->vk.extent.width * image->texel_size;
+      const uint64_t min_depth_pitch = (uint64_t)plane->rowPitch * image->vk.extent.height;
+      const uint64_t plane_size = plane->size ? plane->size : min_depth_pitch;
+      const uint64_t pitch_alignment = 1u << image->native_layout.pitchalign;
+      if (!plane->rowPitch || plane->rowPitch < row_bytes ||
+          plane->rowPitch > UINT32_MAX || plane->rowPitch % pitch_alignment ||
+          plane->offset % 64 || plane->offset > RD_IMAGE_MAX_SIZE ||
+          plane_size > RD_IMAGE_MAX_SIZE - plane->offset ||
+          (plane->size && plane->size < (uint64_t)plane->rowPitch * (image->vk.extent.height - 1) + row_bytes) ||
+          (plane->depthPitch && plane->depthPitch < min_depth_pitch)) {
+          if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+            fprintf(stderr, "radish: DRM plane rejected: modifier %llx extent %ux%u cpp %u offset %llu size %llu row %llu array %llu depth %llu min-row %llu min-depth %llu alignment %llu\n",
+                  (unsigned long long)modifier, image->vk.extent.width, image->vk.extent.height,
+                  image->texel_size, (unsigned long long)plane->offset,
+                  (unsigned long long)plane->size, (unsigned long long)plane->rowPitch,
+                  (unsigned long long)plane->arrayPitch, (unsigned long long)plane->depthPitch,
+                  (unsigned long long)row_bytes, (unsigned long long)min_depth_pitch,
+                  (unsigned long long)pitch_alignment);
+         vk_image_destroy(&device->vk, allocator, &image->vk);
+         return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+      }
+      struct rd_image_level *level = &image->levels[0];
+      level->offset = plane->offset;
+      level->row_pitch = plane->rowPitch;
+      level->depth_pitch = plane->depthPitch ? plane->depthPitch : min_depth_pitch;
+      level->array_pitch = plane->arrayPitch ? plane->arrayPitch : plane_size;
+      level->size = plane_size;
+      image->size = plane->offset + plane_size;
+      image->native_layout.pitch0 = plane->rowPitch;
+      image->native_layout.slices[0].size0 = level->depth_pitch;
+      image->native_layout.layer_size = level->array_pitch;
+      image->native_layout.size = image->size;
    }
    *out = rd_image_to_handle(image);
    return VK_SUCCESS;
@@ -737,7 +873,11 @@ rd_GetImageSubresourceLayout(VkDevice handle, VkImage image_handle,
 {
    VK_FROM_HANDLE(rd_image, image, image_handle);
    *out = (VkSubresourceLayout){0};
-   if (!subresource->aspectMask || (subresource->aspectMask & ~vk_format_aspects(image->vk.format)) ||
+   bool modifier_plane = image &&
+      image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+      subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;
+   if (!subresource->aspectMask ||
+       (!modifier_plane && (subresource->aspectMask & ~vk_format_aspects(image->vk.format))) ||
        (subresource->aspectMask & (subresource->aspectMask - 1)) ||
        subresource->mipLevel >= image->vk.mip_levels || subresource->arrayLayer >= image->vk.array_layers)
       return;

@@ -6,6 +6,8 @@
 #include "util/u_memory.h"
 #include "vk_util.h"
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <xf86drm.h>
 
@@ -14,11 +16,21 @@ rd_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice handle,
    const VkPhysicalDeviceExternalBufferInfo *info,
    VkExternalBufferProperties *properties)
 {
-   properties->externalMemoryProperties = (VkExternalMemoryProperties) {
-      .externalMemoryFeatures = 0,
-      .exportFromImportedHandleTypes = 0,
-      .compatibleHandleTypes = info->handleType,
-   };
+   VkExternalMemoryProperties memory = {0};
+   switch (info->handleType) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+      memory.externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                                      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+      memory.exportFromImportedHandleTypes =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      memory.compatibleHandleTypes = memory.exportFromImportedHandleTypes;
+      break;
+   default:
+      break;
+   }
+   properties->externalMemoryProperties = memory;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -32,13 +44,29 @@ rd_GetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice handle,
 }
 
 VKAPI_ATTR void VKAPI_CALL
-rd_GetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice handle,
+rd_GetPhysicalDeviceExternalSemaphorePropertiesKHR(VkPhysicalDevice handle,
    const VkPhysicalDeviceExternalSemaphoreInfo *info,
    VkExternalSemaphoreProperties *properties)
 {
    properties->exportFromImportedHandleTypes = 0;
    properties->compatibleHandleTypes = 0;
    properties->externalSemaphoreFeatures = 0;
+
+   VK_FROM_HANDLE(rd_physical_device, physical, handle);
+   const VkSemaphoreTypeCreateInfo *type_info =
+      vk_find_struct_const(info->pNext, SEMAPHORE_TYPE_CREATE_INFO);
+   if (info->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT &&
+       (!type_info || type_info->semaphoreType == VK_SEMAPHORE_TYPE_BINARY) &&
+       physical->sync_type.import_sync_file &&
+       physical->sync_type.export_sync_file) {
+      properties->exportFromImportedHandleTypes =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+      properties->compatibleHandleTypes =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+      properties->externalSemaphoreFeatures =
+         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
+         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+   }
 }
 
 static const struct vk_instance_extension_table rd_instance_extensions = {
@@ -55,11 +83,21 @@ static const struct vk_device_extension_table rd_device_extensions = {
    .KHR_maintenance3 = true,
    .KHR_bind_memory2 = true,
    .KHR_get_memory_requirements2 = true,
+   .KHR_external_memory = true,
+   .KHR_external_memory_fd = true,
+   .KHR_external_semaphore = true,
+   .KHR_external_semaphore_fd = true,
+   .EXT_external_memory_dma_buf = true,
+   .EXT_queue_family_foreign = true,
+   .KHR_synchronization2 = true,
+   .KHR_image_format_list = true,
+   .EXT_image_drm_format_modifier = true,
    .KHR_storage_buffer_storage_class = true,
    .KHR_16bit_storage = true,
    .KHR_8bit_storage = true,
    .KHR_shader_float16_int8 = true,
    .KHR_relaxed_block_layout = true,
+   .EXT_physical_device_drm = true,
    .KHR_sampler_mirror_clamp_to_edge = true,
    .EXT_host_query_reset = true,
 };
@@ -127,6 +165,16 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       close(render_fd);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
+   struct stat render_stat;
+   if (fstat(render_fd, &render_stat) != 0) {
+      fd_device_del(fd);
+      close(render_fd);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   struct stat primary_stat;
+   bool has_primary = (drm->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
+      drm->nodes[DRM_NODE_PRIMARY] &&
+      stat(drm->nodes[DRM_NODE_PRIMARY], &primary_stat) == 0;
    struct rd_physical_device *physical = vk_zalloc(&instance->alloc,
       sizeof(*physical), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
    if (!physical) {
@@ -215,9 +263,15 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxDescriptorSetInputAttachments = 4,
       .timestampComputeAndGraphics = true,
       .timestampPeriod = 1000000000.0f / 19200000.0f,
+      .drmHasPrimary = has_primary,
+      .drmHasRender = true,
+      .drmPrimaryMajor = has_primary ? major(primary_stat.st_rdev) : 0,
+      .drmPrimaryMinor = has_primary ? minor(primary_stat.st_rdev) : 0,
+      .drmRenderMajor = major(render_stat.st_rdev),
+      .drmRenderMinor = minor(render_stat.st_rdev),
       .maxStorageBufferRange = 128 * 1024 * 1024,
       .maxUniformBufferRange = 16384,
-      .maxPushConstantsSize = 128,
+      .maxPushConstantsSize = RD_MAX_PUSH_CONSTANTS_SIZE,
       .minMemoryMapAlignment = 64,
       .minStorageBufferOffsetAlignment = 16,
       .minUniformBufferOffsetAlignment = 16,
@@ -240,6 +294,8 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    snprintf(properties.deviceName, sizeof(properties.deviceName),
             "Radish Adreno 506 (experimental compute)");
    physical->sync_type = vk_drm_syncobj_get_type(render_fd);
+   const bool sync_file = physical->sync_type.import_sync_file &&
+                          physical->sync_type.export_sync_file;
    const uint32_t timeline_sync_features = VK_SYNC_FEATURE_TIMELINE |
       VK_SYNC_FEATURE_CPU_WAIT | VK_SYNC_FEATURE_CPU_SIGNAL |
       VK_SYNC_FEATURE_WAIT_ANY | VK_SYNC_FEATURE_GPU_WAIT;
@@ -248,9 +304,12 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       physical->sync_type.get_value && physical->sync_type.signal &&
       physical->sync_type.wait_many;
    struct vk_device_extension_table extensions = rd_device_extensions;
+   extensions.KHR_external_semaphore = sync_file;
+   extensions.KHR_external_semaphore_fd = sync_file;
    extensions.KHR_timeline_semaphore = timeline;
    properties.maxTimelineSemaphoreValueDifference = timeline ? UINT64_MAX : 0;
    const struct vk_features features = { .pipelineStatisticsQuery = true, .robustBufferAccess = true,
+      .synchronization2 = true,
       .multiview = true, .occlusionQueryPrecise = true, .hostQueryReset = true,
       .textureCompressionETC2 = true,
       .storageBuffer16BitAccess = true, .storageBuffer8BitAccess = true, .shaderInt8 = true, .timelineSemaphore = timeline };
