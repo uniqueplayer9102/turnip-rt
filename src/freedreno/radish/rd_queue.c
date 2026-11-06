@@ -10,10 +10,13 @@
 #include "drm/freedreno_ringbuffer.h"
 #include "drm/freedreno_ringbuffer_sp.h"
 #include "vk_sync.h"
+#include "util/libsync.h"
+#include "util/u_sync_provider.h"
 #include "util/u_math.h"
 #include "util/u_atomic.h"
 #include "util/os_time.h"
 #include "util/u_debug.h"
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -391,7 +394,7 @@ rd_emit_constants(struct fd_ringbuffer *ring, const struct rd_dispatch *dispatch
 {
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;
    const struct ir3_const_state *state = ir3_const_state(v);
-   emit_const(ring, 0, MIN2(32, v->constlen * 4), dispatch->push);
+   emit_const(ring, 0, MIN2(RD_MAX_PUSH_CONSTANTS_DWORDS, v->constlen * 4), dispatch->push);
    if (v->constant_data_size) {
       if (ir3_const_can_upload(&state->allocs, IR3_CONST_ALLOC_UBO_PTRS,
                               v->constlen)) {
@@ -460,6 +463,19 @@ rd_emit_driver_params(struct fd_ringbuffer *ring, const struct rd_dispatch *disp
    }
 }
 
+static struct fd_fence *
+rd_flush_submit(struct rd_device *device, struct fd_submit *submit,
+                bool use_fence_fd)
+{
+   int in_fence_fd = device->submit_in_fence_fd;
+   device->submit_in_fence_fd = -1;
+   struct fd_fence *fence = fd_submit_flush(submit, in_fence_fd,
+                                             use_fence_fd);
+   if (in_fence_fd >= 0)
+      close(in_fence_fd);
+   return fence;
+}
+
 void
 rd_flush(struct rd_device *device, struct fd_ringbuffer *ring)
 {
@@ -486,7 +502,7 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
    device->submit_count++;
    int64_t start = profile ? os_time_get_nano() : 0;
    int64_t t0 = device->trace ? os_time_get_nano() : 0;
-   struct fd_fence *fence = fd_submit_flush(submit, -1, false);
+   struct fd_fence *fence = rd_flush_submit(device, submit, false);
    VkResult result = VK_ERROR_DEVICE_LOST;
    if (fence) {
       fd_fence_flush(fence);
@@ -517,19 +533,6 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
    fd_submit_del(submit);
    return result;
 }
-
-struct rd_pending_submit {
-   struct fd_submit *submit;
-   struct fd_ringbuffer *ring;
-   struct fd_fence *fence;
-   struct fd_bo *cs_backing;
-};
-
-struct rd_submit_window {
-   struct rd_pending_submit pending[8];
-   unsigned count, chunks, cs_bytes, bo_refs, backing_bytes;
-   size_t metadata_bytes;
-};
 
 static void
 rd_window_report(const char *action, const char *reason,
@@ -573,6 +576,282 @@ rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
    return result;
 }
 
+static VkResult
+rd_window_reap(struct rd_device *device, struct rd_submit_window *window)
+{
+   unsigned completed = 0;
+   while (completed < window->count) {
+      struct rd_pending_submit *pending = &window->pending[completed];
+      int wait = fd_pipe_wait_timeout(device->pipe, pending->fence, 0);
+      if (wait == -ETIMEDOUT)
+         break;
+      if (wait)
+         return VK_ERROR_DEVICE_LOST;
+      fd_fence_del(pending->fence);
+      fd_ringbuffer_del(pending->ring);
+      fd_submit_del(pending->submit);
+      completed++;
+   }
+   if (!completed)
+      return VK_SUCCESS;
+   window->count -= completed;
+   if (window->count) {
+      memmove(window->pending, window->pending + completed,
+              window->count * sizeof(window->pending[0]));
+      memset(window->pending + window->count, 0,
+             completed * sizeof(window->pending[0]));
+   } else {
+      memset(window, 0, sizeof(*window));
+   }
+   return VK_SUCCESS;
+}
+
+static bool
+rd_async_queue_submit_supported(struct vk_queue_submit *submit)
+{
+   bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   if (vk_queue_submit_has_bind(submit))
+      return false;
+
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct rd_command_buffer *command = container_of(submit->command_buffers[i],
+         struct rd_command_buffer, vk);
+      util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
+         if (recorded->type != RD_CMD_RENDER) {
+            if (debug)
+               fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP command=%u\n",
+                       (unsigned)recorded->type);
+            return false;
+         }
+         util_dynarray_foreach(&recorded->render->draws, struct rd_draw, draw) {
+            if (draw->indirect) {
+               if (debug)
+                  fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP indirect-draw\n");
+               return false;
+            }
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+rd_sync_value_supported(struct rd_device *device, struct vk_sync *sync,
+                        uint64_t value, bool export)
+{
+   if (!sync)
+      return false;
+   if (!(sync->flags & VK_SYNC_IS_TIMELINE))
+      return value == 0 && (export ? sync->type->export_sync_file != NULL :
+                                     sync->type->import_sync_file != NULL);
+   return vk_sync_as_drm_syncobj(sync) && device->vk.sync &&
+      device->vk.sync->transfer &&
+      (export ? sync->type->export_sync_file != NULL :
+                sync->type->import_sync_file != NULL);
+}
+
+static VkResult
+rd_sync_file_create_binary(struct rd_device *device, struct vk_sync **sync_out)
+{
+   struct rd_physical_device *physical =
+      container_of(device->vk.physical, struct rd_physical_device, vk);
+   return vk_sync_create(&device->vk, &physical->sync_type, 0, 0, sync_out);
+}
+
+static VkResult
+rd_export_sync_file_at_value(struct rd_device *device, struct vk_sync *sync,
+                             uint64_t value, int *fd_out)
+{
+   if (!(sync->flags & VK_SYNC_IS_TIMELINE)) {
+      if (value != 0)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      return vk_sync_export_sync_file(&device->vk, sync, fd_out);
+   }
+
+   struct vk_drm_syncobj *src = vk_sync_as_drm_syncobj(sync);
+   if (!src || !device->vk.sync || !device->vk.sync->transfer)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct vk_sync *binary = NULL;
+   VkResult result = rd_sync_file_create_binary(device, &binary);
+   if (result != VK_SUCCESS)
+      return result;
+   struct vk_drm_syncobj *dst = vk_sync_as_drm_syncobj(binary);
+   int err = device->vk.sync->transfer(device->vk.sync, dst->syncobj, 0,
+                                        src->syncobj, value, 0);
+   result = err ? VK_ERROR_FEATURE_NOT_PRESENT :
+      vk_sync_export_sync_file(&device->vk, binary, fd_out);
+   vk_sync_destroy(&device->vk, binary);
+   return result;
+}
+
+static VkResult
+rd_import_sync_file_at_value(struct rd_device *device, struct vk_sync *sync,
+                             uint64_t value, int fd)
+{
+   if (!(sync->flags & VK_SYNC_IS_TIMELINE)) {
+      if (value != 0)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      return vk_sync_import_sync_file(&device->vk, sync, fd);
+   }
+
+   struct vk_drm_syncobj *dst = vk_sync_as_drm_syncobj(sync);
+   if (!dst || !device->vk.sync || !device->vk.sync->transfer)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct vk_sync *binary = NULL;
+   VkResult result = rd_sync_file_create_binary(device, &binary);
+   if (result != VK_SUCCESS)
+      return result;
+   struct vk_drm_syncobj *src = vk_sync_as_drm_syncobj(binary);
+   result = vk_sync_import_sync_file(&device->vk, binary, fd);
+   if (result == VK_SUCCESS) {
+      int err = device->vk.sync->transfer(device->vk.sync, dst->syncobj, value,
+                                           src->syncobj, 0, 0);
+      if (err)
+         result = VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   vk_sync_destroy(&device->vk, binary);
+   return result;
+}
+
+static bool
+rd_async_syncs_supported(struct rd_device *device,
+                        const struct vk_queue_submit *submit)
+{
+   bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      const struct vk_sync_wait *wait = &submit->waits[i];
+      if (!rd_sync_value_supported(device, wait->sync, wait->wait_value,
+                                   true)) {
+         if (debug)
+            fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP wait=%u value=%" PRIu64
+                    " flags=%x export=%u\n", i,
+                    wait->wait_value, wait->sync ? wait->sync->flags : 0,
+                    wait->sync && wait->sync->type->export_sync_file);
+         return false;
+      }
+   }
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      const struct vk_sync_signal *signal = &submit->signals[i];
+      if (!rd_sync_value_supported(device, signal->sync,
+                                   signal->signal_value, false)) {
+         if (debug)
+            fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP signal=%u value=%" PRIu64
+                    " flags=%x import=%u\n", i,
+                    signal->signal_value, signal->sync ? signal->sync->flags : 0,
+                    signal->sync && signal->sync->type->import_sync_file);
+         return false;
+      }
+   }
+   return true;
+}
+
+static VkResult
+rd_export_waits(struct rd_device *device, const struct vk_queue_submit *submit,
+                int *fd_out)
+{
+   int merged = -1;
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      int fd = -1;
+      VkResult result = rd_export_sync_file_at_value(device,
+         submit->waits[i].sync, submit->waits[i].wait_value, &fd);
+      if (result != VK_SUCCESS) {
+         if (fd >= 0)
+            close(fd);
+         if (merged >= 0)
+            close(merged);
+         return result;
+      }
+      if (fd < 0)
+         continue;
+      if (merged < 0) {
+         merged = fd;
+         continue;
+      }
+      int next = sync_merge("radish queue waits", merged, fd);
+      close(merged);
+      close(fd);
+      if (next < 0)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      merged = next;
+   }
+   *fd_out = merged;
+   return VK_SUCCESS;
+}
+
+static VkResult
+rd_submit_sync_marker(struct rd_device *device,
+                      struct rd_submit_window *window,
+                      uint32_t signal_count,
+                      const struct vk_sync_signal *signals)
+{
+   VkResult reap_result = rd_window_reap(device, window);
+   if (reap_result != VK_SUCCESS)
+      return reap_result;
+   if (window->count == ARRAY_SIZE(window->pending)) {
+      VkResult result = rd_window_drain(device, window, "marker-capacity");
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   struct fd_submit *submit = fd_submit_new(device->pipe);
+   if (!submit)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0,
+      FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+   if (!ring) {
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   rd_flush(device, ring);
+   device->submit_count++;
+   struct fd_fence *fence = rd_flush_submit(device, submit, signal_count > 0);
+   if (!fence) {
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return VK_ERROR_DEVICE_LOST;
+   }
+   fd_fence_flush(fence);
+   if (fence->submit_error) {
+      fd_fence_del(fence);
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return VK_ERROR_DEVICE_LOST;
+   }
+
+   window->pending[window->count++] = (struct rd_pending_submit) {
+      .submit = submit,
+      .ring = ring,
+      .fence = fence,
+   };
+
+   if (!signal_count)
+      return VK_SUCCESS;
+
+   if (fence->fence_fd >= 0) {
+      VkResult result = VK_SUCCESS;
+      for (uint32_t i = 0; i < signal_count; i++) {
+         result = rd_import_sync_file_at_value(device, signals[i].sync,
+                                                signals[i].signal_value,
+                                                fence->fence_fd);
+         if (result != VK_SUCCESS)
+            break;
+      }
+      if (result == VK_SUCCESS)
+         return VK_SUCCESS;
+   }
+
+   VkResult wait_result = rd_window_drain(device, window, "signal-fallback");
+   if (wait_result != VK_SUCCESS)
+      return wait_result;
+   return vk_sync_signal_many(&device->vk, signal_count, signals);
+}
+
+VkResult
+rd_queue_drain_pending(struct rd_device *device)
+{
+   return rd_window_drain(device, &device->submit_window, "queue-idle");
+}
+
 static bool
 rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch)
 {
@@ -606,6 +885,33 @@ rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch)
          return false;
    }
    return true;
+}
+
+/* Renders need only bounded GPU-side memory, not the compact single
+ * suballocated ring compute chunks use. A Phoc frame render emits a long
+ * single command stream over its full 1080x2160 sysmem surface, so the
+ * strict shape checks would force a CPU-GPU round trip per frame. Bounded
+ * ceilings only: eight window entries stay under 8 MiB of command stream. */
+static bool
+rd_window_footprint_render(struct fd_submit *submit, struct fd_ringbuffer *ring,
+                           struct fd_bo **backing, unsigned *references,
+                           size_t *metadata)
+{
+   const struct fd_submit_sp *sp = to_fd_submit_sp(submit);
+   const struct fd_ringbuffer_sp *rp = to_fd_ringbuffer_sp(ring);
+   if (sp->suballoc_ring || !sp->ring_pool.parent)
+      return false;
+   struct fd_bo *bo = rp->ring_bo;
+   *backing = bo->handle ? bo : fd_bo_heap_block(bo);
+   if (!*backing || (*backing)->size > 4 * 1024 * 1024)
+      return false;
+   *references = sp->nr_bos + sp->nr_suballoc_bos;
+   *metadata = sizeof(*sp) + sizeof(*rp) + sizeof(struct fd_fence) + 4096 +
+      (sp->max_bos + sp->max_suballoc_bos) * sizeof(struct fd_bo *) +
+      rp->u.max_cmds * sizeof(struct fd_cmd_sp) +
+      2 * sizeof(struct hash_table) +
+      (sp->bo_table->size + sp->suballoc_bo_table->size) * sizeof(struct hash_entry);
+   return *metadata <= 1024 * 1024 && *references <= 512;
 }
 
 static bool
@@ -643,13 +949,21 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
                           struct rd_submit_profile *profile,
                           struct rd_gpu_elapsed *sample,
                           struct rd_submit_window *window,
-                          uint32_t *initial_start, unsigned chunks)
+                          uint32_t *initial_start, unsigned chunks,
+                          bool render)
 {
    if (!window)
       return rd_finish_submit(device, submit, ring, profile, sample);
+   VkResult reap_result = rd_window_reap(device, window);
+   if (reap_result != VK_SUCCESS) {
+      rd_window_drain(device, window, "reap-error");
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return reap_result;
+   }
    device->submit_count++;
    int64_t t0 = device->trace ? os_time_get_nano() : 0;
-   struct fd_fence *fence = fd_submit_flush(submit, -1, false);
+   struct fd_fence *fence = rd_flush_submit(device, submit, false);
    if (fence)
       fd_fence_flush(fence);
    if (device->trace)
@@ -670,8 +984,10 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
    struct fd_bo *backing = NULL;
    unsigned references = 0;
    size_t metadata = 0;
-   bool bounded = rd_window_footprint(submit, ring, initial_start,
-                                       &backing, &references, &metadata);
+   bool bounded = render ?
+      rd_window_footprint_render(submit, ring, &backing, &references, &metadata) :
+      rd_window_footprint(submit, ring, initial_start,
+                          &backing, &references, &metadata);
    bool known_backing = false;
    for (unsigned i = 0; i < window->count; i++)
       known_backing |= window->pending[i].cs_backing == backing;
@@ -703,6 +1019,16 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
    if (window->count == ARRAY_SIZE(window->pending))
       return rd_window_drain(device, window, "capacity");
    return VK_SUCCESS;
+}
+
+VkResult
+rd_finish_window_submit(struct rd_device *device, struct fd_submit *submit,
+                        struct fd_ringbuffer *ring,
+                        struct rd_submit_window *window,
+                        uint32_t *initial_ring_start, bool render)
+{
+   return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
+                                    initial_ring_start, 1, render);
 }
 
 VkResult
@@ -1274,7 +1600,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
                   OUT_WFI5(ring);
                }
                VkResult result = rd_finish_dispatch_submit(device, submit, ring, profile,
-                                                   sample, window, initial_ring_start, chunks);
+                                                   sample, window, initial_ring_start, chunks, false);
                rd_gpu_elapsed_release(sample);
                sample = NULL;
                submit = NULL;
@@ -1289,7 +1615,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
    if (submit) {
       rd_flush(device, ring);
       VkResult result = rd_finish_dispatch_submit(device, submit, ring, profile, sample,
-                                                    window, initial_ring_start, chunks);
+                                                    window, initial_ring_start, chunks, false);
       rd_gpu_elapsed_release(sample);
       if (diagnostics) {
          fprintf(stderr, "RADISH_DISPATCH_END native=%u result=%d submits=%" PRIu64 "\n",
@@ -1310,7 +1636,8 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
 static VkResult
 rd_execute_transfer(struct rd_device *device, enum rd_command_type type,
                       const struct rd_transfer *transfer,
-                      struct rd_submit_profile *profile)
+                      struct rd_submit_profile *profile,
+                      struct rd_submit_window *window)
 {
    if (!transfer->dst || !transfer->dst->memory ||
        (type == RD_CMD_COPY && (!transfer->src || !transfer->src->memory)))
@@ -1347,6 +1674,7 @@ rd_execute_transfer(struct rd_device *device, enum rd_command_type type,
          fd_submit_del(submit);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
+      uint32_t *initial_ring_start = ring->start;
       rd_trace_submit_begin(device, ring);
       struct rd_buffer *dst = transfer->dst;
       unsigned dst_offset = dst->offset + transfer->dst_offset + done;
@@ -1368,7 +1696,9 @@ rd_execute_transfer(struct rd_device *device, enum rd_command_type type,
       }
       OUT_PKT7(ring, CP_WAIT_MEM_WRITES, 0);
       rd_flush(device, ring);
-      VkResult result = rd_finish_submit(device, submit, ring, profile, NULL);
+      VkResult result = window ?
+         rd_finish_window_submit(device, submit, ring, window, initial_ring_start, false) :
+         rd_finish_submit(device, submit, ring, profile, NULL);
       if (result != VK_SUCCESS)
          return result;
       done += bytes;
@@ -1402,6 +1732,13 @@ rd_resolve_indirect(struct rd_device *device, struct rd_dispatch *dispatch)
 static VkResult
 rd_queue_fail(struct vk_queue *queue)
 {
+   struct rd_device *device = container_of(queue->base.device,
+                                            struct rd_device, vk);
+   rd_queue_drain_pending(device);
+   if (device->submit_in_fence_fd >= 0) {
+      close(device->submit_in_fence_fd);
+      device->submit_in_fence_fd = -1;
+   }
    VkResult result = vk_queue_set_lost(queue, "Radish execution or synchronization failed");
    rd_wake_device_waiters(queue->base.device);
    return result;
@@ -1412,20 +1749,56 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct rd_device *device = container_of(queue->base.device, struct rd_device, vk);
    bool profile = debug_get_bool_option("RADISH_PROFILE", false);
-   struct rd_submit_window window = {0};
+   struct rd_submit_window *window = &device->submit_window;
    bool deferred = !profile && debug_get_num_option("RADISH_BATCH_CHUNKS", 1) == 8;
+   bool async_requested = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC", false);
+   bool commands_supported = async_requested &&
+      rd_async_queue_submit_supported(submit);
+   bool syncs_supported = async_requested && rd_async_syncs_supported(device, submit);
+   bool async = async_requested && !profile && !device->trace && commands_supported &&
+      syncs_supported && device->submit_in_fence_fd < 0;
+   bool async_debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   if (async_requested && async_debug && !async)
+      fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP profile=%u trace=%u commands=%u syncs=%u pending-fd=%u waits=%u signals=%u\n",
+              profile, device->trace != NULL, commands_supported, syncs_supported,
+              submit->wait_count, submit->signal_count,
+              device->submit_in_fence_fd >= 0);
+   if (async) {
+      int wait_fd = -1;
+      if (rd_export_waits(device, submit, &wait_fd) == VK_SUCCESS)
+         device->submit_in_fence_fd = wait_fd;
+      else
+         async = false;
+   }
+   if (async && async_debug)
+      fprintf(stderr, "RADISH_ASYNC_SYNC_SUBMIT waits=%u signals=%u\n",
+              submit->wait_count, submit->signal_count);
    __sync_synchronize();
    const int64_t queue_start = device->trace ? os_time_get_nano() : 0;
-   VkResult result = vk_sync_wait_many(&device->vk, submit->wait_count,
-      submit->waits, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
-   if (result != VK_SUCCESS)
-      return rd_queue_fail(queue);
+   VkResult result = VK_SUCCESS;
+   if (!async) {
+      if (device->submit_in_fence_fd >= 0) {
+         int wait_fd = device->submit_in_fence_fd;
+         device->submit_in_fence_fd = -1;
+         int wait_result = sync_wait(wait_fd, -1);
+         close(wait_fd);
+         if (wait_result < 0)
+            return rd_queue_fail(queue);
+      }
+      result = rd_window_drain(device, window, "cpu");
+      if (result != VK_SUCCESS)
+         return rd_queue_fail(queue);
+      result = vk_sync_wait_many(&device->vk, submit->wait_count,
+         submit->waits, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+      if (result != VK_SUCCESS)
+         return rd_queue_fail(queue);
+   }
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct rd_command_buffer *command = container_of(submit->command_buffers[i],
          struct rd_command_buffer, vk);
       util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
          if (rd_trace_needs_resolve(device)) {
-            result = rd_window_drain(device, &window, "trace");
+            result = rd_window_drain(device, window, "trace");
             if (result != VK_SUCCESS)
                return rd_queue_fail(queue);
             rd_trace_resolve(device, queue_start);
@@ -1437,9 +1810,14 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          struct rd_submit_profile submit_profile = {0};
          const struct rd_dispatch *dispatch = &recorded->dispatch;
          struct rd_dispatch indirect;
-         if (recorded->type != RD_CMD_DISPATCH || recorded->dispatch.indirect ||
-             !rd_window_pipeline(device, &recorded->dispatch)) {
-            result = rd_window_drain(device, &window, "cpu");
+         bool can_defer = !profile &&
+            (recorded->type == RD_CMD_RENDER ||
+             (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE));
+         if (recorded->type == RD_CMD_DISPATCH)
+            can_defer = deferred && !recorded->dispatch.indirect &&
+                        rd_window_pipeline(device, &recorded->dispatch);
+         if (!can_defer) {
+            result = rd_window_drain(device, window, "cpu");
             if (result != VK_SUCCESS)
                return rd_queue_fail(queue);
          }
@@ -1465,7 +1843,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             if (result == VK_SUCCESS)
                result = rd_execute_dispatch(device, dispatch,
                                             profile ? &submit_profile : NULL,
-                                            deferred ? &window : NULL);
+                                            can_defer ? window : NULL);
             if (result == VK_SUCCESS)
                rd_query_account_dispatch(device, dispatch);
             if (indirect.sampling_addresses)
@@ -1475,13 +1853,15 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
                                                 recorded->type == RD_CMD_IMAGE_CLEAR);
          } else if (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) {
             result = rd_execute_transfer(device, recorded->type, &recorded->transfer,
-                                         profile ? &submit_profile : NULL);
+                                         profile ? &submit_profile : NULL,
+                                         can_defer ? window : NULL);
          } else if (recorded->type >= RD_CMD_EVENT_SET && recorded->type <= RD_CMD_EVENT_WAIT) {
             result = rd_execute_event(device, recorded->type, &recorded->event);
          } else if (recorded->type >= RD_CMD_QUERY_RESET && recorded->type <= RD_CMD_QUERY_COPY) {
             result = rd_execute_query(device, recorded->type, &recorded->query);
          } else if (recorded->type == RD_CMD_RENDER) {
-            result = rd_execute_render(device, recorded->render);
+            result = rd_execute_render(device, recorded->render,
+                                       can_defer ? window : NULL);
          } else if (recorded->type == RD_CMD_BLIT) {
             result = rd_execute_blit(device, &recorded->blit);
          } else {
@@ -1537,15 +1917,26 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             }
          }
          if (result != VK_SUCCESS) {
-            rd_window_drain(device, &window, "error");
+            rd_window_drain(device, window, "error");
             return rd_queue_fail(queue);
          }
       }
    }
-   result = rd_window_drain(device, &window, "final");
-   if (result != VK_SUCCESS)
-      return rd_queue_fail(queue);
    rd_trace_resolve(device, queue_start);
-   result = vk_sync_signal_many(&device->vk, submit->signal_count, submit->signals);
+   if (async) {
+      if (device->submit_in_fence_fd >= 0 ||
+          (submit->signal_count && window->count)) {
+         result = rd_submit_sync_marker(device, window,
+                                        submit->signal_count, submit->signals);
+      } else if (submit->signal_count) {
+         result = vk_sync_signal_many(&device->vk, submit->signal_count,
+                                      submit->signals);
+      }
+   } else {
+      result = rd_window_drain(device, window, "final");
+      if (result == VK_SUCCESS)
+         result = vk_sync_signal_many(&device->vk, submit->signal_count,
+                                      submit->signals);
+   }
    return result == VK_SUCCESS ? VK_SUCCESS : rd_queue_fail(queue);
 }

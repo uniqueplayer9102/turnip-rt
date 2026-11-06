@@ -12,6 +12,7 @@
  * emitted into one ring and run synchronously, like a compute dispatch.
  */
 #include "rd_private.h"
+#include <unistd.h>
 #include "rd_format.h"
 #include "common/fd5_hw.h"
 #include "drm/freedreno_ringbuffer.h"
@@ -62,7 +63,7 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
  * vertexPipelineStoresAndAtomics / fragmentStoresAndAtomics, which are not
  * advertised.
  */
-#define RD_GFX_PUSH_DWORDS 32
+#define RD_GFX_PUSH_DWORDS RD_MAX_PUSH_CONSTANTS_DWORDS
 #define RD_GFX_MAX_BUFFERS 16
 /* one vec4 after the buffer addresses: x = view index (multiview replay) */
 #define RD_GFX_VIEW_DWORD (RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS)
@@ -1652,9 +1653,15 @@ rd_primtype(VkPrimitiveTopology topology)
    }
 }
 
+struct rd_gfx_program_cache {
+   const struct rd_gfx_pipeline *pipeline;
+   unsigned max_loc;
+};
+
 static void
 rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
-            const struct rd_render *render, const struct rd_draw *draw)
+            const struct rd_render *render, const struct rd_draw *draw,
+            struct rd_gfx_program_cache *program_cache)
 {
    const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
    const struct vk_dynamic_graphics_state *dyn = &gfx->dynamic;
@@ -1741,7 +1748,16 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZOFFSET_0(vp->minDepth));
    OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZSCALE_0(vp->maxDepth - vp->minDepth));
 
-   unsigned max_loc = rd_gfx_program(ring, gfx);
+   unsigned max_loc;
+   if (program_cache && program_cache->pipeline == gfx) {
+      max_loc = program_cache->max_loc;
+   } else {
+      max_loc = rd_gfx_program(ring, gfx);
+      if (program_cache) {
+         program_cache->pipeline = gfx;
+         program_cache->max_loc = max_loc;
+      }
+   }
 
    uint32_t su_cntl = A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(draw->line_width / 2.0f) |
                       COND(draw->bias_enable, A5XX_GRAS_SU_CNTL_POLY_OFFSET) |
@@ -2022,14 +2038,24 @@ static VkResult rd_render_resolves(struct rd_device *device, const struct rd_ren
 static VkResult rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render);
 
 static VkResult
-rd_execute_render_direct(struct rd_device *device, const struct rd_render *render);
+rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
+                         struct rd_submit_window *window);
+
+static bool rd_execute_render_gmem_supported(struct rd_device *device,
+                                        const struct rd_render *render);
+static VkResult rd_execute_render_gmem(struct rd_device *device,
+                                       const struct rd_render *render,
+                                       struct rd_submit_window *window);
 
 static VkResult
-rd_execute_render_view(struct rd_device *device, const struct rd_render *render)
+rd_execute_render_view(struct rd_device *device, const struct rd_render *render,
+                       struct rd_submit_window *window)
 {
    if (render->depth.view || render->stencil.view)
       return rd_execute_render_tiled_ds(device, render);
-   return rd_execute_render_direct(device, render);
+   if (rd_execute_render_gmem_supported(device, render))
+      return rd_execute_render_gmem(device, render, window);
+   return rd_execute_render_direct(device, render, window);
 }
 
 static void
@@ -2048,7 +2074,8 @@ rd_view_layer(struct rd_image_view *out, const struct rd_image_view *view, uint3
  * Layer 0 runs the whole render; each further layer runs on layer <L> of
  * every attachment with only the clears that cover it. */
 static VkResult
-rd_execute_render_layers(struct rd_device *device, const struct rd_render *render)
+rd_execute_render_layers(struct rd_device *device, const struct rd_render *render,
+                         struct rd_submit_window *window)
 {
    VkResult result = VK_SUCCESS;
    for (uint32_t layer = 0; layer < render->layers && result == VK_SUCCESS; layer++) {
@@ -2091,7 +2118,7 @@ rd_execute_render_layers(struct rd_device *device, const struct rd_render *rende
             util_dynarray_append(&queries, *q);
       copy.draws = draws;
       copy.queries = queries;
-      result = rd_execute_render_view(device, &copy);
+      result = rd_execute_render_view(device, &copy, window);
       util_dynarray_fini(&draws);
       util_dynarray_fini(&queries);
    }
@@ -2099,12 +2126,13 @@ rd_execute_render_layers(struct rd_device *device, const struct rd_render *rende
 }
 
 VkResult
-rd_execute_render(struct rd_device *device, const struct rd_render *render)
+rd_execute_render(struct rd_device *device, const struct rd_render *render,
+                  struct rd_submit_window *window)
 {
    if (!render->view_mask && render->layers > 1)
-      return rd_execute_render_layers(device, render);
+      return rd_execute_render_layers(device, render, window);
    if (!render->view_mask)
-      return rd_execute_render_view(device, render);
+      return rd_execute_render_view(device, render, window);
    VkResult result = VK_SUCCESS;
    u_foreach_bit(view, render->view_mask) {
       struct rd_render copy = *render;
@@ -2150,7 +2178,7 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
          }
       }
       copy.queries = queries;
-      result = rd_execute_render_view(device, &copy);
+      result = rd_execute_render_view(device, &copy, window);
       util_dynarray_fini(&queries);
       if (result != VK_SUCCESS)
          break;
@@ -2159,7 +2187,8 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
 }
 
 static VkResult
-rd_execute_render_direct(struct rd_device *device, const struct rd_render *render)
+rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
+                         struct rd_submit_window *window)
 {
    for (const struct rd_render_attachment *a = &render->depth; a <= &render->stencil; a++) {
       if (!a->view)
@@ -2211,12 +2240,14 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       fd_submit_del(submit);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
+   uint32_t *initial_ring_start = ring->start;
    rd_gfx_restore(ring, device);
    rd_gfx_sysmem_prep(ring, device, render, width, height, samples);
    VkResult result = VK_SUCCESS;
    /* which draws need the sample counter: occlusion, or a statistics query
     * counting fragment-shader invocations active at that draw */
    unsigned ndraws = util_dynarray_num_elements(&render->draws, struct rd_draw);
+   struct rd_gfx_program_cache program_cache = {0};
    int *slots = calloc(ndraws ? ndraws : 1, sizeof(int));
    bool *coverage = calloc(ndraws ? ndraws : 1, sizeof(bool));
    struct rd_draw *resolved = calloc(ndraws ? ndraws : 1, sizeof(struct rd_draw));
@@ -2296,12 +2327,12 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          for (unsigned j = 0; j < ARRAY_SIZE(pass.cb.attachments); j++)
             pass.cb.attachments[j].write_mask = 0;
          rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2) * 16);
-         rd_gfx_draw(ring, device, render, &pass);
+         rd_gfx_draw(ring, device, render, &pass, &program_cache);
          rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2 + 1) * 16);
       }
       if (slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2) * 16);
-      rd_gfx_draw(ring, device, render, &draw);
+      rd_gfx_draw(ring, device, render, &draw, &program_cache);
       if (slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2 + 1) * 16);
    }
@@ -2320,7 +2351,9 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
    rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
    rd_flush(device, ring);
-   result = rd_finish_submit(device, submit, ring, NULL, NULL);
+   result = counted ?
+      rd_finish_submit(device, submit, ring, NULL, NULL) :
+      rd_finish_window_submit(device, submit, ring, window, initial_ring_start, true);
    if (result == VK_SUCCESS) {
       const uint64_t *values = counters ? fd_bo_map(counters) : NULL;
       const struct rd_render_query *op = util_dynarray_begin(&render->queries);
@@ -2354,6 +2387,392 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    if (result != VK_SUCCESS)
       return result;
    return rd_render_resolves(device, render);
+}
+
+
+/* --- opt-in color-only GMEM (tiled) render path ------------------------- */
+
+/* A5xx can render color-only passes into on-chip GMEM tile by tile instead
+ * of streaming every pixel through the system-memory bus twice per frame.
+ * The flow follows freedreno's a5xx gmem path (fd5_gmem.c/fd5_emit.c, MIT):
+ * per tile, optionally restore the previous contents into GMEM, replay the
+ * draw stream under the tile scissor, then store the tile back out. There is
+ * no HW binning yet: the draw stream is executed per tile with visibility
+ * forced, so the result is correct for any geometry while the memory
+ * traffic still drops from two full-surface sysmem passes to GMEM plus one
+ * final store per tile. Bypass (sysmem) remains the default path; enable
+ * with RADISH_GMEM=1 after bounded validation. */
+
+struct rd_gmem_layout {
+   uint32_t bin_w, bin_h, cpp, cbuf_base;
+};
+
+static unsigned
+rd_gmem_div_align(unsigned num, unsigned denom, unsigned al)
+{
+   return align(DIV_ROUND_UP(num, denom), al);
+}
+
+static bool
+rd_gmem_layout_fits(struct rd_gmem_layout *l, uint32_t gmem_size)
+{
+   uint64_t total = (uint64_t)l->cbuf_base +
+                    (uint64_t)l->bin_w * l->bin_h * l->cpp;
+   return total <= gmem_size;
+}
+
+static bool
+rd_gmem_layout_init(struct rd_gmem_layout *l, uint32_t cpp, uint32_t width,
+                    uint32_t height, const struct fd_dev_info *info,
+                    uint32_t gmem_size)
+{
+   l->cpp = cpp;
+   l->cbuf_base = 0;
+   l->bin_w = rd_gmem_div_align(width, 1, info->tile_align_w);
+   l->bin_h = rd_gmem_div_align(height, 1, info->tile_align_h);
+   unsigned nbins_x = 1, nbins_y = 1;
+   while (l->bin_w > info->tile_max_w) {
+      nbins_x++;
+      l->bin_w = rd_gmem_div_align(width, nbins_x, info->tile_align_w);
+   }
+   while (l->bin_h > info->tile_max_h) {
+      nbins_y++;
+      l->bin_h = rd_gmem_div_align(height, nbins_y, info->tile_align_h);
+   }
+   while (!rd_gmem_layout_fits(l, gmem_size)) {
+      if ((l->bin_w <= l->bin_h && nbins_x < 32) || nbins_y >= 32)
+         l->bin_w = rd_gmem_div_align(width, ++nbins_x, info->tile_align_w);
+      else
+         l->bin_h = rd_gmem_div_align(height, ++nbins_y, info->tile_align_h);
+   }
+   return true;
+}
+
+/* Runtime gate for the GMEM path. The env var is checked first so
+ * offscreen tests keep working unchanged; a marker file is also honored so a
+ * long-lived compositor can toggle the path without being restarted. */
+static bool
+rd_gmem_enabled(void)
+{
+   if (getenv("RADISH_GMEM"))
+      return true;
+   if (access("/home/user/.local/radish/gmem_enabled", F_OK) == 0)
+      return true;
+   return false;
+}
+
+static bool
+rd_execute_render_gmem_supported(struct rd_device *device,
+                                 const struct rd_render *render)
+{
+   if (!rd_gmem_enabled())
+      return false;
+   if (render->depth.view || render->stencil.view)
+      return false;
+   if (render->samples != VK_SAMPLE_COUNT_1_BIT)
+      return false;
+   if (render->color_count != 1 || !render->color[0].view)
+      return false;
+   if (render->layers != 1 || render->view_mask)
+      return false;
+   if (!device->gmem_size_valid || !device->gmem_size)
+      return false;
+   if (render->queries.size)
+      return false;
+   if (!util_dynarray_num_elements(&render->draws, struct rd_draw))
+      return false;
+   if (!list_is_empty(&device->active_queries))
+      return false;
+   util_dynarray_foreach(&render->draws, struct rd_draw, d) {
+      if (d->indirect || d->barrier || d->occlusion_pool)
+         return false;
+      const struct rd_image *image =
+         container_of(render->color[0].view->vk.image, struct rd_image, vk);
+      if (!image->memory || image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
+         return false;
+   }
+   return true;
+}
+
+/* Configures every MRT slot like rd_gfx_sysmem_prep and fd5's emit_mrt do,
+ * so the slots a render pass does not use stay disabled instead of leaking
+ * state from an earlier submit. */
+static void
+rd_gmem_emit_mrt(struct fd_ringbuffer *ring, struct rd_device *device,
+                 const struct rd_render *render,
+                 const struct rd_gmem_layout *l, bool gmem)
+{
+   const struct vk_image_view *view = &render->color[0].view->vk;
+   const struct rd_image *image = container_of(view->image, struct rd_image, vk);
+   enum pipe_format pformat = vk_format_to_pipe_format(view->format);
+   enum a5xx_color_fmt format = rd5_pipe2color(pformat);
+   enum a3xx_color_swap swap = rd5_pipe2swap(pformat);
+   bool srgb = util_format_is_srgb(pformat);
+   bool sint = util_format_is_pure_sint(pformat);
+   bool uint = util_format_is_pure_uint(pformat);
+   enum a5xx_tile_mode tile_mode;
+   uint32_t stride, size;
+   VkDeviceSize offset = 0;
+   if (gmem) {
+      tile_mode = TILE5_2;
+      stride = l->bin_w * l->cpp;
+      size = stride * l->bin_h;
+   } else {
+      const struct rd_image_level *level = &image->levels[view->base_mip_level];
+      tile_mode = image->native_layout.tile_mode;
+      stride = level->row_pitch;
+      size = level->array_pitch;
+      offset = image->memory_offset + level->offset +
+               (VkDeviceSize)view->base_array_layer *
+                      (image->vk.image_type == VK_IMAGE_TYPE_3D ?
+                          level->depth_pitch : level->array_pitch);
+   }
+   OUT_PKT4(ring, REG_A5XX_RB_MRT_BUF_INFO(0), 5);
+   OUT_RING(ring, A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(format) |
+                     A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(tile_mode) |
+                     A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(swap) |
+                     COND(gmem, 0x800) |
+                     COND(srgb, A5XX_RB_MRT_BUF_INFO_COLOR_SRGB));
+   OUT_RING(ring, A5XX_RB_MRT_PITCH(stride));
+   OUT_RING(ring, A5XX_RB_MRT_ARRAY_PITCH(size));
+   if (gmem) {
+      /* fd5 emits the raw GMEM offset here (cbuf_base, usually 0) — the
+       * RB resolves it on-chip, no kernel IOVA is added */
+      OUT_RING(ring, l->cbuf_base);
+      OUT_RING(ring, 0);
+   } else {
+      OUT_RELOC(ring, image->memory->bo, offset, 0, 0);
+   }
+   OUT_PKT4(ring, REG_A5XX_SP_FS_MRT_REG(0), 1);
+   OUT_RING(ring, A5XX_SP_FS_MRT_REG_COLOR_FORMAT(format) |
+                     COND(sint, A5XX_SP_FS_MRT_REG_COLOR_SINT) |
+                     COND(uint, A5XX_SP_FS_MRT_REG_COLOR_UINT) |
+                     COND(srgb, A5XX_SP_FS_MRT_REG_COLOR_SRGB));
+   OUT_PKT4(ring, REG_A5XX_RB_MRT_FLAG_BUFFER(0), 4);
+   for (unsigned i = 0; i < 4; i++)
+      OUT_RING(ring, 0);
+
+   /* disable the remaining targets */
+   for (unsigned i = 1; i < A5XX_MAX_RENDER_TARGETS; i++) {
+      OUT_PKT4(ring, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_PKT4(ring, REG_A5XX_SP_FS_MRT_REG(i), 1);
+      OUT_RING(ring, 0);
+   }
+}
+
+static void
+rd_gmem_blit(struct fd_ringbuffer *ring, struct rd_device *device,
+             const struct rd_render *render,
+             const struct rd_gmem_layout *l, bool store)
+{
+   const struct vk_image_view *view = &render->color[0].view->vk;
+   const struct rd_image *image = container_of(view->image, struct rd_image, vk);
+   const struct rd_image_level *level = &image->levels[view->base_mip_level];
+
+   OUT_PKT4(ring, REG_A5XX_RB_BLIT_FLAG_DST, 4);
+   for (unsigned i = 0; i < 4; i++)
+      OUT_RING(ring, 0);
+
+   OUT_PKT4(ring, REG_A5XX_RB_RESOLVE_CNTL_3, 5);
+   /* 0x0 mem->gmem (restore), 0x4 gmem->mem without flag buffer (store) */
+   OUT_RING(ring, store ? 0x00000004 : 0x00000000);
+   if (store) {
+      OUT_RELOC(ring, image->memory->bo,
+                image->memory_offset + level->offset, 0, 0);
+      OUT_RING(ring, A5XX_RB_BLIT_DST_PITCH(level->row_pitch));
+      OUT_RING(ring, A5XX_RB_BLIT_DST_ARRAY_PITCH(level->array_pitch));
+   } else {
+      OUT_RING(ring, l->cbuf_base);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, A5XX_RB_BLIT_DST_PITCH(l->bin_w * l->cpp));
+      OUT_RING(ring, A5XX_RB_BLIT_DST_ARRAY_PITCH(l->bin_w * l->bin_h * l->cpp));
+   }
+   OUT_PKT4(ring, REG_A5XX_RB_BLIT_CNTL, 1);
+   OUT_RING(ring, A5XX_RB_BLIT_CNTL_BUF(BLIT_MRT0));
+
+   rd_event(ring, device, CCU_RESOLVE, true);
+}
+
+static void
+rd_gmem_emit_msaa_once(struct fd_ringbuffer *ring)
+{
+   OUT_PKT4(ring, REG_A5XX_TPL1_TP_RAS_MSAA_CNTL, 2);
+   OUT_RING(ring, A5XX_TPL1_TP_RAS_MSAA_CNTL_SAMPLES(MSAA_ONE));
+   OUT_RING(ring, A5XX_TPL1_TP_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
+                  A5XX_TPL1_TP_DEST_MSAA_CNTL_MSAA_DISABLE);
+   OUT_PKT4(ring, REG_A5XX_RB_RAS_MSAA_CNTL, 2);
+   OUT_RING(ring, A5XX_RB_RAS_MSAA_CNTL_SAMPLES(MSAA_ONE));
+   OUT_RING(ring, A5XX_RB_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
+                  A5XX_RB_DEST_MSAA_CNTL_MSAA_DISABLE);
+   OUT_PKT4(ring, REG_A5XX_GRAS_SC_RAS_MSAA_CNTL, 2);
+   OUT_RING(ring, A5XX_GRAS_SC_RAS_MSAA_CNTL_SAMPLES(MSAA_ONE));
+   OUT_RING(ring, A5XX_GRAS_SC_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
+                  A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
+}
+
+static VkResult
+rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
+                       struct rd_submit_window *window)
+{
+   const struct rd_image_view *view = render->color[0].view;
+   const struct rd_image *image = container_of(view->vk.image, struct rd_image, vk);
+   uint32_t width = render->area.extent.width;
+   uint32_t height = render->area.extent.height;
+   const struct fd_dev_info *info = &device->info;
+
+   struct rd_gmem_layout l;
+   if (!rd_gmem_layout_init(&l, image->texel_size, width, height,
+                            info, device->gmem_size))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   uint32_t nbins_x = DIV_ROUND_UP(width, l.bin_w);
+   uint32_t nbins_y = DIV_ROUND_UP(height, l.bin_h);
+
+   struct fd_submit *submit = fd_submit_new(device->pipe);
+   if (!submit)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0,
+      FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+   if (!ring) {
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   uint32_t *initial_ring_start = ring->start;
+
+   rd_gfx_restore(ring, device);
+   /* bisect probe: honored only when RADISH_GMEM_STOP is set to a stage
+    * __LINE__ (see RD_GMEM_STAGE); unset means run the full GMEM path */
+   long stop_at = debug_get_num_option("RADISH_GMEM_STOP", -1);
+#define RD_GMEM_STAGE(name) if (stop_at && stop_at == __LINE__) { \
+      rd_flush(device, ring); \
+      return rd_finish_window_submit(device, submit, ring, window, \
+                                     initial_ring_start, true); }
+
+   if (debug_get_bool_option("RADISH_GMEM_DUMP", false)) {
+      fprintf(stderr, "radish gmem: bin=%ux%u tiles=%ux%u cpp=%u base=0x%"
+              PRIx64 " load=%d store=%d\n", l.bin_w, l.bin_h, nbins_x,
+              nbins_y, l.cpp, device->gmem_base,
+              render->color[0].load == VK_ATTACHMENT_LOAD_OP_LOAD,
+              render->color[0].store == VK_ATTACHMENT_STORE_OP_STORE);
+   }
+
+   /* tile init: GMEM render mode, one MRT in on-chip memory */
+   OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+   OUT_RING(ring, 0);
+   OUT_PKT4(ring, REG_A5XX_GRAS_CL_CNTL, 1);
+   OUT_RING(ring, 0x00000080);
+   OUT_PKT4(ring, REG_A5XX_PC_POWER_CNTL, 1);
+   OUT_RING(ring, info->num_sp_cores - 1);
+   OUT_PKT4(ring, REG_A5XX_VFD_POWER_CNTL, 1);
+   OUT_RING(ring, info->num_sp_cores - 1);
+   OUT_WFI5(ring);
+   OUT_PKT4(ring, REG_A5XX_RB_CCU_CNTL, 1);
+   OUT_RING(ring, 0x7c13c080);
+   OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
+   OUT_RING(ring, A5XX_RB_CNTL_WIDTH(l.bin_w) | A5XX_RB_CNTL_HEIGHT(l.bin_h));
+   OUT_PKT4(ring, REG_A5XX_VPC_SO_OVERRIDE, 1);
+   OUT_RING(ring, 0);
+   /* this shape matches the a5xx critical packet from the vince KGSL
+    * kernel (adreno_a5xx_packets.h): mode dword 1, second-buffer length 1 */
+   RD_GMEM_STAGE(gmem_mode)
+   OUT_PKT7(ring, CP_SET_RENDER_MODE, 5);
+   OUT_RING(ring, CP_SET_RENDER_MODE_0_MODE(GMEM));
+   OUT_RING(ring, 0);
+   OUT_RING(ring, 0);
+   OUT_RING(ring, CP_SET_RENDER_MODE_3_GMEM_ENABLE);
+   OUT_RING(ring, 0x1);
+   rd_gmem_emit_msaa_once(ring);
+
+   VkResult result = VK_SUCCESS;
+   struct rd_gfx_program_cache program_cache = {0};
+   bool load = render->color[0].load == VK_ATTACHMENT_LOAD_OP_LOAD;
+   bool store = render->color[0].store == VK_ATTACHMENT_STORE_OP_STORE;
+
+   for (uint32_t ty = 0; ty < nbins_y && result == VK_SUCCESS; ty++) {
+      for (uint32_t tx = 0; tx < nbins_x; tx++) {
+         uint32_t x1 = render->area.offset.x + tx * l.bin_w;
+         uint32_t y1 = render->area.offset.y + ty * l.bin_h;
+         uint32_t tw = MIN2(l.bin_w, render->area.offset.x + width - x1);
+         uint32_t th = MIN2(l.bin_h, render->area.offset.y + height - y1);
+         if (tw == 0 || th == 0)
+            continue;
+
+         OUT_PKT4(ring, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
+         OUT_RING(ring, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(x1) |
+                           A5XX_GRAS_SC_WINDOW_SCISSOR_TL_Y(y1));
+         OUT_RING(ring, A5XX_GRAS_SC_WINDOW_SCISSOR_BR_X(x1 + tw - 1) |
+                           A5XX_GRAS_SC_WINDOW_SCISSOR_BR_Y(y1 + th - 1));
+         OUT_PKT4(ring, REG_A5XX_RB_RESOLVE_CNTL_1, 2);
+         OUT_RING(ring, A5XX_RB_RESOLVE_CNTL_1_X(x1) | A5XX_RB_RESOLVE_CNTL_1_Y(y1));
+         OUT_RING(ring, A5XX_RB_RESOLVE_CNTL_2_X(x1 + tw - 1) |
+                           A5XX_RB_RESOLVE_CNTL_2_Y(y1 + th - 1));
+         OUT_PKT7(ring, CP_SET_VISIBILITY_OVERRIDE, 1);
+         OUT_RING(ring, 0x1);
+         OUT_PKT4(ring, REG_A5XX_RB_WINDOW_OFFSET, 1);
+         OUT_RING(ring, A5XX_RB_WINDOW_OFFSET_X(x1) | A5XX_RB_WINDOW_OFFSET_Y(y1));
+
+         RD_GMEM_STAGE(tile_prep)
+         if (load) {
+            rd_gmem_emit_msaa_once(ring);
+            OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
+            OUT_RING(ring, A5XX_RB_CNTL_WIDTH(l.bin_w) |
+                              A5XX_RB_CNTL_HEIGHT(l.bin_h) | A5XX_RB_CNTL_BYPASS);
+            rd_gmem_emit_mrt(ring, device, render, &l, false);
+            RD_GMEM_STAGE(restore_mrt)
+            rd_gmem_blit(ring, device, render, &l, false);
+         }
+
+         RD_GMEM_STAGE(restore_done)
+         /* GMEM as render target */
+         rd_gmem_emit_msaa_once(ring);
+         OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
+         OUT_RING(ring, A5XX_RB_CNTL_WIDTH(l.bin_w) | A5XX_RB_CNTL_HEIGHT(l.bin_h));
+         rd_gmem_emit_mrt(ring, device, render, &l, true);
+
+         util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+            struct rd_draw d = *draw;
+            if (d.indirect && rd_resolve_draw_indirect(device, &d) != VK_SUCCESS) {
+               result = VK_ERROR_UNKNOWN;
+               break;
+            }
+            if (!d.vertex_count || !d.instance_count)
+               continue;
+            rd_gfx_draw(ring, device, render, &d, &program_cache);
+         }
+         if (result != VK_SUCCESS)
+            break;
+
+         if (store)
+            rd_gmem_blit(ring, device, render, &l, true);
+      }
+   }
+
+   if (result == VK_SUCCESS) {
+      OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+      OUT_RING(ring, 0);
+      rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
+      rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
+      OUT_PKT7(ring, CP_SET_RENDER_MODE, 5);
+      OUT_RING(ring, CP_SET_RENDER_MODE_0_MODE(BYPASS));
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      rd_flush(device, ring);
+      result = rd_finish_window_submit(device, submit, ring, window,
+                                       initial_ring_start, true);
+      if (result == VK_SUCCESS)
+         result = rd_render_resolves(device, render);
+   } else {
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+   }
+   return result;
 }
 
 /* --- internal clears ------------------------------------------------------ */
@@ -2731,7 +3150,7 @@ rd_resolve_view(struct rd_device *device, struct rd_image_view *src, struct rd_i
    draw.push[1] = dy;
    draw.descriptors[1] = &descriptor;
    util_dynarray_append(&render.draws, draw);
-   VkResult result = rd_execute_render(device, &render);
+   VkResult result = rd_execute_render(device, &render, NULL);
    util_dynarray_fini(&render.draws);
    return result;
 }
@@ -2894,7 +3313,7 @@ rd_blit_layer(struct rd_device *device, const struct rd_blit *blit, struct rd_pi
    memcpy(&draw.push[9], &src_w, sizeof(src_w));
    draw.descriptors[1] = &descriptor;
    util_dynarray_append(&render.draws, draw);
-   VkResult result = rd_execute_render(device, &render);
+   VkResult result = rd_execute_render(device, &render, NULL);
    util_dynarray_fini(&render.draws);
    return result;
 }
@@ -2988,7 +3407,7 @@ rd_execute_clear_ds(struct rd_device *device, const struct rd_blit *blit)
          struct rd_draw draw;
          rd_clear_draw(pipeline, area, -1, blit->aspects, value, &draw);
          util_dynarray_append(&render.draws, draw);
-         VkResult result = rd_execute_render(device, &render);
+         VkResult result = rd_execute_render(device, &render, NULL);
          util_dynarray_fini(&render.draws);
          if (result != VK_SUCCESS)
             return result;
@@ -3237,7 +3656,7 @@ rd_copy_texels(struct rd_device *device, struct rd_image *src, uint32_t src_leve
    memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
    draw.descriptors[1] = &descriptor;
    util_dynarray_append(&render.draws, draw);
-   VkResult result = rd_execute_render_direct(device, &render);
+   VkResult result = rd_execute_render_direct(device, &render, NULL);
    util_dynarray_fini(&render.draws);
    return result;
 }
@@ -3332,7 +3751,7 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
             for (unsigned i = 0; i < segment.color_count; i++)
                segment.color[i].resolve = NULL;
          }
-         result = rd_execute_render_direct(device, &segment);
+         result = rd_execute_render_direct(device, &segment, NULL);
          util_dynarray_fini(&queries);
          if (result == VK_SUCCESS && !last && area.extent.width && area.extent.height)
             result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area,

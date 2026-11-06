@@ -80,6 +80,7 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       sizeof(*device), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!device)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   device->submit_in_fence_fd = -1;
    struct vk_device_dispatch_table dispatch;
    vk_device_dispatch_table_from_entrypoints(&dispatch, &rd_device_entrypoints, true);
    VkResult result = vk_device_init(&device->vk, &physical->vk, &dispatch,
@@ -113,6 +114,18 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    device->queue.driver_submit = rd_queue_submit;
    device->vk.command_buffer_ops = &rd_command_buffer_ops;
    device->info = fd_dev_info(fd_pipe_dev_id(device->pipe));
+   uint64_t gmem_size = 0;
+   if (!fd_pipe_get_param(device->pipe, FD_GMEM_SIZE, &gmem_size) &&
+       gmem_size && gmem_size <= UINT32_MAX) {
+      device->gmem_size = (uint32_t)gmem_size;
+      device->gmem_size_valid = true;
+      uint64_t gmem_base = 0;
+      if (!fd_pipe_get_param(device->pipe, FD_GMEM_BASE, &gmem_base))
+         device->gmem_base = gmem_base;
+   }
+   if (device->gmem_size_valid && debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+      fprintf(stderr, "radish: gmem size=0x%x base=0x%" PRIx64 "\n",
+              device->gmem_size, device->gmem_base);
    const struct ir3_compiler_options options = { .disable_cache = true };
    device->compiler = ir3_compiler_create(device->fd, fd_pipe_dev_id(device->pipe),
                                          &device->info, &options);
@@ -155,6 +168,7 @@ rd_DestroyDevice(VkDevice handle, const VkAllocationCallbacks *allocator)
    if (!device)
       return;
    vk_queue_finish(&device->queue);
+   rd_queue_drain_pending(device);
    rd_meta_finish(device);
    simple_mtx_destroy(&device->meta_mutex);
    rd_trace_finish(device);

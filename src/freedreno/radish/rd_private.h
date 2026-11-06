@@ -36,6 +36,19 @@
 struct fd_ringbuffer;
 struct fd_submit;
 
+struct rd_pending_submit {
+   struct fd_submit *submit;
+   struct fd_ringbuffer *ring;
+   struct fd_fence *fence;
+   struct fd_bo *cs_backing;
+};
+
+struct rd_submit_window {
+   struct rd_pending_submit pending[8];
+   unsigned count, chunks, cs_bytes, bo_refs, backing_bytes;
+   size_t metadata_bytes;
+};
+
 struct rd_instance { struct vk_instance vk; };
 struct rd_physical_device {
    struct vk_physical_device vk;
@@ -60,6 +73,12 @@ struct rd_device {
    uint32_t seqno;
    uint64_t submit_count;
    uint64_t faults;
+   struct rd_submit_window submit_window;
+   int submit_in_fence_fd;
+   /* queried once, used by the opt-in color-only GMEM render path */
+   uint32_t gmem_size;
+   uint64_t gmem_base;
+   bool gmem_size_valid;
    struct list_head active_queries;
    uint32_t queue_priority;
    struct rd_trace *trace;
@@ -357,7 +376,13 @@ bool rd_lower_stage_buffers(struct nir_shader *nir, struct rd_pipeline *stage);
 /* rd_graphics.c */
 bool rd_graphics_enabled(void);
 void rd_meta_finish(struct rd_device *device);
-VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render);
+VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render,
+                           struct rd_submit_window *window);
+VkResult rd_finish_window_submit(struct rd_device *device,
+                                 struct fd_submit *submit,
+                                 struct fd_ringbuffer *ring,
+                                 struct rd_submit_window *window,
+                                 uint32_t *initial_ring_start, bool render);
 VkResult rd_execute_blit(struct rd_device *device, const struct rd_blit *blit);
 void rd_render_free(struct rd_command_buffer *command, struct rd_render *render);
 bool rd_render_query(struct rd_command_buffer *command, struct rd_query_pool *pool,
@@ -374,6 +399,7 @@ void rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ri
 void rd_emit_image_constants(struct fd_ringbuffer *ring,
                              const struct rd_dispatch *dispatch);
 VkResult rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit);
+VkResult rd_queue_drain_pending(struct rd_device *device);
 VkResult rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
                              const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
 void rd_wake_device_waiters(struct vk_device *device);

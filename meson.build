@@ -2186,7 +2186,7 @@ else
 endif
 
 yacc_is_bison = true
-needs_flex_bison = with_any_opengl or with_freedreno_vk or with_intel_tools or with_gallium
+needs_flex_bison = with_any_opengl or with_freedreno_vk or with_radish_vk or with_intel_tools or with_gallium
 
 if build_machine.system() == 'windows'
   # Prefer the winflexbison versions, they're much easier to install and have
