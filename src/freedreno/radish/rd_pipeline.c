@@ -409,10 +409,11 @@ rd_build_nir_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
       .max_compute_reg_footprint = 4096,
       .real_wavesize = rd_real_wavesize(),
       .push_consts_type = IR3_PUSH_CONSTS_PER_STAGE,
-      .push_consts_dwords = 32,
+      .push_consts_dwords = RD_MAX_PUSH_CONSTANTS_DWORDS,
       .const_allocs = {
-         .consts[IR3_CONST_ALLOC_PUSH_CONSTS] = { .offset_vec4 = 0, .size_vec4 = 8 },
-         .max_const_offset_vec4 = 8,
+         .consts[IR3_CONST_ALLOC_PUSH_CONSTS] = {
+            .offset_vec4 = 0, .size_vec4 = RD_MAX_PUSH_CONSTANTS_SIZE / 16 },
+         .max_const_offset_vec4 = RD_MAX_PUSH_CONSTANTS_SIZE / 16,
       },
    };
    ir3_finalize_nir(device->compiler, &options.nir_options, nir);

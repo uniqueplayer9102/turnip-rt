@@ -192,7 +192,20 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
    VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void *values)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   if (offset > 128 || size > 128 - offset) {
+   if (offset > RD_MAX_PUSH_CONSTANTS_SIZE ||
+       size > RD_MAX_PUSH_CONSTANTS_SIZE - offset) {
+      if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
+         VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
+         fprintf(stderr,
+                 "radish: rejected push constants offset=%u size=%u stages=0x%x max=%u\n",
+                 offset, size, stages, RD_MAX_PUSH_CONSTANTS_SIZE);
+         for (uint32_t i = 0; i < pipeline_layout->push_range_count; i++) {
+            const VkPushConstantRange *range = &pipeline_layout->push_ranges[i];
+            fprintf(stderr,
+                    "radish: push range[%u] offset=%u size=%u stages=0x%x\n",
+                    i, range->offset, range->size, range->stageFlags);
+         }
+      }
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }

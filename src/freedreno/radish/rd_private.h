@@ -28,6 +28,11 @@
 #include "util/u_debug.h"
 #include <stdio.h>
 
+#define RD_MAX_PUSH_CONSTANTS_SIZE 256
+#define RD_MAX_PUSH_CONSTANTS_DWORDS (RD_MAX_PUSH_CONSTANTS_SIZE / sizeof(uint32_t))
+
+
+
 struct fd_ringbuffer;
 struct fd_submit;
 
@@ -164,7 +169,7 @@ struct rd_dispatch {
    struct rd_descriptor descriptors[RD_MAX_ACTIVE_RESOURCES];
    struct rd_descriptor_set *sets[RD_MAX_SETS];
    uint32_t dynamic_offsets[RD_MAX_ACTIVE_RESOURCES];
-   uint32_t push[32], grid[3], base[3];
+   uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS], grid[3], base[3];
 };
 struct rd_event {
    struct vk_object_base base;
@@ -224,7 +229,7 @@ struct rd_draw {
    bool alpha_to_coverage;
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
-   uint32_t push[32];
+   uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS];
    /* descriptors of each stage's resources, copied when recorded */
    struct rd_descriptor *descriptors[2];
    /* the occlusion query active when the draw was recorded */
@@ -319,7 +324,7 @@ struct rd_command_buffer {
    struct rd_buffer *index_buffer;
    VkDeviceSize index_offset;
    VkIndexType index_type;
-   uint32_t push[32];
+   uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS];
    struct util_dynarray commands;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(rd_set_layout, vk.base, VkDescriptorSetLayout, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
