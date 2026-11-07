@@ -532,6 +532,16 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
    }
 }
 
+static uint32_t
+rd_image_max_side(VkImageType type, VkImageCreateFlags2KHR flags)
+{
+   if (type == VK_IMAGE_TYPE_3D)
+      return 256;
+   if (type == VK_IMAGE_TYPE_1D || (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
+      return 4096;
+   return RD_IMAGE_MAX_2D_SIZE;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
    const VkPhysicalDeviceImageFormatInfo2 *info, VkImageFormatProperties2 *out)
@@ -552,11 +562,11 @@ rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
         (info->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
          (external->handleType & ~external_handles))))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   uint32_t side = info->type == VK_IMAGE_TYPE_3D ? 256 : 4096;
+   uint32_t side = rd_image_max_side(info->type, info->flags);
    out->imageFormatProperties = (VkImageFormatProperties) {
       .maxExtent = {side, info->type == VK_IMAGE_TYPE_1D ? 1 : side,
                     info->type == VK_IMAGE_TYPE_3D ? side : 1},
-      .maxMipLevels = info->type == VK_IMAGE_TYPE_3D ? 9 : RD_IMAGE_MAX_LEVELS,
+      .maxMipLevels = util_logbase2(side) + 1,
       .maxArrayLayers = info->type == VK_IMAGE_TYPE_3D ? 1 : 256,
       .sampleCounts = rd_image_sample_counts(info->format, info->type, info->tiling, info->usage, info->flags),
       .maxResourceSize = RD_IMAGE_MAX_SIZE,
@@ -707,7 +717,7 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
    if ((flags & VK_IMAGE_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT) &&
        (info->mipLevels != 1 || info->arrayLayers != 1))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   uint32_t side = info->imageType == VK_IMAGE_TYPE_3D ? 256 : 4096;
+   uint32_t side = rd_image_max_side(info->imageType, flags);
    if (info->extent.width > side || info->extent.height > side || info->extent.depth > side ||
        (info->imageType == VK_IMAGE_TYPE_1D && (info->extent.height != 1 || info->extent.depth != 1)) ||
        (info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth != 1) ||

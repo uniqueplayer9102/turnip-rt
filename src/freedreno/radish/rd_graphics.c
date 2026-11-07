@@ -2495,9 +2495,31 @@ rd_execute_render_gmem_supported(struct rd_device *device,
    return true;
 }
 
-/* Configures every MRT slot like rd_gfx_sysmem_prep and fd5's emit_mrt do,
- * so the slots a render pass does not use stay disabled instead of leaking
- * state from an earlier submit. */
+/* This path only ever takes a single colour attachment, so slots 1..7 stay
+ * disabled for the whole render. Emitting them once before the tile loop
+ * instead of per tile keeps ~90 dwords per tile out of the ring. */
+static void
+rd_gmem_emit_mrt_disabled(struct fd_ringbuffer *ring)
+{
+   for (unsigned i = 1; i < A5XX_MAX_RENDER_TARGETS; i++) {
+      OUT_PKT4(ring, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_PKT4(ring, REG_A5XX_SP_FS_MRT_REG(i), 1);
+      OUT_RING(ring, 0);
+      OUT_PKT4(ring, REG_A5XX_RB_MRT_FLAG_BUFFER(i), 4);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+      OUT_RING(ring, 0);
+   }
+}
+
+/* Configures the active target. Slots 1..7 are left alone; they were
+ * disabled once by rd_gmem_emit_mrt_disabled before the tile loop. */
 static void
 rd_gmem_emit_mrt(struct fd_ringbuffer *ring, struct rd_device *device,
                  const struct rd_render *render,
@@ -2552,18 +2574,6 @@ rd_gmem_emit_mrt(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_PKT4(ring, REG_A5XX_RB_MRT_FLAG_BUFFER(0), 4);
    for (unsigned i = 0; i < 4; i++)
       OUT_RING(ring, 0);
-
-   /* disable the remaining targets */
-   for (unsigned i = 1; i < A5XX_MAX_RENDER_TARGETS; i++) {
-      OUT_PKT4(ring, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
-      OUT_RING(ring, 0);
-      OUT_RING(ring, 0);
-      OUT_RING(ring, 0);
-      OUT_RING(ring, 0);
-      OUT_RING(ring, 0);
-      OUT_PKT4(ring, REG_A5XX_SP_FS_MRT_REG(i), 1);
-      OUT_RING(ring, 0);
-   }
 }
 
 static void
@@ -2584,7 +2594,10 @@ rd_gmem_blit(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_RING(ring, store ? 0x00000004 : 0x00000000);
    if (store) {
       OUT_RELOC(ring, image->memory->bo,
-                image->memory_offset + level->offset, 0, 0);
+                image->memory_offset + level->offset +
+                (VkDeviceSize)view->base_array_layer *
+                   (image->vk.image_type == VK_IMAGE_TYPE_3D ?
+                       level->depth_pitch : level->array_pitch), 0, 0);
       OUT_RING(ring, A5XX_RB_BLIT_DST_PITCH(level->row_pitch));
       OUT_RING(ring, A5XX_RB_BLIT_DST_ARRAY_PITCH(level->array_pitch));
    } else {
@@ -2597,6 +2610,68 @@ rd_gmem_blit(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_RING(ring, A5XX_RB_BLIT_CNTL_BUF(BLIT_MRT0));
 
    rd_event(ring, device, CCU_RESOLVE, true);
+}
+
+/* Reference a recorded draw stream from the tile's command ring. One
+ * CP_INDIRECT_BUFFER per ring chunk, matching how freedreno's a5xx path
+ * re-uses batch->draw across tiles. */
+static void
+rd_gmem_emit_draw_ib(struct fd_ringbuffer *ring, struct fd_ringbuffer *draw_ring)
+{
+   for (uint32_t i = 0; i < fd_ringbuffer_cmd_count(draw_ring); i++) {
+      uint64_t iova;
+      uint32_t size = fd_ringbuffer_attach_ring(ring, draw_ring, i, &iova);
+      if (!size)
+         continue;
+      OUT_PKT7(ring, CP_INDIRECT_BUFFER, 3);
+      OUT_RING(ring, iova & 0xffffffff);
+      OUT_RING(ring, iova >> 32);
+      OUT_RING(ring, size / sizeof(uint32_t));
+   }
+}
+
+struct rd_gmem_draw_seg {
+   uint32_t first_chunk, last_chunk;
+   uint32_t first_offset, last_offset;
+   int64_t minx, miny, maxx, maxy;
+   bool cullable;
+};
+
+static void
+rd_gmem_draw_bounds(const struct rd_render *render, const struct rd_draw *draw,
+                    struct rd_gmem_draw_seg *seg)
+{
+   seg->minx = MAX2(draw->scissor.offset.x, render->area.offset.x);
+   seg->miny = MAX2(draw->scissor.offset.y, render->area.offset.y);
+   seg->maxx = MIN2((int64_t)draw->scissor.offset.x + draw->scissor.extent.width,
+                   (int64_t)render->area.offset.x + render->area.extent.width);
+   seg->maxy = MIN2((int64_t)draw->scissor.offset.y + draw->scissor.extent.height,
+                   (int64_t)render->area.offset.y + render->area.extent.height);
+   const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
+   seg->cullable = !gfx->vs.res->resource_count && gfx->fs.v->has_no_side_effects;
+}
+
+static unsigned
+rd_gmem_emit_draw_seg(struct fd_ringbuffer *ring, struct fd_ringbuffer *draw_ring,
+                      const struct rd_gmem_draw_seg *seg)
+{
+   unsigned ibs = 0;
+   for (uint32_t chunk = seg->first_chunk; chunk <= seg->last_chunk; chunk++) {
+      uint64_t iova;
+      uint32_t size = fd_ringbuffer_attach_ring(ring, draw_ring, chunk, &iova);
+      uint32_t first = chunk == seg->first_chunk ? seg->first_offset : 0;
+      uint32_t last = chunk == seg->last_chunk ? seg->last_offset : size / 4;
+      assert(first <= last && last <= size / 4);
+      if (first == last)
+         continue;
+      iova += (uint64_t)first * sizeof(uint32_t);
+      OUT_PKT7(ring, CP_INDIRECT_BUFFER, 3);
+      OUT_RING(ring, iova & 0xffffffff);
+      OUT_RING(ring, iova >> 32);
+      OUT_RING(ring, last - first);
+      ibs++;
+   }
+   return ibs;
 }
 
 static void
@@ -2622,9 +2697,16 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
 {
    const struct rd_image_view *view = render->color[0].view;
    const struct rd_image *image = container_of(view->vk.image, struct rd_image, vk);
-   uint32_t width = render->area.extent.width;
-   uint32_t height = render->area.extent.height;
    const struct fd_dev_info *info = &device->info;
+   uint32_t minx = render->area.offset.x & ~(info->gmem_align_w - 1);
+   uint32_t miny = render->area.offset.y & ~(info->gmem_align_h - 1);
+   uint32_t area_maxx = render->area.offset.x + render->area.extent.width;
+   uint32_t area_maxy = render->area.offset.y + render->area.extent.height;
+   VkExtent3D extent = vk_image_mip_level_extent(&image->vk, view->vk.base_mip_level);
+   uint32_t maxx = MIN2(align(area_maxx, info->gmem_align_w), extent.width);
+   uint32_t maxy = MIN2(align(area_maxy, info->gmem_align_h), extent.height);
+   uint32_t width = maxx - minx;
+   uint32_t height = maxy - miny;
 
    struct rd_gmem_layout l;
    if (!rd_gmem_layout_init(&l, image->texel_size, width, height,
@@ -2645,12 +2727,51 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    }
    uint32_t *initial_ring_start = ring->start;
 
+   struct fd_ringbuffer *draw_ring = fd_submit_new_ringbuffer(submit, 0,
+      FD_RINGBUFFER_GROWABLE);
+   if (!draw_ring) {
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   VkResult result = VK_SUCCESS;
+   size_t ndraws = util_dynarray_num_elements(&render->draws, struct rd_draw);
+   struct rd_gmem_draw_seg *segs = calloc(ndraws, sizeof(*segs));
+   if (!segs) {
+      fd_ringbuffer_del(draw_ring);
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   size_t nr_segs = 0;
+   bool cull = debug_get_bool_option("RADISH_GMEM_CULL", true);
+   uint64_t candidates = 0, skipped = 0, draw_ibs = 0;
+   util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+      struct rd_draw d = *draw;
+      if (d.indirect && rd_resolve_draw_indirect(device, &d) != VK_SUCCESS) {
+         result = VK_ERROR_UNKNOWN;
+         break;
+      }
+      if (!d.vertex_count || !d.instance_count)
+         continue;
+      struct rd_gmem_draw_seg *seg = &segs[nr_segs];
+      seg->first_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
+      seg->first_offset = draw_ring->cur - draw_ring->start;
+      rd_gfx_draw(draw_ring, device, render, &d, NULL);
+      seg->last_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
+      seg->last_offset = draw_ring->cur - draw_ring->start;
+      rd_gmem_draw_bounds(render, &d, seg);
+      nr_segs++;
+   }
+
    rd_gfx_restore(ring, device);
    /* bisect probe: honored only when RADISH_GMEM_STOP is set to a stage
     * __LINE__ (see RD_GMEM_STAGE); unset means run the full GMEM path */
    long stop_at = debug_get_num_option("RADISH_GMEM_STOP", -1);
 #define RD_GMEM_STAGE(name) if (stop_at && stop_at == __LINE__) { \
       rd_flush(device, ring); \
+      fd_ringbuffer_del(draw_ring); \
+      free(segs); \
       return rd_finish_window_submit(device, submit, ring, window, \
                                      initial_ring_start, true); }
 
@@ -2688,18 +2809,19 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    OUT_RING(ring, CP_SET_RENDER_MODE_3_GMEM_ENABLE);
    OUT_RING(ring, 0x1);
    rd_gmem_emit_msaa_once(ring);
+   /* stencil/register state that never changes across tiles is written here
+    * rather than repeated for each tile */
+   rd_gmem_emit_mrt_disabled(ring);
 
-   VkResult result = VK_SUCCESS;
-   struct rd_gfx_program_cache program_cache = {0};
    bool load = render->color[0].load == VK_ATTACHMENT_LOAD_OP_LOAD;
    bool store = render->color[0].store == VK_ATTACHMENT_STORE_OP_STORE;
 
    for (uint32_t ty = 0; ty < nbins_y && result == VK_SUCCESS; ty++) {
       for (uint32_t tx = 0; tx < nbins_x; tx++) {
-         uint32_t x1 = render->area.offset.x + tx * l.bin_w;
-         uint32_t y1 = render->area.offset.y + ty * l.bin_h;
-         uint32_t tw = MIN2(l.bin_w, render->area.offset.x + width - x1);
-         uint32_t th = MIN2(l.bin_h, render->area.offset.y + height - y1);
+         uint32_t x1 = minx + tx * l.bin_w;
+         uint32_t y1 = miny + ty * l.bin_h;
+         uint32_t tw = MIN2(l.bin_w, maxx - x1);
+         uint32_t th = MIN2(l.bin_h, maxy - y1);
          if (tw == 0 || th == 0)
             continue;
 
@@ -2718,8 +2840,10 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
          OUT_RING(ring, A5XX_RB_WINDOW_OFFSET_X(x1) | A5XX_RB_WINDOW_OFFSET_Y(y1));
 
          RD_GMEM_STAGE(tile_prep)
-         if (load) {
-            rd_gmem_emit_msaa_once(ring);
+         bool preserve = x1 < (uint32_t)render->area.offset.x ||
+                         y1 < (uint32_t)render->area.offset.y ||
+                         x1 + tw > area_maxx || y1 + th > area_maxy;
+         if (load || preserve) {
             OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
             OUT_RING(ring, A5XX_RB_CNTL_WIDTH(l.bin_w) |
                               A5XX_RB_CNTL_HEIGHT(l.bin_h) | A5XX_RB_CNTL_BYPASS);
@@ -2730,29 +2854,42 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
 
          RD_GMEM_STAGE(restore_done)
          /* GMEM as render target */
-         rd_gmem_emit_msaa_once(ring);
          OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
          OUT_RING(ring, A5XX_RB_CNTL_WIDTH(l.bin_w) | A5XX_RB_CNTL_HEIGHT(l.bin_h));
          rd_gmem_emit_mrt(ring, device, render, &l, true);
 
-         util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
-            struct rd_draw d = *draw;
-            if (d.indirect && rd_resolve_draw_indirect(device, &d) != VK_SUCCESS) {
-               result = VK_ERROR_UNKNOWN;
-               break;
+         candidates += nr_segs;
+         if (cull) {
+            int64_t tmaxx = (int64_t)x1 + tw;
+            int64_t tmaxy = (int64_t)y1 + th;
+            for (size_t s = 0; s < nr_segs; s++) {
+               const struct rd_gmem_draw_seg *seg = &segs[s];
+               if (seg->cullable &&
+                   (seg->maxx <= seg->minx || seg->maxy <= seg->miny ||
+                    seg->maxx <= x1 || seg->minx >= tmaxx ||
+                    seg->maxy <= y1 || seg->miny >= tmaxy)) {
+                  skipped++;
+                  continue;
+               }
+               draw_ibs += rd_gmem_emit_draw_seg(ring, draw_ring, seg);
             }
-            if (!d.vertex_count || !d.instance_count)
-               continue;
-            rd_gfx_draw(ring, device, render, &d, &program_cache);
+         } else {
+            draw_ibs += fd_ringbuffer_cmd_count(draw_ring);
+            rd_gmem_emit_draw_ib(ring, draw_ring);
          }
-         if (result != VK_SUCCESS)
-            break;
 
          if (store)
             rd_gmem_blit(ring, device, render, &l, true);
       }
    }
 
+   if (debug_get_bool_option("RADISH_GMEM_DUMP", false))
+      fprintf(stderr, "radish gmem cull: draws=%zu chunks=%u candidates=%" PRIu64
+              " skipped=%" PRIu64 " ibs=%" PRIu64 " enabled=%u\n",
+              nr_segs, fd_ringbuffer_cmd_count(draw_ring), candidates, skipped,
+              draw_ibs, cull);
+   fd_ringbuffer_del(draw_ring);
+   free(segs);
    if (result == VK_SUCCESS) {
       OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
       OUT_RING(ring, 0);

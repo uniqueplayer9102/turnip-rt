@@ -6,7 +6,8 @@
 #include "vk_buffer_view.h"
 #include "vk_sampler.h"
 
-#define RD_IMAGE_MAX_LEVELS 13
+#define RD_IMAGE_MAX_2D_SIZE 8192
+#define RD_IMAGE_MAX_LEVELS 14
 #define RD_IMAGE_MAX_SIZE (UINT32_MAX - 4095ull)
 
 struct rd_device;
