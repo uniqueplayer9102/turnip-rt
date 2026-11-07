@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "util/cache_ops.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "util/u_debug.h"
 #include "vk_format.h"
@@ -479,6 +480,8 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
       attachment |= VK_FORMAT_FEATURE_BLIT_SRC_BIT;
    if (rd_image_required_blit_dst(format))
       attachment |= VK_FORMAT_FEATURE_BLIT_DST_BIT;
+   VkFormatFeatureFlags linear_blit = rd_image_required_blit_dst(format) ?
+      VK_FORMAT_FEATURE_BLIT_DST_BIT : 0;
    if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) {
       attachment |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
       if (rd_image_color_blend_supported(format))
@@ -487,7 +490,8 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
       attachment |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
    out->formatProperties = (VkFormatProperties) {
-      .linearTilingFeatures = vk_format_is_compressed(format) ? 0 : flags, .optimalTilingFeatures = flags | attachment,
+      .linearTilingFeatures = vk_format_is_compressed(format) ? 0 : flags | linear_blit,
+      .optimalTilingFeatures = flags | attachment,
       .bufferFeatures = buffer,
    };
    VkFormatFeatureFlags2 flags2 = flags;
@@ -496,7 +500,7 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
    vk_foreach_struct(sType, next, out->pNext) {
       if (sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
          VkFormatProperties3 *properties = (VkFormatProperties3 *)next;
-         properties->linearTilingFeatures = vk_format_is_compressed(format) ? 0 : flags2;
+         properties->linearTilingFeatures = vk_format_is_compressed(format) ? 0 : flags2 | linear_blit;
          properties->optimalTilingFeatures = flags2 | attachment;
          properties->bufferFeatures = buffer;
       }
@@ -606,6 +610,10 @@ rd_image_layout(struct rd_image *image)
        (image->vk.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
        (rd_shader_format_supported(image->vk.format) || image->vk.samples != VK_SAMPLE_COUNT_1_BIT))
       shader = true;
+   if (image->vk.tiling == VK_IMAGE_TILING_LINEAR &&
+       (image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+       rd_image_required_blit_dst(image->vk.format))
+      shader = true;
    VkDeviceSize limit = RD_IMAGE_MAX_SIZE;
    if (shader) {
       const struct fdl_image_params parameters = {
@@ -668,6 +676,9 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
 {
    VK_FROM_HANDLE(rd_device, device, handle);
    *out = VK_NULL_HANDLE;
+   if (wsi_common_is_swapchain_image(info))
+      return wsi_common_create_swapchain_image(device->vk.physical->wsi_device,
+                                               info, out);
    VkImageCreateFlags2KHR flags = vk_image_create_flags(info);
    const VkImageDrmFormatModifierListCreateInfoEXT *modifier_list =
       vk_find_struct_const(info->pNext, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
@@ -793,9 +804,17 @@ VKAPI_ATTR void VKAPI_CALL
 rd_GetImageMemoryRequirements2(VkDevice handle, const VkImageMemoryRequirementsInfo2 *info,
                               VkMemoryRequirements2 *out)
 {
+   VK_FROM_HANDLE(rd_device, device, handle);
    VK_FROM_HANDLE(rd_image, image, info->image);
+   struct rd_physical_device *physical =
+      container_of(device->vk.physical, struct rd_physical_device, vk);
+   bool cached = physical->has_cached_memory && !image->vk.external_handle_types &&
+      image->vk.image_type == VK_IMAGE_TYPE_2D &&
+      image->vk.tiling == VK_IMAGE_TILING_LINEAR &&
+      image->vk.usage == VK_IMAGE_USAGE_TRANSFER_DST_BIT &&
+      rd_image_required_blit_dst(image->vk.format);
    out->memoryRequirements = (VkMemoryRequirements) {
-      .size = image->size, .alignment = 64, .memoryTypeBits = 1,
+      .size = image->size, .alignment = 64, .memoryTypeBits = cached ? 3 : 1,
    };
    vk_foreach_struct(sType, next, out->pNext) {
       if (sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
@@ -817,13 +836,27 @@ rd_GetImageMemoryRequirements(VkDevice handle, VkImage image, VkMemoryRequiremen
    *out = result.memoryRequirements;
 }
 
+static struct rd_memory *
+rd_image_bind_memory(const VkBindImageMemoryInfo *info)
+{
+   const VkBindImageMemorySwapchainInfoKHR *swapchain =
+      vk_find_struct_const(info->pNext, BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
+   if (swapchain && swapchain->swapchain) {
+      if (info->memoryOffset)
+         return NULL;
+      return rd_memory_from_handle(wsi_common_get_memory(swapchain->swapchain,
+                                                         swapchain->imageIndex));
+   }
+   return rd_memory_from_handle(info->memory);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 rd_BindImageMemory2(VkDevice handle, uint32_t count, const VkBindImageMemoryInfo *infos)
 {
    VK_FROM_HANDLE(rd_device, device, handle);
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(rd_image, image, infos[i].image);
-      VK_FROM_HANDLE(rd_memory, memory, infos[i].memory);
+      struct rd_memory *memory = rd_image_bind_memory(&infos[i]);
       const VkBindImageMemoryDeviceGroupInfo *group =
          vk_find_struct_const(infos[i].pNext, BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO);
       if (group) {
@@ -849,7 +882,7 @@ rd_BindImageMemory2(VkDevice handle, uint32_t count, const VkBindImageMemoryInfo
    }
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(rd_image, image, infos[i].image);
-      image->memory = rd_memory_from_handle(infos[i].memory);
+      image->memory = rd_image_bind_memory(&infos[i]);
       image->memory_offset = infos[i].memoryOffset;
    }
    return VK_SUCCESS;
@@ -1399,7 +1432,7 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
    if (src && src->bo != dst->bo && fd_bo_cpu_prep(src->bo, device->pipe, FD_BO_PREP_READ | FD_BO_PREP_NOSYNC))
       return VK_ERROR_DEVICE_LOST;
    uint32_t flags = FD_BO_PREP_WRITE | FD_BO_PREP_NOSYNC;
-   if ((src && src->bo == dst->bo) || transfer->copy_mask || transfer->lane_step)
+   if ((src && src->bo == dst->bo) || transfer->copy_mask || transfer->lane_step || dst->cached)
       flags |= FD_BO_PREP_READ;
    if (fd_bo_cpu_prep(dst->bo, device->pipe, flags))
       return VK_ERROR_DEVICE_LOST;
@@ -1407,6 +1440,10 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
    const uint8_t *src_map = src ? fd_bo_map(src->bo) : NULL;
    if (!dst_map || (src && !src_map))
       return VK_ERROR_MEMORY_MAP_FAILED;
+   if (src && src->cached)
+      util_flush_inval_range((void *)src_map, src->vk.size);
+   if (dst->cached)
+      util_flush_inval_range(dst_map, dst->vk.size);
    __sync_synchronize();
    for (uint32_t z = 0; z < transfer->slices; z++) {
       for (uint32_t y = 0; y < transfer->rows; y++) {
@@ -1436,6 +1473,8 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
          }
       }
    }
+   if (dst->cached)
+      util_flush_range(dst_map, dst->vk.size);
    __sync_synchronize();
    return VK_SUCCESS;
 }

@@ -14,6 +14,7 @@
 #include "vk_physical_device.h"
 #include "vk_queue.h"
 #include "vk_query_pool.h"
+#include "wsi_common.h"
 #include "util/u_thread.h"
 #include "util/simple_mtx.h"
 #include "vk_descriptor_set_layout.h"
@@ -54,11 +55,13 @@ struct rd_physical_device {
    struct vk_physical_device vk;
    struct fd_device *fd;
    int render_fd;
+   bool has_cached_memory;
    struct vk_sync_type sync_type;
    VkResult (*sync_wait_many)(struct vk_device *device, uint32_t count,
                               const struct vk_sync_wait *waits,
                               enum vk_sync_wait_flags flags, uint64_t deadline);
    const struct vk_sync_type *sync_types[2];
+   struct wsi_device wsi;
 };
 struct rd_device {
    struct vk_device vk;
@@ -92,6 +95,7 @@ struct rd_memory {
    struct vk_device_memory vk;
    struct fd_bo *bo;
    void *map;
+   bool cached;
 };
 struct rd_buffer {
    struct vk_buffer vk;
@@ -375,6 +379,8 @@ const struct rd_nir_resource_binding *rd_pipeline_resource(void *data, uint32_t 
 bool rd_lower_stage_buffers(struct nir_shader *nir, struct rd_pipeline *stage);
 /* rd_graphics.c */
 bool rd_graphics_enabled(void);
+VkResult rd_wsi_init(struct rd_physical_device *physical);
+void rd_wsi_finish(struct rd_physical_device *physical);
 void rd_meta_finish(struct rd_device *device);
 VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render,
                            struct rd_submit_window *window);

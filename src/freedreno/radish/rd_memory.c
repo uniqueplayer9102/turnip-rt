@@ -1,12 +1,16 @@
 #include "rd_private.h"
 #include <limits.h>
 #include "util/u_math.h"
+#include "util/cache_ops.h"
+#include "drm/msm/msm_common.h"
 
 VKAPI_ATTR VkResult VKAPI_CALL
 rd_AllocateMemory(VkDevice handle, const VkMemoryAllocateInfo *info,
                   const VkAllocationCallbacks *allocator, VkDeviceMemory *out)
 {
    VK_FROM_HANDLE(rd_device, device, handle);
+   struct rd_physical_device *physical =
+      container_of(device->vk.physical, struct rd_physical_device, vk);
    *out = VK_NULL_HANDLE;
    const VkMemoryAllocateFlagsInfo *flags =
       vk_find_struct_const(info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
@@ -15,13 +19,19 @@ rd_AllocateMemory(VkDevice handle, const VkMemoryAllocateInfo *info,
    if (flags && ((flags->flags & ~VK_MEMORY_ALLOCATE_DEVICE_MASK_BIT) ||
                  ((flags->flags & VK_MEMORY_ALLOCATE_DEVICE_MASK_BIT) && flags->deviceMask != 1)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   if (info->memoryTypeIndex != 0 || !info->allocationSize ||
+   if (info->memoryTypeIndex > 1 ||
+       (info->memoryTypeIndex == 1 && !physical->has_cached_memory) || !info->allocationSize ||
        info->allocationSize > UINT32_MAX - 4095)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    struct rd_memory *memory = vk_device_memory_create(&device->vk, info,
                                                       allocator, sizeof(*memory));
    if (!memory)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   memory->cached = info->memoryTypeIndex == 1;
+   if (memory->cached && (fd_info || memory->vk.export_handle_types)) {
+      vk_device_memory_destroy(&device->vk, allocator, &memory->vk);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
    if (fd_info) {
       if (fd_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
           fd_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
@@ -36,15 +46,39 @@ rd_AllocateMemory(VkDevice handle, const VkMemoryAllocateInfo *info,
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       }
       close(fd_info->fd);
+   } else if (memory->cached) {
+      uint32_t size = align64(info->allocationSize, 4096);
+      uint32_t gem_handle;
+      int fd = fd_device_fd(device->fd);
+      if (!msm_common_gem_new(fd, size, MSM_BO_CACHED, &gem_handle)) {
+         memory->bo = fd_bo_from_handle(device->fd, gem_handle, size);
+         if (!memory->bo)
+            msm_common_gem_close(fd, gem_handle);
+      }
    } else {
+      const struct wsi_memory_allocate_info *wsi_info =
+         vk_find_struct_const(info->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA);
+      uint32_t bo_flags = FD_BO_HINT_BUFFER;
+      if (memory->vk.export_handle_types ||
+          (wsi_info && (wsi_info->implicit_sync || wsi_info->dma_buf_sync_file)))
+         bo_flags |= FD_BO_SHARED;
       memory->bo = fd_bo_new(device->fd, align64(info->allocationSize, 4096),
-                              FD_BO_HINT_BUFFER, "radish-memory");
+                              bo_flags, "radish-memory");
    }
    if (!memory->bo) {
       vk_device_memory_destroy(&device->vk, allocator, &memory->vk);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
    memory->bo->bo_reuse = NO_CACHE;
+   if (memory->cached) {
+      void *map = fd_bo_map(memory->bo);
+      if (!map) {
+         fd_bo_del(memory->bo);
+         vk_device_memory_destroy(&device->vk, allocator, &memory->vk);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      util_flush_range(map, fd_bo_size(memory->bo));
+   }
    *out = rd_memory_to_handle(memory);
    return VK_SUCCESS;
 }
@@ -121,6 +155,17 @@ VKAPI_ATTR VkResult VKAPI_CALL
 rd_FlushMappedMemoryRanges(VkDevice handle, uint32_t count,
                            const VkMappedMemoryRange *ranges)
 {
+   for (uint32_t i = 0; i < count; i++) {
+      VK_FROM_HANDLE(rd_memory, memory, ranges[i].memory);
+      if (!memory->cached)
+         continue;
+      if (!memory->map || ranges[i].offset >= memory->vk.size ||
+          (ranges[i].size != VK_WHOLE_SIZE && ranges[i].size > memory->vk.size - ranges[i].offset))
+         return VK_ERROR_MEMORY_MAP_FAILED;
+      VkDeviceSize size = ranges[i].size == VK_WHOLE_SIZE ?
+         memory->vk.size - ranges[i].offset : ranges[i].size;
+      util_flush_range((uint8_t *)memory->map + ranges[i].offset, size);
+   }
    __sync_synchronize();
    return VK_SUCCESS;
 }
@@ -134,6 +179,14 @@ rd_InvalidateMappedMemoryRanges(VkDevice handle, uint32_t count,
       VK_FROM_HANDLE(rd_memory, memory, ranges[i].memory);
       if (fd_bo_cpu_prep(memory->bo, device->pipe, FD_BO_PREP_READ))
          return VK_ERROR_DEVICE_LOST;
+      if (memory->cached) {
+         if (!memory->map || ranges[i].offset >= memory->vk.size ||
+             (ranges[i].size != VK_WHOLE_SIZE && ranges[i].size > memory->vk.size - ranges[i].offset))
+            return VK_ERROR_MEMORY_MAP_FAILED;
+         VkDeviceSize size = ranges[i].size == VK_WHOLE_SIZE ?
+            memory->vk.size - ranges[i].offset : ranges[i].size;
+         util_flush_inval_range((uint8_t *)memory->map + ranges[i].offset, size);
+      }
    }
    __sync_synchronize();
    return VK_SUCCESS;

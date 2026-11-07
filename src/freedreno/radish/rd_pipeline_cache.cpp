@@ -15,7 +15,7 @@ static constexpr size_t meta_a = offsetof(rd_pipeline, descriptor_count);
 static constexpr size_t meta_a_size = offsetof(rd_pipeline, sampling_nir) - meta_a;
 static constexpr size_t meta_b = offsetof(rd_pipeline, sampling_mask);
 static constexpr size_t meta_b_size = sizeof(rd_pipeline) - meta_b;
-static constexpr uint32_t cache_version = 2;
+static constexpr uint32_t cache_version = 3;
 static constexpr size_t cache_max_entry = 64 * 1024 * 1024;
 struct rd_cache_object {
    vk_pipeline_cache_object base;
@@ -104,25 +104,40 @@ static vk_pipeline_cache_object *deserialize(vk_pipeline_cache *cache,
 
 
 
-static bool variant_bounds(rd_device *device, const void *data, size_t size)
+static bool variant_bounds(rd_device *device, const void *data, size_t size,
+                           VkShaderStageFlagBits stage)
 {
    blob_reader in;
    blob_reader_init(&in, data, size);
-   blob_skip_bytes(&in, sizeof(ir3_shader_key));
-   if (blob_read_uint32(&in) != MESA_SHADER_COMPUTE)
+   ir3_shader_key key = {};
+   blob_copy_bytes(&in, &key, sizeof(key));
+   uint32_t type = blob_read_uint32(&in);
+   uint32_t expected = stage == VK_SHADER_STAGE_VERTEX_BIT ? MESA_SHADER_VERTEX :
+                       stage == VK_SHADER_STAGE_FRAGMENT_BIT ? MESA_SHADER_FRAGMENT :
+                       stage == VK_SHADER_STAGE_COMPUTE_BIT ? MESA_SHADER_COMPUTE : UINT32_MAX;
+   if (in.overrun || type != expected || expected == UINT32_MAX ||
+       blob_read_uint8(&in) > 1)
       return false;
-   blob_read_uint8(&in); 
-   ir3_shader_variant v = {};
-   blob_copy_bytes(&in, VARIANT_CACHE_PTR(&v), VARIANT_CACHE_SIZE);
-   if (in.overrun || !v.info.size || v.info.size > size_t(in.end - in.current))
-      return false;
-   blob_skip_bytes(&in, v.info.size);
-   blob_skip_bytes(&in, sizeof(struct ir3_const_state));
-   if (!device->compiler->info->props.load_shader_consts_via_preamble) {
-      uint32_t count = blob_read_uint32(&in);
-      if (in.overrun || count > size_t(in.end - in.current) / sizeof(uint32_t))
+   if (type != MESA_SHADER_COMPUTE) {
+      const ir3_shader_key zero = {};
+      if (memcmp(&key, &zero, sizeof(key)))
          return false;
-      blob_skip_bytes(&in, size_t(count) * sizeof(uint32_t));
+   }
+   const unsigned variants = type == MESA_SHADER_VERTEX && ir3_has_binning_vs(&key) ? 2 : 1;
+   for (unsigned i = 0; i < variants; i++) {
+      ir3_shader_variant v = {};
+      blob_copy_bytes(&in, VARIANT_CACHE_PTR(&v), VARIANT_CACHE_SIZE);
+      if (in.overrun || !v.info.size || v.info.size > size_t(in.end - in.current))
+         return false;
+      blob_skip_bytes(&in, v.info.size);
+      if (!i)
+         blob_skip_bytes(&in, sizeof(struct ir3_const_state));
+      if (!device->compiler->info->props.load_shader_consts_via_preamble) {
+         uint32_t count = blob_read_uint32(&in);
+         if (in.overrun || count > size_t(in.end - in.current) / sizeof(uint32_t))
+            return false;
+         blob_skip_bytes(&in, size_t(count) * sizeof(uint32_t));
+      }
    }
    return !in.overrun && in.current == in.end;
 }
@@ -154,7 +169,9 @@ rd_pipeline_cache_restore(rd_device *device, rd_pipeline *pipeline,
       saved.resource_usage.texture_count <= 16 && saved.resource_usage.sampler_count <= 16 &&
       saved.resource_usage.image_count <= 16 && saved.compile_flags == flags &&
       uint64_t(native_size) + nir_size == uint64_t(in.end - in.current) &&
-      variant_bounds(device, in.current, native_size);
+      variant_bounds(device, in.current, native_size, stage->stage);
+   if (stage->stage != VK_SHADER_STAGE_COMPUTE_BIT)
+      valid = valid && !nir_size && saved.buffer_count <= 16;
    const ir3_shader_variant *variant = nullptr;
    nir_shader *nir = nullptr;
    if (valid) {

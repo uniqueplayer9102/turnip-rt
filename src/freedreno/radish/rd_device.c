@@ -83,6 +83,7 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    device->submit_in_fence_fd = -1;
    struct vk_device_dispatch_table dispatch;
    vk_device_dispatch_table_from_entrypoints(&dispatch, &rd_device_entrypoints, true);
+   vk_device_dispatch_table_from_entrypoints(&dispatch, &wsi_device_entrypoints, false);
    VkResult result = vk_device_init(&device->vk, &physical->vk, &dispatch,
                                     info, allocator);
    if (result != VK_SUCCESS) {

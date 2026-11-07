@@ -4,6 +4,8 @@
 #include "util/build_id.h"
 #include "freedreno_uuid.h"
 #include "util/u_memory.h"
+#include "util/cache_ops.h"
+#include "drm/msm/msm_common.h"
 #include "vk_util.h"
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -70,6 +72,12 @@ rd_GetPhysicalDeviceExternalSemaphorePropertiesKHR(VkPhysicalDevice handle,
 }
 
 static const struct vk_instance_extension_table rd_instance_extensions = {
+   .KHR_surface = true,
+   .KHR_get_surface_capabilities2 = true,
+   .EXT_headless_surface = true,
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+   .KHR_wayland_surface = true,
+#endif
    .KHR_get_physical_device_properties2 = true,
    .KHR_device_group_creation = true,
    .KHR_external_memory_capabilities = true,
@@ -78,6 +86,8 @@ static const struct vk_instance_extension_table rd_instance_extensions = {
 };
 
 static const struct vk_device_extension_table rd_device_extensions = {
+   .KHR_swapchain = true,
+   .KHR_incremental_present = true,
    .KHR_device_group = true,
    .KHR_descriptor_update_template = true,
    .KHR_maintenance3 = true,
@@ -123,6 +133,7 @@ static void
 rd_destroy_physical(struct vk_physical_device *base)
 {
    struct rd_physical_device *physical = container_of(base, struct rd_physical_device, vk);
+   rd_wsi_finish(physical);
    fd_device_del(physical->fd);
    close(physical->render_fd);
    vk_physical_device_finish(base);
@@ -185,6 +196,8 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    struct vk_physical_device_dispatch_table dispatch;
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch,
       &rd_physical_device_entrypoints, true);
+   vk_physical_device_dispatch_table_from_entrypoints(&dispatch,
+      &wsi_physical_device_entrypoints, false);
    struct vk_properties properties = {
       .apiVersion = VK_API_VERSION_1_1,
       .driverVersion = 1,
@@ -293,6 +306,11 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    properties.deviceNodeMask = 1;
    snprintf(properties.deviceName, sizeof(properties.deviceName),
             "Radish Adreno 506 (experimental compute)");
+   size_t cache_granularity = util_cache_granularity();
+   physical->has_cached_memory = cache_granularity &&
+      msm_common_is_memory_type_supported(fd_device_fd(fd), sysconf(_SC_PAGESIZE), MSM_BO_CACHED);
+   if (physical->has_cached_memory)
+      properties.nonCoherentAtomSize = MAX2(properties.nonCoherentAtomSize, cache_granularity);
    physical->sync_type = vk_drm_syncobj_get_type(render_fd);
    const bool sync_file = physical->sync_type.import_sync_file &&
                           physical->sync_type.export_sync_file;
@@ -327,6 +345,11 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    physical->sync_type.wait_many = rd_sync_wait_many;
    physical->sync_types[0] = &physical->sync_type;
    physical->vk.supported_sync_types = physical->sync_types;
+   result = rd_wsi_init(physical);
+   if (result != VK_SUCCESS) {
+      rd_destroy_physical(&physical->vk);
+      return result;
+   }
    *out = &physical->vk;
    return VK_SUCCESS;
 }
@@ -344,6 +367,8 @@ rd_CreateInstance(const VkInstanceCreateInfo *info,
    struct vk_instance_dispatch_table dispatch;
    vk_instance_dispatch_table_from_entrypoints(&dispatch,
                                                &rd_instance_entrypoints, true);
+   vk_instance_dispatch_table_from_entrypoints(&dispatch,
+                                               &wsi_instance_entrypoints, false);
    VkResult result = vk_instance_init(&instance->vk, &rd_instance_extensions,
                                       &dispatch, info, allocator);
    if (result != VK_SUCCESS) {
@@ -400,6 +425,7 @@ VKAPI_ATTR void VKAPI_CALL
 rd_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice handle,
                                      VkPhysicalDeviceMemoryProperties2 *out)
 {
+   VK_FROM_HANDLE(rd_physical_device, physical, handle);
    uint64_t total = 0;
    os_get_total_physical_memory(&total);
    out->memoryProperties = (VkPhysicalDeviceMemoryProperties) {
@@ -410,6 +436,15 @@ rd_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice handle,
       .memoryHeapCount = 1,
       .memoryHeaps = {{ .size = total / 2, .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT }},
    };
+   if (physical->has_cached_memory) {
+      out->memoryProperties.memoryTypeCount = 2;
+      out->memoryProperties.memoryTypes[1] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+         .heapIndex = 0,
+      };
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -226,8 +226,23 @@ rd_lower_view_index(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 static VkResult
 rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
                struct rd_gfx_shader *shader,
-               const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags)
+               VkPipelineCache cache, const VkPipelineShaderStageCreateInfo *stage,
+               VkPipelineCreateFlags flags)
 {
+   shader->res = vk_zalloc(&device->vk.alloc, sizeof(struct rd_pipeline), 8,
+                           VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!shader->res)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   shader->res->layout = pipeline->layout;
+   shader->res->compile_flags = flags;
+   bool cached = rd_pipeline_cache_restore(device, shader->res, cache, stage, flags);
+   if (debug_get_bool_option("RADISH_GFX_CACHE_DEBUG", false))
+      fprintf(stderr, "RADISH_GFX_CACHE stage=%u enabled=%u hit=%u\n",
+              stage->stage, cache != VK_NULL_HANDLE, cached);
+   if (cached) {
+      shader->v = shader->res->variant;
+      return rd_gfx_upload(device, shader);
+   }
    const struct spirv_to_nir_options spirv_options = {
       .ubo_addr_format = nir_address_format_32bit_index_offset,
       .ssbo_addr_format = nir_address_format_32bit_index_offset,
@@ -244,13 +259,6 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
          fprintf(stderr, "radish: shader to NIR failed (%d)\n", result);
       return result;
    }
-   shader->res = vk_zalloc(&device->vk.alloc, sizeof(struct rd_pipeline), 8,
-                           VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!shader->res) {
-      ralloc_free(nir);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-   shader->res->layout = pipeline->layout;
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       /* A vertex shader that never writes gl_Position (positions are then
@@ -314,6 +322,7 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
       ralloc_free(nir);
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
+   shader->res->descriptor_count = shader->res->resource_count;
    NIR_PASS(_, nir, nir_opt_dce);
    if (lower.ibo) {
       nir->info.num_ubos = 0;
@@ -348,7 +357,11 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    if (!shader->v)
       return VK_ERROR_UNKNOWN;
    shader->v->shader = NULL;
-   return rd_gfx_upload(device, shader);
+   shader->res->variant = shader->v;
+   result = rd_gfx_upload(device, shader);
+   if (result == VK_SUCCESS)
+      rd_pipeline_cache_store(device, shader->res, cache, stage, flags);
+   return result;
 }
 
 void
@@ -372,7 +385,8 @@ rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline)
 
 
 static VkResult
-rd_create_graphics_pipeline(struct rd_device *device, const VkGraphicsPipelineCreateInfo *info,
+rd_create_graphics_pipeline(struct rd_device *device, VkPipelineCache cache,
+                            const VkGraphicsPipelineCreateInfo *info,
                             const VkAllocationCallbacks *allocator, VkPipeline *out)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, layout, info->layout);
@@ -423,9 +437,9 @@ rd_create_graphics_pipeline(struct rd_device *device, const VkGraphicsPipelineCr
    if (result == VK_SUCCESS && (!vs || !fs))
       result = VK_ERROR_FEATURE_NOT_PRESENT;
    if (result == VK_SUCCESS)
-      result = rd_gfx_compile(device, pipeline, &gfx->vs, vs, info->flags);
+      result = rd_gfx_compile(device, pipeline, &gfx->vs, cache, vs, info->flags);
    if (result == VK_SUCCESS)
-      result = rd_gfx_compile(device, pipeline, &gfx->fs, fs, info->flags);
+      result = rd_gfx_compile(device, pipeline, &gfx->fs, cache, fs, info->flags);
    ralloc_free(empty_fs);
    if (result == VK_SUCCESS) {
       vk_dynamic_graphics_state_init(&gfx->dynamic);
@@ -451,11 +465,13 @@ rd_CreateGraphicsPipelines(VkDevice handle, VkPipelineCache cache, uint32_t coun
    VkPipeline *out)
 {
    VK_FROM_HANDLE(rd_device, device, handle);
+   if (!debug_get_bool_option("RADISH_GFX_CACHE", true))
+      cache = VK_NULL_HANDLE;
    VkResult failure = VK_SUCCESS;
    memset(out, 0, count * sizeof(*out));
    for (uint32_t i = 0; i < count; i++) {
       VkResult result = rd_graphics_enabled() ?
-         rd_create_graphics_pipeline(device, &infos[i], allocator, &out[i]) :
+         rd_create_graphics_pipeline(device, cache, &infos[i], allocator, &out[i]) :
          VK_ERROR_FEATURE_NOT_PRESENT;
       if (result != VK_SUCCESS)
          failure = result;
@@ -3006,7 +3022,7 @@ rd_clear_pipeline(struct rd_device *device)
             .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
             .pDynamicState = &dy, .layout = layout };
          VkPipeline handle;
-         if (rd_create_graphics_pipeline(device, &info, NULL, &handle) == VK_SUCCESS)
+         if (rd_create_graphics_pipeline(device, VK_NULL_HANDLE, &info, NULL, &handle) == VK_SUCCESS)
             device->clear_pipeline = rd_pipeline_from_handle(handle);
          device->vk.dispatch_table.DestroyPipelineLayout(rd_device_to_handle(device), layout, NULL);
       }
@@ -3234,7 +3250,7 @@ rd_meta_pipeline(struct rd_device *device, struct rd_pipeline **slot,
                .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &dy,
                .layout = layout };
             VkPipeline handle;
-            if (rd_create_graphics_pipeline(device, &info, NULL, &handle) == VK_SUCCESS)
+            if (rd_create_graphics_pipeline(device, VK_NULL_HANDLE, &info, NULL, &handle) == VK_SUCCESS)
                *slot = rd_pipeline_from_handle(handle);
             disp->DestroyPipelineLayout(dev, layout, NULL);
          }
