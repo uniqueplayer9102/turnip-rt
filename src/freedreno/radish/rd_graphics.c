@@ -2390,7 +2390,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
 }
 
 
-/* --- opt-in color-only GMEM (tiled) render path ------------------------- */
+/* --- color-only GMEM (tiled) render path --------------------------------- */
 
 /* A5xx can render color-only passes into on-chip GMEM tile by tile instead
  * of streaming every pixel through the system-memory bus twice per frame.
@@ -2400,8 +2400,8 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
  * no HW binning yet: the draw stream is executed per tile with visibility
  * forced, so the result is correct for any geometry while the memory
  * traffic still drops from two full-surface sysmem passes to GMEM plus one
- * final store per tile. Bypass (sysmem) remains the default path; enable
- * with RADISH_GMEM=1 after bounded validation. */
+ * final store per tile. This is the default for eligible passes; set
+ * RADISH_GMEM=0 or drop a gmem_disabled marker file to fall back to bypass. */
 
 struct rd_gmem_layout {
    uint32_t bin_w, bin_h, cpp, cbuf_base;
@@ -2448,17 +2448,18 @@ rd_gmem_layout_init(struct rd_gmem_layout *l, uint32_t cpp, uint32_t width,
    return true;
 }
 
-/* Runtime gate for the GMEM path. The env var is checked first so
- * offscreen tests keep working unchanged; a marker file is also honored so a
- * long-lived compositor can toggle the path without being restarted. */
+/* Runtime gate for the GMEM path. GMEM is the default for eligible passes;
+ * RADISH_GMEM=0 forces the sysmem (bypass) path. A marker file is also
+ * honored so a long-lived compositor can fall back to bypass without being
+ * restarted. */
 static bool
 rd_gmem_enabled(void)
 {
-   if (getenv("RADISH_GMEM"))
-      return true;
-   if (access("/home/user/.local/radish/gmem_enabled", F_OK) == 0)
-      return true;
-   return false;
+   if (!debug_get_bool_option("RADISH_GMEM", true))
+      return false;
+   if (access("/home/user/.local/radish/gmem_disabled", F_OK) == 0)
+      return false;
+   return true;
 }
 
 static bool

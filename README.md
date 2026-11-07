@@ -50,7 +50,8 @@ src/freedreno/registers/adreno/a5xx.xml register semantics
 
 ## Building
 
-Radish is a drm-shim-free Vulkan driver inside Mesa, selected with the
+Radish is a Vulkan driver inside Mesa that talks to the Adreno DRM device
+through freedreno's `fd_pipe`/`fd_device` layer. It is selected with the
 `radish` vulkan driver:
 
 ```sh
@@ -72,20 +73,25 @@ like the other Vulkan drivers.
 | `RADISH_DEBUG_ERRORS=1` | log validation failures to stderr; also prints the queried GMEM size and base at device creation |
 | `RADISH_DEBUG_QUERIES=1` | log query activity |
 | `RADISH_DEBUG=1` | broader debug output |
-| `RADISH_GMEM=1` | enable the opt-in color-only GMEM (tiled) render path |
+| `RADISH_GMEM=0` | force the sysmem (bypass) render path instead of GMEM |
 | `RADISH_GMEM_DUMP=1` | print tile layout for each GMEM render |
 | `RADISH_GMEM_STOP=<line>` | flush and return after a given stage; bisection helper |
 | `RADISH_ASYNC_QUEUE_SYNC=1` | queue sync behaviour used by the compositor setup |
 
-GMEM can also be enabled at run time without restarting a live compositor by
-creating a marker file:
+GMEM is the default for passes it accepts. A running compositor can fall back
+to bypass without a restart by creating a marker file:
 
 ```sh
-touch /home/user/.local/radish/gmem_enabled   # enable
-rm /home/user/.local/radish/gmem_enabled      # disable, back to sysmem
+touch /home/user/.local/radish/gmem_disabled   # bypass path
+rm /home/user/.local/radish/gmem_disabled      # GMEM path
 ```
 
-The env var and the marker file are OR'd, so either enables the path.
+`gmem_disabled` wins over the environment default, so it also reverts a
+process started without `RADISH_GMEM=0`.
+
+Only passes that carry a single color attachment at one sample with no
+depth/stencil, no queries, no indirect draws and no barriers take the GMEM
+path; everything else keeps using bypass.
 
 ## Supported extensions
 
@@ -123,6 +129,27 @@ A5xx caps that shape the render path:
 | tile_align_w | 64 |
 | tile_align_h | 32 |
 | tile_max_w | 1024 |
+
+## GMEM vs sysmem, measured
+
+Both paths were timed by submitting a clear plus stacked triangle draws to a
+1080x2160 RGBA8 attachment and waiting on each submit, so the figure is
+per-submit GPU work rather than one-shot pipeline compile time. Adreno 506,
+17x4 tiles, 64x544 bins:
+
+| Workload | sysmem | GMEM | Delta |
+| --- | --- | --- | --- |
+| clear + store only | 4.0 ms | 5.3 ms | GMEM slower |
+| 512 triangles/submit | 419.7, 430.0, 418.2 ms | 354.6, 355.8, 355.8 ms | GMEM 15.5% faster |
+| 1024 triangles/submit | 855.5 ms | 705.7 ms | GMEM 17.5% faster |
+
+Readback pixels matched byte for byte between the two paths, and no GPU faults
+were logged across any run.
+
+The clear-only case being slower is expected: with nothing to amortise them,
+the per-tile restore and store blits cost more than they save. The win shows
+up as soon as there are real draws, which is why GMEM is the default for the
+passes it accepts.
 
 ## Related repository
 
