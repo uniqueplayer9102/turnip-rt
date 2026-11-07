@@ -3047,6 +3047,9 @@ rd_meta_finish(struct rd_device *device)
    if (device->copy_texel_pipeline)
       rd_destroy_pipeline_public(device, device->copy_texel_pipeline, NULL);
    device->copy_texel_pipeline = NULL;
+   if (device->image_copy_pipeline)
+      rd_destroy_pipeline_public(device, device->image_copy_pipeline, NULL);
+   device->image_copy_pipeline = NULL;
    for (unsigned i = 0; i < ARRAY_SIZE(device->blit_pipeline); i++) {
       if (device->blit_pipeline[i])
          rd_destroy_pipeline_public(device, device->blit_pipeline[i], NULL);

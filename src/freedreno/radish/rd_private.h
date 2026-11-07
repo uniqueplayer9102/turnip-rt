@@ -89,6 +89,7 @@ struct rd_device {
    struct rd_pipeline *clear_pipeline;
    struct rd_pipeline *resolve_pipeline[4];
    struct rd_pipeline *copy_texel_pipeline;
+   struct rd_pipeline *image_copy_pipeline;
    struct rd_pipeline *blit_pipeline[9]; /* [dim 1D/2D/3D][float/int/uint] */
 };
 struct rd_memory {
@@ -406,6 +407,11 @@ void rd_emit_image_constants(struct fd_ringbuffer *ring,
                              const struct rd_dispatch *dispatch);
 VkResult rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit);
 VkResult rd_queue_drain_pending(struct rd_device *device);
+VkResult rd_execute_gpu_image_copy(struct rd_device *device,
+                                   const struct rd_image_transfer *transfer,
+                                   struct rd_memory *src, struct rd_memory *dst,
+                                   VkDeviceSize src_offset, VkDeviceSize dst_offset,
+                                   struct rd_submit_window *window);
 VkResult rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
                              const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
 void rd_wake_device_waiters(struct vk_device *device);

@@ -14,6 +14,7 @@ struct rd_device;
 struct rd_memory;
 struct rd_buffer;
 struct rd_command_buffer;
+struct rd_submit_window;
 
 struct rd_image_level {
    VkDeviceSize offset, row_pitch, depth_pitch, array_pitch, size;
@@ -57,6 +58,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(rd_sampler, vk.base, VkSampler, VK_OBJECT_TYPE_SA
 
 VkResult rd_execute_image_transfer(struct rd_device *device,
                                    const struct rd_image_transfer *transfer,
-                                   bool clear);
+                                   bool clear, struct rd_submit_window *window);
+bool rd_image_copy_gpu_supported(struct rd_device *device,
+                                  const struct rd_image_transfer *transfer);
 bool rd_image_barrier_valid(const VkImageMemoryBarrier2 *barrier);
 #endif

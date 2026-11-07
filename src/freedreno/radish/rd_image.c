@@ -1407,8 +1407,46 @@ rd_image_transfer_bounds(VkDeviceSize offset, VkDeviceSize row, VkDeviceSize sli
    return transfer->slices == 1 || slice <= (remaining - rows) / (transfer->slices - 1);
 }
 
+bool
+rd_image_copy_gpu_supported(struct rd_device *device,
+                            const struct rd_image_transfer *transfer)
+{
+   if (!debug_get_bool_option("RADISH_GPU_IMAGE_COPY", true) ||
+       fd_device_version(device->fd) < FD_VERSION_SOFTPIN ||
+       !transfer->src_buffer || !transfer->dst_image ||
+       transfer->src_image || transfer->dst_buffer || transfer->copy_mask || transfer->lane_step ||
+       transfer->dst_image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       transfer->dst_image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       transfer->dst_image->vk.external_handle_types || transfer->dst_image->native_layout.tile_mode ||
+       transfer->rows > 65535 || transfer->slices > 65535)
+      return false;
+   VkFormat format = transfer->dst_image->vk.format;
+   if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R8G8B8A8_SRGB &&
+       format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_B8G8R8A8_SRGB)
+      return false;
+   struct rd_memory *src, *dst;
+   VkDeviceSize src_offset, dst_offset, src_size, dst_size;
+   if (!rd_image_transfer_memory(NULL, transfer->src_buffer, &src, &src_offset, &src_size) ||
+       !rd_image_transfer_memory(transfer->dst_image, NULL, &dst, &dst_offset, &dst_size) ||
+       !rd_image_transfer_bounds(transfer->src_offset, transfer->src_row_pitch,
+                                 transfer->src_slice_pitch, transfer, src_size, 0, 0) ||
+       !rd_image_transfer_bounds(transfer->dst_offset, transfer->dst_row_pitch,
+                                 transfer->dst_slice_pitch, transfer, dst_size, 0, 0) ||
+       src->bo == dst->bo || !src->bo || !dst->bo ||
+       transfer->row_bytes * transfer->rows * transfer->slices < 512 * 1024)
+      return false;
+   VkDeviceSize alignment = (src_offset + transfer->src_offset) |
+      (dst_offset + transfer->dst_offset) | transfer->row_bytes |
+      transfer->src_row_pitch | transfer->dst_row_pitch |
+      transfer->src_slice_pitch | transfer->dst_slice_pitch;
+   return !(alignment & 3) && transfer->row_bytes <= UINT32_MAX &&
+      transfer->src_row_pitch <= UINT32_MAX && transfer->dst_row_pitch <= UINT32_MAX &&
+      transfer->src_slice_pitch <= UINT32_MAX && transfer->dst_slice_pitch <= UINT32_MAX;
+}
+
 VkResult
-rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transfer *transfer, bool clear)
+rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transfer *transfer,
+                           bool clear, struct rd_submit_window *window)
 {
    struct rd_memory *src = NULL, *dst = NULL;
    VkDeviceSize src_offset = 0, dst_offset = 0, src_size = 0, dst_size = 0;
@@ -1429,6 +1467,9 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
       return VK_ERROR_UNKNOWN;
    if (transfer->lane_step && (clear || !transfer->src_step || !transfer->dst_step))
       return VK_ERROR_UNKNOWN;
+   if (!clear && rd_image_copy_gpu_supported(device, transfer))
+      return rd_execute_gpu_image_copy(device, transfer, src, dst,
+         src_offset + transfer->src_offset, dst_offset + transfer->dst_offset, window);
    if (src && src->bo != dst->bo && fd_bo_cpu_prep(src->bo, device->pipe, FD_BO_PREP_READ | FD_BO_PREP_NOSYNC))
       return VK_ERROR_DEVICE_LOST;
    uint32_t flags = FD_BO_PREP_WRITE | FD_BO_PREP_NOSYNC;

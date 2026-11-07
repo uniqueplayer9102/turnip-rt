@@ -5,11 +5,14 @@
 
 #include "rd_private.h"
 #include "rd_trace.h"
+#include "compiler/nir/nir_builder.h"
+#include "ir3/ir3_nir.h"
 #include "common/fd5_hw.h"
 #include "common/freedreno_common.h"
 #include "drm/freedreno_ringbuffer.h"
 #include "drm/freedreno_ringbuffer_sp.h"
 #include "vk_sync.h"
+#include "vk_pipeline.h"
 #include "util/libsync.h"
 #include "util/u_sync_provider.h"
 #include "util/u_math.h"
@@ -607,7 +610,7 @@ rd_window_reap(struct rd_device *device, struct rd_submit_window *window)
 }
 
 static bool
-rd_async_queue_submit_supported(struct vk_queue_submit *submit)
+rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit *submit)
 {
    bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
    if (vk_queue_submit_has_bind(submit))
@@ -617,6 +620,9 @@ rd_async_queue_submit_supported(struct vk_queue_submit *submit)
       struct rd_command_buffer *command = container_of(submit->command_buffers[i],
          struct rd_command_buffer, vk);
       util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
+         if (recorded->type == RD_CMD_IMAGE_COPY &&
+             rd_image_copy_gpu_supported(device, &recorded->image_transfer))
+            continue;
          if (recorded->type != RD_CMD_RENDER) {
             if (debug)
                fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP command=%u\n",
@@ -1633,6 +1639,162 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
    return VK_SUCCESS;
 }
 
+static nir_shader *
+rd_image_copy_shader(struct rd_device *device)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      ir3_get_compiler_options(device->compiler), "radish-image-copy");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *src_index = nir_vulkan_resource_index(&b, 2, 32, zero,
+      .desc_set = 0, .binding = 0, .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   nir_def *dst_index = nir_vulkan_resource_index(&b, 2, 32, zero,
+      .desc_set = 0, .binding = 1, .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   nir_def *src = nir_load_vulkan_descriptor(&b, 2, 32, src_index,
+      .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   nir_def *dst = nir_load_vulkan_descriptor(&b, 2, 32, dst_index,
+      .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   nir_def *parameters = nir_load_push_constant(&b, 4, 32, zero, .base = 0, .range = 16);
+   nir_def *tail = nir_load_push_constant(&b, 3, 32, zero, .base = 16, .range = 12);
+   nir_def *id = nir_load_global_invocation_id(&b, 32);
+   nir_def *x = nir_ishl_imm(&b, nir_channel(&b, id, 0), 2);
+   nir_def *y = nir_channel(&b, id, 1);
+   nir_def *z = nir_channel(&b, id, 2);
+   nir_push_if(&b, nir_ult(&b, x, nir_channel(&b, parameters, 0)));
+   nir_def *byte = nir_ishl_imm(&b, x, 2);
+   nir_def *src_offset = nir_iadd(&b, byte, nir_channel(&b, tail, 1));
+   src_offset = nir_iadd(&b, src_offset, nir_imul(&b, y, nir_channel(&b, parameters, 1)));
+   src_offset = nir_iadd(&b, src_offset, nir_imul(&b, z, nir_channel(&b, parameters, 3)));
+   nir_def *dst_offset = nir_iadd(&b, byte, nir_channel(&b, tail, 2));
+   dst_offset = nir_iadd(&b, dst_offset, nir_imul(&b, y, nir_channel(&b, parameters, 2)));
+   dst_offset = nir_iadd(&b, dst_offset, nir_imul(&b, z, nir_channel(&b, tail, 0)));
+   nir_push_if(&b, nir_uge(&b, nir_channel(&b, parameters, 0), nir_iadd_imm(&b, x, 4)));
+   nir_def *value = nir_load_ssbo(&b, 4, 32, nir_channel(&b, src, 0), src_offset,
+      .access = ACCESS_NON_WRITEABLE, .align_mul = 4);
+   nir_store_ssbo(&b, value, nir_channel(&b, dst, 0), dst_offset,
+      .access = ACCESS_NON_READABLE, .align_mul = 4, .write_mask = 0xf);
+   nir_push_else(&b, NULL);
+   for (unsigned i = 0; i < 3; i++) {
+      nir_push_if(&b, nir_ult(&b, nir_iadd_imm(&b, x, i), nir_channel(&b, parameters, 0)));
+      nir_def *part = nir_load_ssbo(&b, 1, 32, nir_channel(&b, src, 0),
+         nir_iadd_imm(&b, src_offset, i * 4), .access = ACCESS_NON_WRITEABLE, .align_mul = 4);
+      nir_store_ssbo(&b, part, nir_channel(&b, dst, 0), nir_iadd_imm(&b, dst_offset, i * 4),
+         .access = ACCESS_NON_READABLE, .align_mul = 4, .write_mask = 1);
+      nir_pop_if(&b, NULL);
+   }
+   nir_pop_if(&b, NULL);
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+
+static VkResult
+rd_image_copy_pipeline(struct rd_device *device, struct rd_pipeline **out)
+{
+   simple_mtx_lock(&device->meta_mutex);
+   VkResult result = VK_SUCCESS;
+   if (!device->image_copy_pipeline) {
+      VkDescriptorSetLayoutBinding bindings[2] = {
+         { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+           .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+         { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+           .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+      };
+      VkDescriptorSetLayoutCreateInfo set_info = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+         .bindingCount = 2, .pBindings = bindings };
+      VkDevice handle = rd_device_to_handle(device);
+      VkDescriptorSetLayout set = VK_NULL_HANDLE;
+      VkPipelineLayout layout = VK_NULL_HANDLE;
+      result = device->vk.dispatch_table.CreateDescriptorSetLayout(handle, &set_info, NULL, &set);
+      if (result == VK_SUCCESS) {
+         VkPushConstantRange range = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 28 };
+         VkPipelineLayoutCreateInfo layout_info = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1, .pSetLayouts = &set,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &range };
+         result = device->vk.dispatch_table.CreatePipelineLayout(handle, &layout_info, NULL, &layout);
+      }
+      if (result == VK_SUCCESS) {
+         VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+            .nir = rd_image_copy_shader(device) };
+         VkComputePipelineCreateInfo pipeline_info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+               .pNext = &nir_info, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main" },
+            .layout = layout };
+         VkPipeline pipeline;
+         result = device->vk.dispatch_table.CreateComputePipelines(handle, VK_NULL_HANDLE, 1,
+            &pipeline_info, NULL, &pipeline);
+         if (result == VK_SUCCESS)
+            device->image_copy_pipeline = rd_pipeline_from_handle(pipeline);
+         ralloc_free(nir_info.nir);
+      }
+      if (layout)
+         device->vk.dispatch_table.DestroyPipelineLayout(handle, layout, NULL);
+      if (set)
+         device->vk.dispatch_table.DestroyDescriptorSetLayout(handle, set, NULL);
+   }
+   *out = device->image_copy_pipeline;
+   simple_mtx_unlock(&device->meta_mutex);
+   return result;
+}
+
+VkResult
+rd_execute_gpu_image_copy(struct rd_device *device, const struct rd_image_transfer *transfer,
+                           struct rd_memory *src, struct rd_memory *dst,
+                           VkDeviceSize src_offset, VkDeviceSize dst_offset,
+                           struct rd_submit_window *window)
+{
+   struct rd_pipeline *pipeline;
+   VkResult result = rd_image_copy_pipeline(device, &pipeline);
+   if (result != VK_SUCCESS)
+      return result;
+   if (pipeline->resource_count != 2 || pipeline->descriptor_count != 2 ||
+       pipeline->buffer_count != 2 || pipeline->used_descriptors != UINT64_C(3) ||
+       pipeline->variant->num_ssbos != 2 || pipeline->variant->has_barrier ||
+       pipeline->variant->local_size[0] != 64 || pipeline->variant->local_size[1] != 1 ||
+       pipeline->variant->local_size[2] != 1)
+      return VK_ERROR_UNKNOWN;
+   VkDeviceSize src_base = src_offset & ~15ull;
+   VkDeviceSize dst_base = dst_offset & ~15ull;
+   struct rd_buffer buffers[2] = {
+      { .vk.size = src->vk.size - src_base, .memory = src, .offset = src_base },
+      { .vk.size = dst->vk.size - dst_base, .memory = dst, .offset = dst_base },
+   };
+   struct rd_dispatch dispatch = {
+      .pipeline = pipeline,
+      .grid = { DIV_ROUND_UP(transfer->row_bytes / 4, 256), transfer->rows, transfer->slices },
+      .push = { transfer->row_bytes / 4, transfer->src_row_pitch, transfer->dst_row_pitch,
+         transfer->src_slice_pitch, transfer->dst_slice_pitch, src_offset - src_base, dst_offset - dst_base },
+   };
+   for (unsigned i = 0; i < pipeline->resource_count; i++) {
+      unsigned binding = pipeline->resources[i].binding;
+      if (binding > 1)
+         return VK_ERROR_UNKNOWN;
+      dispatch.descriptors[i] = (struct rd_descriptor) {
+         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .buffer = &buffers[binding],
+         .range = buffers[binding].vk.size };
+   }
+   if (debug_get_bool_option("RADISH_GPU_IMAGE_COPY_DEBUG", false))
+      fprintf(stderr, "RADISH_GPU_IMAGE_COPY bytes=%" PRIu64 " rows=%u slices=%u groups=%u,%u,%u\n",
+         (uint64_t)transfer->row_bytes * transfer->rows * transfer->slices,
+         transfer->rows, transfer->slices, dispatch.grid[0], dispatch.grid[1], dispatch.grid[2]);
+   struct fd_submit *submit = fd_submit_new(device->pipe);
+   if (!submit)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0,
+      FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+   if (!ring) {
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   uint32_t *initial_ring_start = ring->start;
+   const uint32_t base[3] = {0};
+   rd_emit_dispatch_chunk(device, ring, &dispatch, dispatch.grid, base, true, NULL);
+   rd_flush(device, ring);
+   return rd_finish_window_submit(device, submit, ring, window, initial_ring_start, false);
+}
+
 static VkResult
 rd_execute_transfer(struct rd_device *device, enum rd_command_type type,
                       const struct rd_transfer *transfer,
@@ -1753,7 +1915,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    bool deferred = !profile && debug_get_num_option("RADISH_BATCH_CHUNKS", 1) == 8;
    bool async_requested = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC", false);
    bool commands_supported = async_requested &&
-      rd_async_queue_submit_supported(submit);
+      rd_async_queue_submit_supported(device, submit);
    bool syncs_supported = async_requested && rd_async_syncs_supported(device, submit);
    bool async = async_requested && !profile && !device->trace && commands_supported &&
       syncs_supported && device->submit_in_fence_fd < 0;
@@ -1810,9 +1972,11 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          struct rd_submit_profile submit_profile = {0};
          const struct rd_dispatch *dispatch = &recorded->dispatch;
          struct rd_dispatch indirect;
-         bool can_defer = !profile &&
-            (recorded->type == RD_CMD_RENDER ||
-             (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE));
+          bool can_defer = !profile &&
+             (recorded->type == RD_CMD_RENDER ||
+              (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) ||
+              (recorded->type == RD_CMD_IMAGE_COPY &&
+               rd_image_copy_gpu_supported(device, &recorded->image_transfer)));
          if (recorded->type == RD_CMD_DISPATCH)
             can_defer = deferred && !recorded->dispatch.indirect &&
                         rd_window_pipeline(device, &recorded->dispatch);
@@ -1849,8 +2013,9 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             if (indirect.sampling_addresses)
                fd_bo_del(indirect.sampling_addresses);
          } else if (recorded->type == RD_CMD_IMAGE_COPY || recorded->type == RD_CMD_IMAGE_CLEAR) {
-            result = rd_execute_image_transfer(device, &recorded->image_transfer,
-                                                recorded->type == RD_CMD_IMAGE_CLEAR);
+             result = rd_execute_image_transfer(device, &recorded->image_transfer,
+                                                 recorded->type == RD_CMD_IMAGE_CLEAR,
+                                                 can_defer ? window : NULL);
          } else if (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) {
             result = rd_execute_transfer(device, recorded->type, &recorded->transfer,
                                          profile ? &submit_profile : NULL,
