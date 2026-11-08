@@ -369,6 +369,7 @@ bool rd_shader_format_filterable(VkFormat format);
 VkResult rd_init_border_colors(struct rd_device *device);
 /* rd_queue.c, shared with rd_graphics.c */
 void rd_flush(struct rd_device *device, struct fd_ringbuffer *ring);
+uint32_t rd_rb_debug_eco_cntl(const struct rd_device *device);
 struct rd_gpu_elapsed;
 struct rd_submit_profile;
 VkResult rd_finish_submit(struct rd_device *device, struct fd_submit *submit,

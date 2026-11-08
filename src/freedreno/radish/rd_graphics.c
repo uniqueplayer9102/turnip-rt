@@ -903,7 +903,7 @@ rd_gfx_restore(struct fd_ringbuffer *ring, struct rd_device *device)
    OUT_PKT4(ring, REG_A5XX_RB_MODE_CNTL, 1);
    OUT_RING(ring, 0x00000044);
    OUT_PKT4(ring, REG_A5XX_RB_DBG_ECO_CNTL, 1);
-   OUT_RING(ring, 0x00100000);
+   OUT_RING(ring, rd_rb_debug_eco_cntl(device));
    OUT_PKT4(ring, REG_A5XX_VFD_MODE_CNTL, 1);
    OUT_RING(ring, 0);
    OUT_PKT4(ring, REG_A5XX_PC_MODE_CNTL, 1);

@@ -167,6 +167,14 @@ rd_gpu_elapsed_finish(struct rd_device *device, struct rd_gpu_elapsed *sample,
               sample->sample);
 }
 
+uint32_t
+rd_rb_debug_eco_cntl(const struct rd_device *device)
+{
+   bool workaround = fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) == 506 &&
+      debug_get_bool_option("RADISH_A506_RB_DP2_WORKAROUND", true);
+   return 0x00100000 | COND(workaround, 0x00000200);
+}
+
 static void
 cs_restore_emit(struct fd_ringbuffer *ring, struct rd_device *device)
 {
@@ -193,7 +201,7 @@ cs_restore_emit(struct fd_ringbuffer *ring, struct rd_device *device)
    OUT_RING(ring, 0x00000044);
 
    OUT_PKT4(ring, REG_A5XX_RB_DBG_ECO_CNTL, 1);
-   OUT_RING(ring, 0x00100000);
+   OUT_RING(ring, rd_rb_debug_eco_cntl(device));
 
    OUT_PKT4(ring, REG_A5XX_PC_MODE_CNTL, 1);
    OUT_RING(ring, 0x0000001f);
