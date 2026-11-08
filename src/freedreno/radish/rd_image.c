@@ -1444,6 +1444,64 @@ rd_image_copy_gpu_supported(struct rd_device *device,
       transfer->src_slice_pitch <= UINT32_MAX && transfer->dst_slice_pitch <= UINT32_MAX;
 }
 
+static void
+rd_image_transfer_cache(struct rd_memory *memory, void *map, VkDeviceSize offset,
+                        const struct rd_image_transfer *transfer, bool dst, bool flush)
+{
+   bool ranges = debug_get_bool_option("RADISH_IMAGE_TRANSFER_CACHE_RANGES", true);
+   uint64_t bytes = 0, count = 0;
+   if (!ranges) {
+      if (flush)
+         util_flush_range(map, memory->vk.size);
+      else
+         util_flush_inval_range(map, memory->vk.size);
+      bytes = memory->vk.size;
+      count = 1;
+   } else {
+      VkDeviceSize row = dst ? transfer->dst_row_pitch : transfer->src_row_pitch;
+      VkDeviceSize slice = dst ? transfer->dst_slice_pitch : transfer->src_slice_pitch;
+      offset += dst ? transfer->dst_offset : transfer->src_offset;
+      VkDeviceSize span = transfer->row_bytes;
+      if (transfer->lane_step) {
+         offset += dst ? transfer->dst_lane : transfer->src_lane;
+         span = (span - 1) * (dst ? transfer->dst_step : transfer->src_step) + 1;
+      }
+      VkDeviceSize atom = util_cache_granularity();
+      VkDeviceSize begin = UINT64_MAX, end = 0;
+      void (*operation)(void *, size_t) = flush ? util_flush_range_no_fence :
+                                                  util_flush_inval_range_no_fence;
+      util_pre_flush_fence();
+      for (uint32_t z = 0; z < transfer->slices; z++) {
+         for (uint32_t y = 0; y < transfer->rows; y++) {
+            VkDeviceSize at = offset + z * slice + y * row;
+            VkDeviceSize first = at & ~(atom - 1);
+            VkDeviceSize last = MIN2(align64(at + span, atom), fd_bo_size(memory->bo));
+            if (begin != UINT64_MAX && first > end) {
+               operation((uint8_t *)map + begin, end - begin);
+               bytes += end - begin;
+               count++;
+               begin = UINT64_MAX;
+               end = 0;
+            }
+            begin = MIN2(begin, first);
+            end = MAX2(end, last);
+         }
+      }
+      operation((uint8_t *)map + begin, end - begin);
+      bytes += end - begin;
+      count++;
+      if (flush)
+         util_post_flush_fence();
+      else
+         util_post_flush_inval_fence();
+   }
+   if (debug_get_bool_option("RADISH_IMAGE_TRANSFER_CACHE_DEBUG", false))
+      fprintf(stderr, "RADISH_IMAGE_TRANSFER_CACHE op=%s path=%s ranges=%" PRIu64
+              " bytes=%" PRIu64 " allocation=%" PRIu64 "\n",
+              flush ? "flush" : "invalidate", ranges ? "ranges" : "full",
+              count, bytes, (uint64_t)memory->vk.size);
+}
+
 VkResult
 rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transfer *transfer,
                            bool clear, struct rd_submit_window *window)
@@ -1482,9 +1540,9 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
    if (!dst_map || (src && !src_map))
       return VK_ERROR_MEMORY_MAP_FAILED;
    if (src && src->cached)
-      util_flush_inval_range((void *)src_map, src->vk.size);
+      rd_image_transfer_cache(src, (void *)src_map, src_offset, transfer, false, false);
    if (dst->cached)
-      util_flush_inval_range(dst_map, dst->vk.size);
+      rd_image_transfer_cache(dst, dst_map, dst_offset, transfer, true, false);
    __sync_synchronize();
    for (uint32_t z = 0; z < transfer->slices; z++) {
       for (uint32_t y = 0; y < transfer->rows; y++) {
@@ -1515,7 +1573,7 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
       }
    }
    if (dst->cached)
-      util_flush_range(dst_map, dst->vk.size);
+      rd_image_transfer_cache(dst, dst_map, dst_offset, transfer, true, true);
    __sync_synchronize();
    return VK_SUCCESS;
 }

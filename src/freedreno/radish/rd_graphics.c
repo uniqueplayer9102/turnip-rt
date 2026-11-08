@@ -2056,6 +2056,41 @@ rd_stats_need_fragments(const struct rd_query_pool *pool)
           (pool->vk.pipeline_statistics & VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT);
 }
 
+static bool
+rd_render_needs_query_accounting(struct rd_device *device, const struct rd_render *render)
+{
+   if (!debug_get_bool_option("RADISH_QUERY_FREE_RENDER", true) ||
+       !list_is_empty(&device->active_queries) || render->queries.size)
+      return true;
+   util_dynarray_foreach(&render->draws, struct rd_draw, draw)
+      if (draw->occlusion_pool)
+         return true;
+   return false;
+}
+
+static VkResult
+rd_create_sample_counters(struct rd_device *device, unsigned count,
+                          struct fd_bo **out, uint64_t **values)
+{
+   *out = NULL;
+   *values = NULL;
+   uint64_t bytes = (uint64_t)count * 32;
+   if (!bytes || bytes > UINT32_MAX - 4095)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct fd_bo *bo = fd_bo_new(device->fd, align64(bytes, 4096), 0, "radish-sample-counts");
+   if (!bo)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   void *map = fd_bo_map(bo);
+   if (!map) {
+      fd_bo_del(bo);
+      return VK_ERROR_MEMORY_MAP_FAILED;
+   }
+   memset(map, 0, bytes);
+   *out = bo;
+   *values = map;
+   return VK_SUCCESS;
+}
+
 static VkResult rd_render_resolves(struct rd_device *device, const struct rd_render *render);
 static VkResult rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render);
 
@@ -2270,10 +2305,11 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
     * counting fragment-shader invocations active at that draw */
    unsigned ndraws = util_dynarray_num_elements(&render->draws, struct rd_draw);
    struct rd_gfx_program_cache program_cache = {0};
-   int *slots = calloc(ndraws ? ndraws : 1, sizeof(int));
-   bool *coverage = calloc(ndraws ? ndraws : 1, sizeof(bool));
-   struct rd_draw *resolved = calloc(ndraws ? ndraws : 1, sizeof(struct rd_draw));
-   if (!slots || !resolved || !coverage) {
+   bool queries = rd_render_needs_query_accounting(device, render);
+   int *slots = queries ? calloc(ndraws, sizeof(int)) : NULL;
+   bool *coverage = queries ? calloc(ndraws, sizeof(bool)) : NULL;
+   struct rd_draw *resolved = queries ? calloc(ndraws, sizeof(struct rd_draw)) : NULL;
+   if (queries && (!slots || !resolved || !coverage)) {
       free(slots);
       free(resolved);
       free(coverage);
@@ -2282,10 +2318,10 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    int fragments = 0;
-   list_for_each_entry(struct rd_query_slot, slot, &device->active_queries, active_link)
-      fragments += rd_stats_need_fragments(slot->pool);
    unsigned counted = 0;
-   {
+   if (queries) {
+      list_for_each_entry(struct rd_query_slot, slot, &device->active_queries, active_link)
+         fragments += rd_stats_need_fragments(slot->pool);
       const struct rd_render_query *op = util_dynarray_begin(&render->queries);
       const struct rd_render_query *op_end = util_dynarray_end(&render->queries);
       for (unsigned i = 0; i < ndraws; i++) {
@@ -2301,34 +2337,42 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       }
    }
    struct fd_bo *counters = NULL;
+   uint64_t *values = NULL;
    if (counted) {
-      counters = fd_bo_new(device->fd, align(counted * 32, 4096), 0, "radish-sample-counts");
-      if (!counters) {
+      result = rd_create_sample_counters(device, counted, &counters, &values);
+      if (result != VK_SUCCESS) {
          free(slots);
          free(resolved);
          free(coverage);
          fd_ringbuffer_del(ring);
          fd_submit_del(submit);
-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         return result;
       }
-      memset(fd_bo_map(counters), 0, counted * 32);
    }
+   if (debug_get_bool_option("RADISH_RENDER_QUERY_DEBUG", false))
+      fprintf(stderr, "RADISH_RENDER_QUERY path=%s draws=%u counters=%u allocations=%u\n",
+              queries ? "accounting" : "query-free", ndraws, counted, queries ? 3 : 0);
    for (unsigned i = 0; i < ndraws; i++) {
-      struct rd_draw draw = *util_dynarray_element(&render->draws, struct rd_draw, i);
-      resolved[i] = draw;
-      resolved[i].vertex_count = 0;
-      if (draw.indirect && (result = rd_resolve_draw_indirect(device, &draw)) != VK_SUCCESS)
-         break;
-      if (!draw.vertex_count || !draw.instance_count)
+      const struct rd_draw *draw = util_dynarray_element(&render->draws, struct rd_draw, i);
+      struct rd_draw indirect;
+      if (draw->indirect) {
+         indirect = *draw;
+         result = rd_resolve_draw_indirect(device, &indirect);
+         if (result != VK_SUCCESS)
+            break;
+         draw = &indirect;
+      }
+      if (!draw->vertex_count || !draw->instance_count)
          continue;
-      if (draw.indexed && (!draw.index_buffer || !draw.index_buffer->memory)) {
+      if (draw->indexed && (!draw->index_buffer || !draw->index_buffer->memory)) {
          result = VK_ERROR_UNKNOWN;
          break;
       }
-      resolved[i] = draw;
-      fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->vs.bo);
-      fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->fs.bo);
-      if (draw.barrier) {
+      if (queries)
+         resolved[i] = *draw;
+      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->vs.bo);
+      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->fs.bo);
+      if (draw->barrier) {
          /* make the colour writes so far visible to texture fetches */
          rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
          rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
@@ -2340,11 +2384,11 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          OUT_RING(ring, 0x00000012);
          OUT_WFI5(ring);
       }
-      if (coverage[i]) {
+      if (queries && coverage[i]) {
          /* fragment-shader invocations: count the rasterized samples of the
           * draw with depth/stencil tests off and nothing written (the shader
           * has no side effects), before the draw itself */
-         struct rd_draw pass = draw;
+         struct rd_draw pass = *draw;
          memset(&pass.ds, 0, sizeof(pass.ds));
          for (unsigned j = 0; j < ARRAY_SIZE(pass.cb.attachments); j++)
             pass.cb.attachments[j].write_mask = 0;
@@ -2352,10 +2396,10 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          rd_gfx_draw(ring, device, render, &pass, &program_cache, true);
          rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2 + 1) * 16);
       }
-      if (slots[i] >= 0)
+      if (queries && slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2) * 16);
-      rd_gfx_draw(ring, device, render, &draw, &program_cache, true);
-      if (slots[i] >= 0)
+      rd_gfx_draw(ring, device, render, draw, &program_cache, true);
+      if (queries && slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2 + 1) * 16);
    }
    if (result != VK_SUCCESS) {
@@ -2376,8 +2420,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    result = counted ?
       rd_finish_submit(device, submit, ring, NULL, NULL) :
       rd_finish_window_submit(device, submit, ring, window, initial_ring_start, true);
-   if (result == VK_SUCCESS) {
-      const uint64_t *values = counters ? fd_bo_map(counters) : NULL;
+   if (result == VK_SUCCESS && queries) {
       const struct rd_render_query *op = util_dynarray_begin(&render->queries);
       const struct rd_render_query *op_end = util_dynarray_end(&render->queries);
       for (unsigned i = 0; i < ndraws; i++) {
