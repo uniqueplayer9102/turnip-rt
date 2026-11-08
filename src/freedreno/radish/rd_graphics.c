@@ -1675,9 +1675,22 @@ struct rd_gfx_program_cache {
 };
 
 static void
+rd_gfx_viewport(struct fd_ringbuffer *ring, const VkViewport *vp)
+{
+   OUT_WFI5(ring);
+   OUT_PKT4(ring, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
+   OUT_RING(ring, A5XX_GRAS_CL_VPORT_XOFFSET_0(vp->x + vp->width * 0.5f));
+   OUT_RING(ring, A5XX_GRAS_CL_VPORT_XSCALE_0(vp->width * 0.5f));
+   OUT_RING(ring, A5XX_GRAS_CL_VPORT_YOFFSET_0(vp->y + vp->height * 0.5f));
+   OUT_RING(ring, A5XX_GRAS_CL_VPORT_YSCALE_0(vp->height * 0.5f));
+   OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZOFFSET_0(vp->minDepth));
+   OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZSCALE_0(vp->maxDepth - vp->minDepth));
+}
+
+static void
 rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
             const struct rd_render *render, const struct rd_draw *draw,
-            struct rd_gfx_program_cache *program_cache)
+            struct rd_gfx_program_cache *program_cache, bool emit_viewport)
 {
    const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
    const struct vk_dynamic_graphics_state *dyn = &gfx->dynamic;
@@ -1754,15 +1767,8 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_RING(ring, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(minx) | A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(miny));
    OUT_RING(ring, A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_X(maxx) | A5XX_GRAS_SC_VIEWPORT_SCISSOR_TL_0_Y(maxy));
 
-   const VkViewport *vp = &draw->viewport;
-   OUT_WFI5(ring);
-   OUT_PKT4(ring, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
-   OUT_RING(ring, A5XX_GRAS_CL_VPORT_XOFFSET_0(vp->x + vp->width * 0.5f));
-   OUT_RING(ring, A5XX_GRAS_CL_VPORT_XSCALE_0(vp->width * 0.5f));
-   OUT_RING(ring, A5XX_GRAS_CL_VPORT_YOFFSET_0(vp->y + vp->height * 0.5f));
-   OUT_RING(ring, A5XX_GRAS_CL_VPORT_YSCALE_0(vp->height * 0.5f));
-   OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZOFFSET_0(vp->minDepth));
-   OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZSCALE_0(vp->maxDepth - vp->minDepth));
+   if (emit_viewport)
+      rd_gfx_viewport(ring, &draw->viewport);
 
    unsigned max_loc;
    if (program_cache && program_cache->pipeline == gfx) {
@@ -2343,12 +2349,12 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          for (unsigned j = 0; j < ARRAY_SIZE(pass.cb.attachments); j++)
             pass.cb.attachments[j].write_mask = 0;
          rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2) * 16);
-         rd_gfx_draw(ring, device, render, &pass, &program_cache);
+         rd_gfx_draw(ring, device, render, &pass, &program_cache, true);
          rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2 + 1) * 16);
       }
       if (slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2) * 16);
-      rd_gfx_draw(ring, device, render, &draw, &program_cache);
+      rd_gfx_draw(ring, device, render, &draw, &program_cache, true);
       if (slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2 + 1) * 16);
    }
@@ -2649,9 +2655,24 @@ rd_gmem_emit_draw_ib(struct fd_ringbuffer *ring, struct fd_ringbuffer *draw_ring
 struct rd_gmem_draw_seg {
    uint32_t first_chunk, last_chunk;
    uint32_t first_offset, last_offset;
+   const struct rd_draw *draw;
    int64_t minx, miny, maxx, maxy;
    bool cullable;
 };
+
+static bool
+rd_gmem_draw_needs_idle(const struct rd_draw *previous, const struct rd_draw *draw)
+{
+   return previous->pipeline != draw->pipeline ||
+      memcmp(&previous->ds, &draw->ds, sizeof(draw->ds)) ||
+      memcmp(&previous->cb, &draw->cb, sizeof(draw->cb)) ||
+      previous->cull != draw->cull || previous->front != draw->front ||
+      previous->bias_enable != draw->bias_enable ||
+      previous->bias_constant != draw->bias_constant ||
+      previous->bias_clamp != draw->bias_clamp || previous->bias_slope != draw->bias_slope ||
+      previous->line_width != draw->line_width || previous->sample_mask != draw->sample_mask ||
+      previous->alpha_to_coverage != draw->alpha_to_coverage;
+}
 
 static void
 rd_gmem_draw_bounds(const struct rd_render *render, const struct rd_draw *draw,
@@ -2761,7 +2782,9 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    }
    size_t nr_segs = 0;
    bool cull = debug_get_bool_option("RADISH_GMEM_CULL", true);
+   bool viewport_reuse = cull && debug_get_bool_option("RADISH_GMEM_VIEWPORT_REUSE", true);
    uint64_t candidates = 0, skipped = 0, draw_ibs = 0;
+   uint64_t viewport_updates = 0, viewport_reuses = 0, state_waits = 0;
    util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
       struct rd_draw d = *draw;
       if (d.indirect && rd_resolve_draw_indirect(device, &d) != VK_SUCCESS) {
@@ -2771,9 +2794,10 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       if (!d.vertex_count || !d.instance_count)
          continue;
       struct rd_gmem_draw_seg *seg = &segs[nr_segs];
+      seg->draw = draw;
       seg->first_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->first_offset = draw_ring->cur - draw_ring->start;
-      rd_gfx_draw(draw_ring, device, render, &d, NULL);
+      rd_gfx_draw(draw_ring, device, render, &d, NULL, !viewport_reuse);
       seg->last_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->last_offset = draw_ring->cur - draw_ring->start;
       rd_gmem_draw_bounds(render, &d, seg);
@@ -2878,6 +2902,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
          if (cull) {
             int64_t tmaxx = (int64_t)x1 + tw;
             int64_t tmaxy = (int64_t)y1 + th;
+            const struct rd_draw *previous = NULL;
             for (size_t s = 0; s < nr_segs; s++) {
                const struct rd_gmem_draw_seg *seg = &segs[s];
                if (seg->cullable &&
@@ -2886,6 +2911,25 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
                     seg->maxy <= y1 || seg->miny >= tmaxy)) {
                   skipped++;
                   continue;
+               }
+               if (viewport_reuse) {
+                  const struct rd_draw *draw = seg->draw;
+                  if (seg->maxx <= seg->minx || seg->maxy <= seg->miny) {
+                     previous = NULL;
+                  } else {
+                     if (!previous ||
+                         memcmp(&previous->viewport, &draw->viewport, sizeof(draw->viewport))) {
+                        rd_gfx_viewport(ring, &draw->viewport);
+                        viewport_updates++;
+                     } else {
+                        viewport_reuses++;
+                        if (rd_gmem_draw_needs_idle(previous, draw)) {
+                           OUT_WFI5(ring);
+                           state_waits++;
+                        }
+                     }
+                     previous = draw;
+                  }
                }
                draw_ibs += rd_gmem_emit_draw_seg(ring, draw_ring, seg);
             }
@@ -2899,11 +2943,15 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       }
    }
 
-   if (debug_get_bool_option("RADISH_GMEM_DUMP", false))
+   if (debug_get_bool_option("RADISH_GMEM_DUMP", false)) {
       fprintf(stderr, "radish gmem cull: draws=%zu chunks=%u candidates=%" PRIu64
               " skipped=%" PRIu64 " ibs=%" PRIu64 " enabled=%u\n",
               nr_segs, fd_ringbuffer_cmd_count(draw_ring), candidates, skipped,
               draw_ibs, cull);
+      fprintf(stderr, "radish gmem viewport: updates=%" PRIu64 " reuses=%" PRIu64
+              " state_waits=%" PRIu64 " enabled=%u\n",
+              viewport_updates, viewport_reuses, state_waits, viewport_reuse);
+   }
    fd_ringbuffer_del(draw_ring);
    free(segs);
    if (result == VK_SUCCESS) {
