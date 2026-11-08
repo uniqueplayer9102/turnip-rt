@@ -3098,6 +3098,9 @@ rd_meta_finish(struct rd_device *device)
    if (device->image_copy_pipeline)
       rd_destroy_pipeline_public(device, device->image_copy_pipeline, NULL);
    device->image_copy_pipeline = NULL;
+   if (device->buffer_fill_pipeline)
+      rd_destroy_pipeline_public(device, device->buffer_fill_pipeline, NULL);
+   device->buffer_fill_pipeline = NULL;
    for (unsigned i = 0; i < ARRAY_SIZE(device->blit_pipeline); i++) {
       if (device->blit_pipeline[i])
          rd_destroy_pipeline_public(device, device->blit_pipeline[i], NULL);

@@ -92,6 +92,7 @@ struct rd_device {
    struct rd_pipeline *resolve_pipeline[4];
    struct rd_pipeline *copy_texel_pipeline;
    struct rd_pipeline *image_copy_pipeline;
+   struct rd_pipeline *buffer_fill_pipeline;
    struct rd_pipeline *blit_pipeline[9]; /* [dim 1D/2D/3D][float/int/uint] */
 };
 struct rd_memory {
