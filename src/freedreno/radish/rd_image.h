@@ -60,6 +60,7 @@ VkResult rd_execute_image_transfer(struct rd_device *device,
                                    const struct rd_image_transfer *transfer,
                                    bool clear, struct rd_submit_window *window);
 bool rd_image_copy_gpu_supported(struct rd_device *device,
-                                  const struct rd_image_transfer *transfer);
+                                  const struct rd_image_transfer *transfer,
+                                  bool small_copies);
 bool rd_image_barrier_valid(const VkImageMemoryBarrier2 *barrier);
 #endif

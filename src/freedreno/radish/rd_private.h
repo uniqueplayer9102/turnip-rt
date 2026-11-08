@@ -42,6 +42,8 @@ struct rd_pending_submit {
    struct fd_ringbuffer *ring;
    struct fd_fence *fence;
    struct fd_bo *cs_backing;
+   uint32_t chunks, cs_bytes, bo_refs;
+   size_t metadata_bytes;
 };
 
 struct rd_submit_window {

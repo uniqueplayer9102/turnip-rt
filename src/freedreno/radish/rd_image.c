@@ -1409,7 +1409,7 @@ rd_image_transfer_bounds(VkDeviceSize offset, VkDeviceSize row, VkDeviceSize sli
 
 bool
 rd_image_copy_gpu_supported(struct rd_device *device,
-                            const struct rd_image_transfer *transfer)
+                            const struct rd_image_transfer *transfer, bool small_copies)
 {
    if (!debug_get_bool_option("RADISH_GPU_IMAGE_COPY", true) ||
        fd_device_version(device->fd) < FD_VERSION_SOFTPIN ||
@@ -1433,7 +1433,7 @@ rd_image_copy_gpu_supported(struct rd_device *device,
        !rd_image_transfer_bounds(transfer->dst_offset, transfer->dst_row_pitch,
                                  transfer->dst_slice_pitch, transfer, dst_size, 0, 0) ||
        src->bo == dst->bo || !src->bo || !dst->bo ||
-       transfer->row_bytes * transfer->rows * transfer->slices < 512 * 1024)
+       (!small_copies && transfer->row_bytes * transfer->rows * transfer->slices < 512 * 1024))
       return false;
    VkDeviceSize alignment = (src_offset + transfer->src_offset) |
       (dst_offset + transfer->dst_offset) | transfer->row_bytes |
@@ -1467,7 +1467,7 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
       return VK_ERROR_UNKNOWN;
    if (transfer->lane_step && (clear || !transfer->src_step || !transfer->dst_step))
       return VK_ERROR_UNKNOWN;
-   if (!clear && rd_image_copy_gpu_supported(device, transfer))
+   if (!clear && rd_image_copy_gpu_supported(device, transfer, false))
       return rd_execute_gpu_image_copy(device, transfer, src, dst,
          src_offset + transfer->src_offset, dst_offset + transfer->dst_offset, window);
    if (src && src->bo != dst->bo && fd_bo_cpu_prep(src->bo, device->pipe, FD_BO_PREP_READ | FD_BO_PREP_NOSYNC))

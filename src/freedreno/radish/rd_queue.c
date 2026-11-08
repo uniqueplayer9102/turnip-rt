@@ -583,36 +583,91 @@ static VkResult
 rd_window_reap(struct rd_device *device, struct rd_submit_window *window)
 {
    unsigned completed = 0;
+   VkResult result = VK_SUCCESS;
    while (completed < window->count) {
       struct rd_pending_submit *pending = &window->pending[completed];
       int wait = fd_pipe_wait_timeout(device->pipe, pending->fence, 0);
       if (wait == -ETIMEDOUT)
          break;
-      if (wait)
-         return VK_ERROR_DEVICE_LOST;
+      if (wait) {
+         result = VK_ERROR_DEVICE_LOST;
+         break;
+      }
       fd_fence_del(pending->fence);
       fd_ringbuffer_del(pending->ring);
       fd_submit_del(pending->submit);
       completed++;
    }
    if (!completed)
-      return VK_SUCCESS;
+      return result;
    window->count -= completed;
    if (window->count) {
       memmove(window->pending, window->pending + completed,
               window->count * sizeof(window->pending[0]));
       memset(window->pending + window->count, 0,
              completed * sizeof(window->pending[0]));
+      window->chunks = window->cs_bytes = window->bo_refs = window->backing_bytes = 0;
+      window->metadata_bytes = 0;
+      for (unsigned i = 0; i < window->count; i++) {
+         const struct rd_pending_submit *pending = &window->pending[i];
+         window->chunks += pending->chunks;
+         window->cs_bytes += pending->cs_bytes;
+         window->bo_refs += pending->bo_refs;
+         window->metadata_bytes += pending->metadata_bytes;
+         bool seen = !pending->cs_backing;
+         for (unsigned j = 0; j < i && !seen; j++)
+            seen = window->pending[j].cs_backing == pending->cs_backing;
+         if (!seen)
+            window->backing_bytes += pending->cs_backing->size;
+      }
    } else {
       memset(window, 0, sizeof(*window));
    }
-   return VK_SUCCESS;
+   uint64_t faults = 0;
+   if (fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) || faults != device->faults)
+      return VK_ERROR_DEVICE_LOST;
+   return result;
+}
+
+static VkResult
+rd_window_reserve(struct rd_device *device, struct rd_submit_window *window)
+{
+   VkResult result = rd_window_reap(device, window);
+   if (result != VK_SUCCESS || window->count < ARRAY_SIZE(window->pending))
+      return result;
+   if (!debug_get_bool_option("RADISH_WINDOW_WAIT_OLDEST", false))
+      return rd_window_drain(device, window, "capacity-reserve");
+   int64_t start = device->trace ? os_time_get_nano() : 0;
+   int wait = fd_pipe_wait_timeout(device->pipe, window->pending[0].fence, 5000000000ull);
+   if (device->trace)
+      device->trace->wait_ns += os_time_get_nano() - start;
+   result = wait ? VK_ERROR_DEVICE_LOST : rd_window_reap(device, window);
+   rd_window_report("WAIT", "capacity-oldest", window, result);
+   if (result == VK_SUCCESS && window->count >= ARRAY_SIZE(window->pending))
+      return VK_ERROR_DEVICE_LOST;
+   return result;
 }
 
 static bool
-rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit *submit)
+rd_queue_submit_has_render(const struct vk_queue_submit *submit)
+{
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      const struct rd_command_buffer *command = container_of(submit->command_buffers[i],
+         struct rd_command_buffer, vk);
+      util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
+         if (recorded->type == RD_CMD_RENDER)
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit *submit,
+                                bool small_copies)
 {
    bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   bool supported = true;
    if (vk_queue_submit_has_bind(submit))
       return false;
 
@@ -621,13 +676,28 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
          struct rd_command_buffer, vk);
       util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
          if (recorded->type == RD_CMD_IMAGE_COPY &&
-             rd_image_copy_gpu_supported(device, &recorded->image_transfer))
+             rd_image_copy_gpu_supported(device, &recorded->image_transfer, small_copies))
             continue;
          if (recorded->type != RD_CMD_RENDER) {
-            if (debug)
+            if (debug) {
                fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP command=%u\n",
                        (unsigned)recorded->type);
-            return false;
+               if (recorded->type == RD_CMD_IMAGE_COPY) {
+                  const struct rd_image_transfer *copy = &recorded->image_transfer;
+                  fprintf(stderr, "RADISH_ASYNC_COPY_SKIP src_format=%u dst_format=%u row_bytes=%" PRIu64
+                          " rows=%u slices=%u src_offset=%" PRIu64 " dst_offset=%" PRIu64
+                          " src_pitch=%" PRIu64 " dst_pitch=%" PRIu64 " lanes=%u\n",
+                          copy->src_image ? copy->src_image->vk.format : 0,
+                          copy->dst_image ? copy->dst_image->vk.format : 0,
+                          (uint64_t)copy->row_bytes, copy->rows, copy->slices,
+                          (uint64_t)copy->src_offset, (uint64_t)copy->dst_offset,
+                          (uint64_t)copy->src_row_pitch, (uint64_t)copy->dst_row_pitch, copy->lane_step);
+               }
+            }
+            if (!debug)
+               return false;
+            supported = false;
+            continue;
          }
          util_dynarray_foreach(&recorded->render->draws, struct rd_draw, draw) {
             if (draw->indirect) {
@@ -638,7 +708,7 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
          }
       }
    }
-   return true;
+   return supported;
 }
 
 static bool
@@ -790,14 +860,9 @@ rd_submit_sync_marker(struct rd_device *device,
                       uint32_t signal_count,
                       const struct vk_sync_signal *signals)
 {
-   VkResult reap_result = rd_window_reap(device, window);
+   VkResult reap_result = rd_window_reserve(device, window);
    if (reap_result != VK_SUCCESS)
       return reap_result;
-   if (window->count == ARRAY_SIZE(window->pending)) {
-      VkResult result = rd_window_drain(device, window, "marker-capacity");
-      if (result != VK_SUCCESS)
-         return result;
-   }
 
    struct fd_submit *submit = fd_submit_new(device->pipe);
    if (!submit)
@@ -960,7 +1025,7 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
 {
    if (!window)
       return rd_finish_submit(device, submit, ring, profile, sample);
-   VkResult reap_result = rd_window_reap(device, window);
+   VkResult reap_result = rd_window_reserve(device, window);
    if (reap_result != VK_SUCCESS) {
       rd_window_drain(device, window, "reap-error");
       fd_ringbuffer_del(ring);
@@ -1015,14 +1080,18 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
       fd_submit_del(submit);
       return before == VK_SUCCESS ? result : before;
    }
-   window->pending[window->count++] = (struct rd_pending_submit){submit, ring, fence, backing};
+   window->pending[window->count++] = (struct rd_pending_submit) {
+      .submit = submit, .ring = ring, .fence = fence, .cs_backing = backing,
+      .chunks = chunks, .cs_bytes = 32768, .bo_refs = references, .metadata_bytes = metadata,
+   };
    window->chunks += chunks;
    window->cs_bytes += 32768;
    window->bo_refs += references;
    window->metadata_bytes += metadata;
    window->backing_bytes = backing_bytes;
    rd_window_report("ENQUEUE", "gpu", window, VK_SUCCESS);
-   if (window->count == ARRAY_SIZE(window->pending))
+   if (window->count == ARRAY_SIZE(window->pending) &&
+       !debug_get_bool_option("RADISH_WINDOW_WAIT_OLDEST", false))
       return rd_window_drain(device, window, "capacity");
    return VK_SUCCESS;
 }
@@ -1739,11 +1808,11 @@ rd_image_copy_pipeline(struct rd_device *device, struct rd_pipeline **out)
    return result;
 }
 
-VkResult
-rd_execute_gpu_image_copy(struct rd_device *device, const struct rd_image_transfer *transfer,
-                           struct rd_memory *src, struct rd_memory *dst,
-                           VkDeviceSize src_offset, VkDeviceSize dst_offset,
-                           struct rd_submit_window *window)
+static VkResult
+rd_emit_gpu_image_copy(struct rd_device *device, struct fd_ringbuffer *ring,
+                       const struct rd_image_transfer *transfer,
+                       struct rd_memory *src, struct rd_memory *dst,
+                       VkDeviceSize src_offset, VkDeviceSize dst_offset)
 {
    struct rd_pipeline *pipeline;
    VkResult result = rd_image_copy_pipeline(device, &pipeline);
@@ -1779,6 +1848,18 @@ rd_execute_gpu_image_copy(struct rd_device *device, const struct rd_image_transf
       fprintf(stderr, "RADISH_GPU_IMAGE_COPY bytes=%" PRIu64 " rows=%u slices=%u groups=%u,%u,%u\n",
          (uint64_t)transfer->row_bytes * transfer->rows * transfer->slices,
          transfer->rows, transfer->slices, dispatch.grid[0], dispatch.grid[1], dispatch.grid[2]);
+   const uint32_t base[3] = {0};
+   rd_emit_dispatch_chunk(device, ring, &dispatch, dispatch.grid, base, true, NULL);
+   rd_flush(device, ring);
+   return VK_SUCCESS;
+}
+
+VkResult
+rd_execute_gpu_image_copy(struct rd_device *device, const struct rd_image_transfer *transfer,
+                           struct rd_memory *src, struct rd_memory *dst,
+                           VkDeviceSize src_offset, VkDeviceSize dst_offset,
+                           struct rd_submit_window *window)
+{
    struct fd_submit *submit = fd_submit_new(device->pipe);
    if (!submit)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1789,10 +1870,77 @@ rd_execute_gpu_image_copy(struct rd_device *device, const struct rd_image_transf
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    uint32_t *initial_ring_start = ring->start;
-   const uint32_t base[3] = {0};
-   rd_emit_dispatch_chunk(device, ring, &dispatch, dispatch.grid, base, true, NULL);
-   rd_flush(device, ring);
+   VkResult result = rd_emit_gpu_image_copy(device, ring, transfer, src, dst, src_offset, dst_offset);
+   if (result != VK_SUCCESS) {
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return result;
+   }
    return rd_finish_window_submit(device, submit, ring, window, initial_ring_start, false);
+}
+
+static unsigned
+rd_image_copy_batch_count(const struct rd_command *first, const struct rd_command *end)
+{
+   unsigned limit = CLAMP(debug_get_num_option("RADISH_GPU_IMAGE_COPY_BATCH", 8), 1, 8);
+   struct fd_bo *bos[8];
+   unsigned count = 0, bo_count = 0;
+   for (const struct rd_command *command = first; command < end && count < limit; command++) {
+      if (command->type != RD_CMD_IMAGE_COPY)
+         break;
+      const struct rd_image_transfer *copy = &command->image_transfer;
+      struct fd_bo *used[] = { copy->src_buffer->memory->bo, copy->dst_image->memory->bo };
+      for (unsigned i = 0; i < ARRAY_SIZE(used); i++) {
+         bool found = false;
+         for (unsigned j = 0; j < bo_count; j++)
+            found |= bos[j] == used[i];
+         if (found)
+            continue;
+         if (bo_count == ARRAY_SIZE(bos))
+            return count;
+         bos[bo_count++] = used[i];
+      }
+      count++;
+   }
+   return count;
+}
+
+static VkResult
+rd_execute_gpu_image_copy_batch(struct rd_device *device, const struct rd_command *commands,
+                                unsigned count, struct rd_submit_window *window)
+{
+   assert(count > 0 && count <= 8);
+   struct fd_submit *submit = fd_submit_new(device->pipe);
+   if (!submit)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0,
+      FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+   if (!ring) {
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   uint32_t *initial_ring_start = ring->start;
+   uint64_t bytes = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const struct rd_image_transfer *copy = &commands[i].image_transfer;
+      VkResult result = VK_ERROR_UNKNOWN;
+      if (rd_image_copy_gpu_supported(device, copy, true)) {
+         struct rd_buffer *src = copy->src_buffer;
+         struct rd_image *dst = copy->dst_image;
+         result = rd_emit_gpu_image_copy(device, ring, copy, src->memory, dst->memory,
+            src->offset + copy->src_offset, dst->memory_offset + copy->dst_offset);
+      }
+      if (result != VK_SUCCESS) {
+         fd_ringbuffer_del(ring);
+         fd_submit_del(submit);
+         return result;
+      }
+      bytes += copy->row_bytes * copy->rows * copy->slices;
+   }
+   if (debug_get_bool_option("RADISH_GPU_IMAGE_COPY_DEBUG", false))
+      fprintf(stderr, "RADISH_GPU_IMAGE_COPY_BATCH copies=%u bytes=%" PRIu64 "\n", count, bytes);
+   return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
+                                    initial_ring_start, count, false);
 }
 
 static VkResult
@@ -1914,8 +2062,11 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    struct rd_submit_window *window = &device->submit_window;
    bool deferred = !profile && debug_get_num_option("RADISH_BATCH_CHUNKS", 1) == 8;
    bool async_requested = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC", false);
+   bool small_copies = async_requested && !profile && !device->trace &&
+      debug_get_bool_option("RADISH_GPU_IMAGE_COPY_SMALL", true) &&
+      rd_queue_submit_has_render(submit);
    bool commands_supported = async_requested &&
-      rd_async_queue_submit_supported(device, submit);
+      rd_async_queue_submit_supported(device, submit, small_copies);
    bool syncs_supported = async_requested && rd_async_syncs_supported(device, submit);
    bool async = async_requested && !profile && !device->trace && commands_supported &&
       syncs_supported && device->submit_in_fence_fd < 0;
@@ -1923,8 +2074,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    if (async_requested && async_debug && !async)
       fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP profile=%u trace=%u commands=%u syncs=%u pending-fd=%u waits=%u signals=%u\n",
               profile, device->trace != NULL, commands_supported, syncs_supported,
-              submit->wait_count, submit->signal_count,
-              device->submit_in_fence_fd >= 0);
+              device->submit_in_fence_fd >= 0, submit->wait_count, submit->signal_count);
    if (async) {
       int wait_fd = -1;
       if (rd_export_waits(device, submit, &wait_fd) == VK_SUCCESS)
@@ -1932,6 +2082,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
       else
          async = false;
    }
+   small_copies &= async;
    if (async && async_debug)
       fprintf(stderr, "RADISH_ASYNC_SYNC_SUBMIT waits=%u signals=%u\n",
               submit->wait_count, submit->signal_count);
@@ -1972,11 +2123,11 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          struct rd_submit_profile submit_profile = {0};
          const struct rd_dispatch *dispatch = &recorded->dispatch;
          struct rd_dispatch indirect;
-          bool can_defer = !profile &&
-             (recorded->type == RD_CMD_RENDER ||
-              (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) ||
-              (recorded->type == RD_CMD_IMAGE_COPY &&
-               rd_image_copy_gpu_supported(device, &recorded->image_transfer)));
+         bool can_defer = !profile &&
+            (recorded->type == RD_CMD_RENDER ||
+             (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) ||
+             (recorded->type == RD_CMD_IMAGE_COPY &&
+              rd_image_copy_gpu_supported(device, &recorded->image_transfer, small_copies)));
          if (recorded->type == RD_CMD_DISPATCH)
             can_defer = deferred && !recorded->dispatch.indirect &&
                         rd_window_pipeline(device, &recorded->dispatch);
@@ -2012,10 +2163,14 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
                rd_query_account_dispatch(device, dispatch);
             if (indirect.sampling_addresses)
                fd_bo_del(indirect.sampling_addresses);
+         } else if (small_copies && recorded->type == RD_CMD_IMAGE_COPY) {
+            unsigned count = rd_image_copy_batch_count(recorded, util_dynarray_end(&command->commands));
+            result = rd_execute_gpu_image_copy_batch(device, recorded, count, window);
+            recorded += count - 1;
          } else if (recorded->type == RD_CMD_IMAGE_COPY || recorded->type == RD_CMD_IMAGE_CLEAR) {
-             result = rd_execute_image_transfer(device, &recorded->image_transfer,
-                                                 recorded->type == RD_CMD_IMAGE_CLEAR,
-                                                 can_defer ? window : NULL);
+            result = rd_execute_image_transfer(device, &recorded->image_transfer,
+                                                recorded->type == RD_CMD_IMAGE_CLEAR,
+                                                can_defer ? window : NULL);
          } else if (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) {
             result = rd_execute_transfer(device, recorded->type, &recorded->transfer,
                                          profile ? &submit_profile : NULL,
