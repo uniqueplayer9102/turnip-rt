@@ -1502,6 +1502,53 @@ rd_image_transfer_cache(struct rd_memory *memory, void *map, VkDeviceSize offset
               count, bytes, (uint64_t)memory->vk.size);
 }
 
+static uint64_t
+rd_image_clear_cpu(uint8_t *map, const struct rd_image_transfer *transfer)
+{
+   VkDeviceSize span = transfer->row_bytes;
+   uint32_t rows = transfer->rows, slices = transfer->slices;
+   if (transfer->dst_row_pitch == span) {
+      span *= rows;
+      rows = 1;
+   }
+   if (rows == 1 && transfer->dst_slice_pitch == span) {
+      span *= slices;
+      slices = 1;
+   }
+   bool uniform = true;
+   for (unsigned i = 1; i < transfer->texel_size; i++)
+      uniform &= transfer->clear[i] == transfer->clear[0];
+   _Alignas(16) uint8_t block[1024];
+   unsigned block_bytes = MIN2(span, sizeof(block));
+   block_bytes -= block_bytes % transfer->texel_size;
+   const uint8_t *pattern = transfer->clear;
+   if (!uniform && block_bytes > transfer->texel_size) {
+      memcpy(block, pattern, transfer->texel_size);
+      for (unsigned done = transfer->texel_size; done < block_bytes;) {
+         unsigned bytes = MIN2(done, block_bytes - done);
+         memcpy(block + done, block, bytes);
+         done += bytes;
+      }
+      pattern = block;
+   }
+   for (uint32_t z = 0; z < slices; z++) {
+      for (uint32_t y = 0; y < rows; y++) {
+         uint8_t *to = map + transfer->dst_offset + z * transfer->dst_slice_pitch +
+                       y * transfer->dst_row_pitch;
+         if (uniform) {
+            memset(to, pattern[0], span);
+         } else {
+            for (VkDeviceSize done = 0; done < span;) {
+               unsigned bytes = MIN2(span - done, block_bytes);
+               memcpy(to + done, pattern, bytes);
+               done += bytes;
+            }
+         }
+      }
+   }
+   return (uint64_t)rows * slices * (uniform ? 1 : DIV_ROUND_UP(span, block_bytes));
+}
+
 VkResult
 rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transfer *transfer,
                            bool clear, struct rd_submit_window *window)
@@ -1544,34 +1591,43 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
    if (dst->cached)
       rd_image_transfer_cache(dst, dst_map, dst_offset, transfer, true, false);
    __sync_synchronize();
-   for (uint32_t z = 0; z < transfer->slices; z++) {
-      for (uint32_t y = 0; y < transfer->rows; y++) {
-         uint8_t *to = dst_map + dst_offset + transfer->dst_offset +
-                       z * transfer->dst_slice_pitch + y * transfer->dst_row_pitch;
-         if (clear) {
-            for (VkDeviceSize x = 0; x < transfer->row_bytes; x += transfer->texel_size)
-               memcpy(to + x, transfer->clear, transfer->texel_size);
-         } else {
-            const uint8_t *from = src_map + src_offset + transfer->src_offset +
-                                  z * transfer->src_slice_pitch + y * transfer->src_row_pitch;
-            if (transfer->lane_step) {
-               for (VkDeviceSize x = 0; x < transfer->row_bytes; x++)
-                  to[x * transfer->dst_step + transfer->dst_lane] =
-                     from[x * transfer->src_step + transfer->src_lane];
-            } else if (transfer->copy_mask) {
-               for (VkDeviceSize x = 0; x < transfer->row_bytes; x += 4) {
-                  uint32_t source, target;
-                  memcpy(&source, from + x, 4);
-                  memcpy(&target, to + x, 4);
-                  target = (target & ~transfer->copy_mask) | (source & transfer->copy_mask);
-                  memcpy(to + x, &target, 4);
-               }
+   bool bulk_clear = clear && debug_get_bool_option("RADISH_CPU_IMAGE_CLEAR_BULK", true);
+   uint64_t clear_calls = bulk_clear ? rd_image_clear_cpu(dst_map + dst_offset, transfer) :
+      clear ? transfer->row_bytes / transfer->texel_size * transfer->rows * transfer->slices : 0;
+   if (!bulk_clear) {
+      for (uint32_t z = 0; z < transfer->slices; z++) {
+         for (uint32_t y = 0; y < transfer->rows; y++) {
+            uint8_t *to = dst_map + dst_offset + transfer->dst_offset +
+                           z * transfer->dst_slice_pitch + y * transfer->dst_row_pitch;
+            if (clear) {
+               for (VkDeviceSize x = 0; x < transfer->row_bytes; x += transfer->texel_size)
+                  memcpy(to + x, transfer->clear, transfer->texel_size);
             } else {
-               memmove(to, from, transfer->row_bytes);
+               const uint8_t *from = src_map + src_offset + transfer->src_offset +
+                                      z * transfer->src_slice_pitch + y * transfer->src_row_pitch;
+               if (transfer->lane_step) {
+                  for (VkDeviceSize x = 0; x < transfer->row_bytes; x++)
+                     to[x * transfer->dst_step + transfer->dst_lane] =
+                         from[x * transfer->src_step + transfer->src_lane];
+               } else if (transfer->copy_mask) {
+                  for (VkDeviceSize x = 0; x < transfer->row_bytes; x += 4) {
+                     uint32_t source, target;
+                     memcpy(&source, from + x, 4);
+                     memcpy(&target, to + x, 4);
+                     target = (target & ~transfer->copy_mask) | (source & transfer->copy_mask);
+                     memcpy(to + x, &target, 4);
+                  }
+               } else {
+                  memmove(to, from, transfer->row_bytes);
+               }
             }
          }
       }
    }
+   if (clear && debug_get_bool_option("RADISH_CPU_IMAGE_CLEAR_DEBUG", false))
+      fprintf(stderr, "RADISH_CPU_IMAGE_CLEAR path=%s bytes=%" PRIu64 " texel=%u calls=%" PRIu64 "\n",
+              bulk_clear ? "bulk" : "texel", transfer->row_bytes * transfer->rows * transfer->slices,
+              transfer->texel_size, clear_calls);
    if (dst->cached)
       rd_image_transfer_cache(dst, dst_map, dst_offset, transfer, true, true);
    __sync_synchronize();
