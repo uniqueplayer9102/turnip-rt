@@ -481,14 +481,72 @@ rd_CreateGraphicsPipelines(VkDevice handle, VkPipelineCache cache, uint32_t coun
 
 /* --- recording ------------------------------------------------------------ */
 
+struct rd_descriptor_block {
+   struct rd_descriptor_block *next;
+   uint32_t used, capacity;
+   struct rd_descriptor descriptors[];
+};
+
+static struct rd_descriptor *
+rd_render_alloc_descriptors(struct rd_command_buffer *command, struct rd_render *render,
+                            uint32_t count)
+{
+   if (!count || count > RD_MAX_ACTIVE_RESOURCES) {
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return NULL;
+   }
+   if (!render->descriptor_arena) {
+      struct rd_descriptor *copy = vk_alloc(&command->vk.pool->alloc, count * sizeof(*copy), 8,
+                                            VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!copy)
+         rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return copy;
+   }
+   struct rd_descriptor_block *block = render->descriptor_blocks;
+   if (!block || count > block->capacity - block->used) {
+      uint32_t capacity = MAX2(count, block ? MIN2(block->capacity * 2, 128) : 16);
+      struct rd_descriptor_block *next = vk_alloc(&command->vk.pool->alloc,
+         sizeof(*next) + capacity * sizeof(next->descriptors[0]), 8,
+         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!next) {
+         rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return NULL;
+      }
+      next->next = block;
+      next->used = 0;
+      next->capacity = capacity;
+      render->descriptor_blocks = block = next;
+   }
+   struct rd_descriptor *copy = block->descriptors + block->used;
+   block->used += count;
+   return copy;
+}
+
+static void
+rd_render_free_descriptors(struct rd_command_buffer *command, struct rd_render *render,
+                           struct rd_descriptor *descriptors)
+{
+   if (!render->descriptor_arena)
+      vk_free(&command->vk.pool->alloc, descriptors);
+}
+
 void
 rd_render_free(struct rd_command_buffer *command, struct rd_render *render)
 {
    if (!render)
       return;
-   util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
-      vk_free(&command->vk.pool->alloc, draw->descriptors[0]);
-      vk_free(&command->vk.pool->alloc, draw->descriptors[1]);
+   if (render->descriptor_arena) {
+      struct rd_descriptor_block *block = render->descriptor_blocks;
+      while (block) {
+         struct rd_descriptor_block *next = block->next;
+         vk_free(&command->vk.pool->alloc, block);
+         block = next;
+      }
+   } else {
+      util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+         vk_free(&command->vk.pool->alloc, draw->descriptors[0]);
+         vk_free(&command->vk.pool->alloc, draw->descriptors[1]);
+      }
    }
    util_dynarray_fini(&render->draws);
    util_dynarray_fini(&render->queries);
@@ -530,6 +588,7 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
       return;
    }
    util_dynarray_init(&render->draws, NULL);
+   render->descriptor_arena = debug_get_bool_option("RADISH_DESCRIPTOR_ARENA", true);
    render->area = info->renderArea;
    render->layers = info->layerCount;
    render->view_mask = info->viewMask;
@@ -611,14 +670,14 @@ rd_CmdBindIndexBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offs
 }
 
 static bool
-rd_copy_stage_descriptors(struct rd_command_buffer *command, const struct rd_pipeline *stage,
+rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *render,
+                          const struct rd_pipeline *stage,
                           struct rd_descriptor **out)
 {
    *out = NULL;
    if (!stage->resource_count)
       return true;
-   struct rd_descriptor *copy = vk_zalloc(&command->vk.pool->alloc,
-      stage->resource_count * sizeof(*copy), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   struct rd_descriptor *copy = rd_render_alloc_descriptors(command, render, stage->resource_count);
    if (!copy)
       return false;
    const struct rd_bind_state *bound = &command->bind[1];
@@ -626,7 +685,8 @@ rd_copy_stage_descriptors(struct rd_command_buffer *command, const struct rd_pip
       const struct rd_nir_resource_binding *resource = &stage->resources[i];
       const struct rd_descriptor_set *set = bound->sets[resource->descriptor_set];
       if (!set) {
-         vk_free(&command->vk.pool->alloc, copy);
+         rd_render_free_descriptors(command, render, copy);
+         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return false;
       }
       copy[i] = set->descriptors[resource->logical_slot];
@@ -649,6 +709,7 @@ rd_render_new(struct rd_command_buffer *command)
    }
    util_dynarray_init(&render->draws, NULL);
    util_dynarray_init(&render->queries, NULL);
+   render->descriptor_arena = debug_get_bool_option("RADISH_DESCRIPTOR_ARENA", true);
    struct rd_command *recorded = rd_command_append(command, RD_CMD_RENDER);
    if (!recorded) {
       rd_render_free(command, render);
@@ -658,17 +719,20 @@ rd_render_new(struct rd_command_buffer *command)
    return render;
 }
 
-static struct rd_descriptor *
-rd_clone_descriptors(struct rd_command_buffer *command, const struct rd_descriptor *src,
-                     uint32_t count)
+static bool
+rd_clone_descriptors(struct rd_command_buffer *command, struct rd_render *render,
+                     const struct rd_descriptor *src, uint32_t count,
+                     struct rd_descriptor **out)
 {
+   *out = NULL;
    if (!src || !count)
-      return NULL;
-   struct rd_descriptor *copy = vk_alloc(&command->vk.pool->alloc, count * sizeof(*copy), 8,
-                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (copy)
-      memcpy(copy, src, count * sizeof(*copy));
-   return copy;
+      return true;
+   struct rd_descriptor *copy = rd_render_alloc_descriptors(command, render, count);
+   if (!copy)
+      return false;
+   memcpy(copy, src, count * sizeof(*copy));
+   *out = copy;
+   return true;
 }
 
 bool
@@ -680,19 +744,26 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
       if (!dst)
          return false;
       struct util_dynarray draws = dst->draws, queries = dst->queries;
+      struct rd_descriptor_block *blocks = dst->descriptor_blocks;
+      bool arena = dst->descriptor_arena;
       *dst = *src;
       dst->draws = draws;
       dst->queries = queries;
+      dst->descriptor_blocks = blocks;
+      dst->descriptor_arena = arena;
    } else if (!dst) {
       rd_set_error(&primary->vk, VK_ERROR_UNKNOWN);
       return false;
    }
    util_dynarray_foreach(&src->draws, struct rd_draw, draw) {
       struct rd_draw copy = *draw;
-      copy.descriptors[0] = rd_clone_descriptors(primary, draw->descriptors[0],
-                                                 draw->pipeline->gfx->vs.res->resource_count);
-      copy.descriptors[1] = rd_clone_descriptors(primary, draw->descriptors[1],
-                                                 draw->pipeline->gfx->fs.res->resource_count);
+      if (!rd_clone_descriptors(primary, dst, draw->descriptors[0],
+             draw->pipeline->gfx->vs.res->resource_count, &copy.descriptors[0]) ||
+          !rd_clone_descriptors(primary, dst, draw->descriptors[1],
+             draw->pipeline->gfx->fs.res->resource_count, &copy.descriptors[1])) {
+         rd_render_free_descriptors(primary, dst, copy.descriptors[0]);
+         return false;
+      }
       util_dynarray_append(&dst->draws, copy);
    }
    unsigned base = util_dynarray_num_elements(&dst->draws, struct rd_draw) -
@@ -767,9 +838,9 @@ rd_record_draw(struct rd_command_buffer *command)
    memcpy(draw.vertex_buffers, command->vertex_buffers, sizeof(draw.vertex_buffers));
    memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
    memcpy(draw.push, command->push, sizeof(draw.push));
-   if (!rd_copy_stage_descriptors(command, pipeline->gfx->vs.res, &draw.descriptors[0]) ||
-       !rd_copy_stage_descriptors(command, pipeline->gfx->fs.res, &draw.descriptors[1])) {
-      vk_free(&command->vk.pool->alloc, draw.descriptors[0]);
+   if (!rd_copy_stage_descriptors(command, command->render, pipeline->gfx->vs.res, &draw.descriptors[0]) ||
+       !rd_copy_stage_descriptors(command, command->render, pipeline->gfx->fs.res, &draw.descriptors[1])) {
+      rd_render_free_descriptors(command, command->render, draw.descriptors[0]);
       rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return NULL;
    }

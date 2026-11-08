@@ -284,6 +284,8 @@ struct rd_render {
    bool continued;
    struct util_dynarray draws;
    struct util_dynarray queries; /* struct rd_render_query */
+   struct rd_descriptor_block *descriptor_blocks;
+   bool descriptor_arena;
 };
 struct rd_query_command {
    struct rd_query_pool *pool;
