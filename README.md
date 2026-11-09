@@ -78,6 +78,26 @@ like the other Vulkan drivers.
 | `RADISH_GMEM_STOP=<line>` | flush and return after a given stage; bisection helper |
 | `RADISH_ASYNC_QUEUE_SYNC=1` | queue sync behaviour used by the compositor setup |
 
+| Variable | Value |
+| --- | --- |
+| `RADISH_GRAPHICS` | `1` |
+| `RADISH_ASYNC_QUEUE_SYNC` | `0` |
+| `RADISH_GMEM` | `1` |
+| `RADISH_GMEM_CULL` | `1` |
+| `RADISH_GMEM_VIEWPORT_REUSE` | `1` |
+| `RADISH_GPU_IMAGE_COPY` | `1` |
+| `RADISH_GPU_IMAGE_COPY_SMALL` | `1` |
+| `RADISH_GPU_IMAGE_COPY_BATCH` | `8` |
+| `RADISH_A506_RB_DP2_WORKAROUND` | `1` |
+| `RADISH_GPU_BUFFER_TRANSFER` | `1` |
+| `RADISH_QUERY_FREE_RENDER` | `1` |
+| `RADISH_IMAGE_TRANSFER_CACHE_RANGES` | `1` |
+| `RADISH_CPU_IMAGE_CLEAR_BULK` | `1` |
+| `RADISH_DESCRIPTOR_ARENA` | `1` |
+| `RADISH_LAYOUT_COMPATIBILITY_CACHE` | `1` |
+| `RADISH_LAYOUT_COMPATIBILITY_DEBUG` | `0` |
+| `RADISH_WINDOW_WAIT_OLDEST` | `0` |
+
 GMEM is the default for passes it accepts. A running compositor can fall back
 to bypass without a restart by creating a marker file:
 
@@ -129,6 +149,8 @@ A5xx caps that shape the render path:
 | tile_align_w | 64 |
 | tile_align_h | 32 |
 | tile_max_w | 1024 |
+| `RD_IMAGE_MAX_2D_SIZE` | 8192 |
+| `RD_IMAGE_MAX_LEVELS` | 14 |
 
 ## GMEM vs sysmem, measured
 
