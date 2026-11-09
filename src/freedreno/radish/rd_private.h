@@ -128,6 +128,11 @@ struct rd_set_layout {
    struct vk_sampler_state *immutable_sampler_states;
    struct rd_binding bindings[];
 };
+struct rd_pipeline_layout {
+   struct vk_pipeline_layout vk;
+   uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
+   bool compatibility_cached;
+};
 struct rd_descriptor {
    VkDescriptorType type;
    struct rd_buffer *buffer;

@@ -109,8 +109,8 @@ rd_CmdBindPipeline(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
 }
 
 static void
-rd_layout_compatibility(const struct vk_pipeline_layout *layout,
-                         uint8_t hashes[RD_MAX_SETS][BLAKE3_OUT_LEN])
+rd_compute_layout_compatibility(const struct vk_pipeline_layout *layout,
+                                uint8_t hashes[RD_MAX_SETS][BLAKE3_OUT_LEN])
 {
    struct mesa_blake3 hash;
    _mesa_blake3_init(&hash);
@@ -135,6 +135,36 @@ rd_layout_compatibility(const struct vk_pipeline_layout *layout,
       _mesa_blake3_update(&hash, layout->set_layouts[i]->blake3, BLAKE3_OUT_LEN);
       _mesa_blake3_final(&hash, hashes[i]);
    }
+   if (debug_get_bool_option("RADISH_LAYOUT_COMPATIBILITY_DEBUG", false))
+      fprintf(stderr, "RADISH_LAYOUT_COMPATIBILITY sets=%u ranges=%u\n",
+              layout->set_count, layout->push_range_count);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+rd_CreatePipelineLayout(VkDevice handle, const VkPipelineLayoutCreateInfo *info,
+                        UNUSED const VkAllocationCallbacks *allocator, VkPipelineLayout *out)
+{
+   VK_FROM_HANDLE(rd_device, device, handle);
+   struct rd_pipeline_layout *layout = vk_pipeline_layout_zalloc(&device->vk,
+      sizeof(*layout), info);
+   if (!layout)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   layout->compatibility_cached = debug_get_bool_option("RADISH_LAYOUT_COMPATIBILITY_CACHE", true);
+   if (layout->compatibility_cached)
+      rd_compute_layout_compatibility(&layout->vk, layout->compatibility);
+   *out = vk_pipeline_layout_to_handle(&layout->vk);
+   return VK_SUCCESS;
+}
+
+static void
+rd_layout_compatibility(const struct vk_pipeline_layout *base,
+                         uint8_t hashes[RD_MAX_SETS][BLAKE3_OUT_LEN])
+{
+   const struct rd_pipeline_layout *layout = container_of(base, struct rd_pipeline_layout, vk);
+   if (layout->compatibility_cached)
+      memcpy(hashes, layout->compatibility, sizeof(layout->compatibility));
+   else
+      rd_compute_layout_compatibility(base, hashes);
 }
 
 VKAPI_ATTR void VKAPI_CALL
