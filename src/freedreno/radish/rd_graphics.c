@@ -2377,9 +2377,10 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    unsigned ndraws = util_dynarray_num_elements(&render->draws, struct rd_draw);
    struct rd_gfx_program_cache program_cache = {0};
    bool queries = rd_render_needs_query_accounting(device, render);
-   int *slots = queries ? calloc(ndraws, sizeof(int)) : NULL;
-   bool *coverage = queries ? calloc(ndraws, sizeof(bool)) : NULL;
-   struct rd_draw *resolved = queries ? calloc(ndraws, sizeof(struct rd_draw)) : NULL;
+   size_t nalloc = ndraws ? ndraws : 1;
+   int *slots = queries ? calloc(nalloc, sizeof(int)) : NULL;
+   bool *coverage = queries ? calloc(nalloc, sizeof(bool)) : NULL;
+   struct rd_draw *resolved = queries ? calloc(nalloc, sizeof(struct rd_draw)) : NULL;
    if (queries && (!slots || !resolved || !coverage)) {
       free(slots);
       free(resolved);
@@ -2576,6 +2577,8 @@ rd_gmem_layout_init(struct rd_gmem_layout *l, uint32_t cpp, uint32_t width,
       l->bin_h = rd_gmem_div_align(height, nbins_y, info->tile_align_h);
    }
    while (!rd_gmem_layout_fits(l, gmem_size)) {
+      if (nbins_x >= 32 && nbins_y >= 32)
+         return false;
       if ((l->bin_w <= l->bin_h && nbins_x < 32) || nbins_y >= 32)
          l->bin_w = rd_gmem_div_align(width, ++nbins_x, info->tile_align_w);
       else
@@ -2861,8 +2864,8 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
 
    struct rd_gmem_layout l;
    if (!rd_gmem_layout_init(&l, image->texel_size, width, height,
-                            info, device->gmem_size))
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+                             info, device->gmem_size))
+      return rd_execute_render_direct(device, render, window);
 
    uint32_t nbins_x = DIV_ROUND_UP(width, l.bin_w);
    uint32_t nbins_y = DIV_ROUND_UP(height, l.bin_h);
@@ -2901,9 +2904,10 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    uint64_t viewport_updates = 0, viewport_reuses = 0, state_waits = 0;
    util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
       struct rd_draw d = *draw;
-      if (d.indirect && rd_resolve_draw_indirect(device, &d) != VK_SUCCESS) {
-         result = VK_ERROR_UNKNOWN;
-         break;
+      if (d.indirect) {
+         result = rd_resolve_draw_indirect(device, &d);
+         if (result != VK_SUCCESS)
+            break;
       }
       if (!d.vertex_count || !d.instance_count)
          continue;
@@ -2916,6 +2920,13 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       seg->last_offset = draw_ring->cur - draw_ring->start;
       rd_gmem_draw_bounds(render, &d, seg);
       nr_segs++;
+   }
+   if (result != VK_SUCCESS) {
+      fd_ringbuffer_del(draw_ring);
+      free(segs);
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return result;
    }
 
    rd_gfx_restore(ring, device);

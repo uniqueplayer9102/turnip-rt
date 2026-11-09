@@ -1487,9 +1487,11 @@ rd_image_transfer_cache(struct rd_memory *memory, void *map, VkDeviceSize offset
             end = MAX2(end, last);
          }
       }
-      operation((uint8_t *)map + begin, end - begin);
-      bytes += end - begin;
-      count++;
+      if (begin != UINT64_MAX) {
+         operation((uint8_t *)map + begin, end - begin);
+         bytes += end - begin;
+         count++;
+      }
       if (flush)
          util_post_flush_fence();
       else
