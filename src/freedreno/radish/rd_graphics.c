@@ -771,15 +771,22 @@ rd_draw_uses_input_attachment(const struct rd_draw *draw)
    return false;
 }
 
-static void
-rd_render_append_draw(struct rd_render *render, struct rd_draw draw)
+static struct rd_draw *
+rd_render_append_draw(struct rd_command_buffer *command, struct rd_render *render,
+                      const struct rd_draw *draw)
 {
-   bool input = render->load_clear_pending && rd_draw_uses_input_attachment(&draw);
-   draw.barrier |= render->trailing_barrier || input;
-   util_dynarray_append(&render->draws, draw);
+   bool input = render->load_clear_pending && rd_draw_uses_input_attachment(draw);
+   struct rd_draw *copy = util_dynarray_grow(&render->draws, struct rd_draw, 1);
+   if (!copy) {
+      rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return NULL;
+   }
+   memcpy(copy, draw, sizeof(*copy));
+   copy->barrier |= render->trailing_barrier || input;
    render->trailing_barrier = false;
    if (input)
       render->load_clear_pending = false;
+   return copy;
 }
 
 static bool
@@ -829,7 +836,11 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
          rd_render_free_descriptors(primary, dst, copy.descriptors[0]);
          return false;
       }
-      rd_render_append_draw(dst, copy);
+      if (!rd_render_append_draw(primary, dst, &copy)) {
+         rd_render_free_descriptors(primary, dst, copy.descriptors[0]);
+         rd_render_free_descriptors(primary, dst, copy.descriptors[1]);
+         return false;
+      }
    }
    unsigned base = util_dynarray_num_elements(&dst->draws, struct rd_draw) -
                    util_dynarray_num_elements(&src->draws, struct rd_draw);
@@ -909,8 +920,12 @@ rd_record_draw(struct rd_command_buffer *command)
       rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return NULL;
    }
-   rd_render_append_draw(command->render, draw);
-   return util_dynarray_top_ptr(&command->render->draws, struct rd_draw);
+   struct rd_draw *recorded = rd_render_append_draw(command, command->render, &draw);
+   if (!recorded) {
+      rd_render_free_descriptors(command, command->render, draw.descriptors[0]);
+      rd_render_free_descriptors(command, command->render, draw.descriptors[1]);
+   }
+   return recorded;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -3371,8 +3386,7 @@ rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
    rd_clear_draw(pipeline, rect, color, aspects, value, &draw);
    draw.layer_first = layer_first;
    draw.layer_count = layer_count;
-   rd_render_append_draw(render, draw);
-   return true;
+   return rd_render_append_draw(command, render, &draw) != NULL;
 }
 
 VKAPI_ATTR void VKAPI_CALL
