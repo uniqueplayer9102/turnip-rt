@@ -290,6 +290,7 @@ struct rd_render {
    struct rd_render_attachment color[RD_MAX_RTS], depth, stencil;
    /* draws of a secondary command buffer recorded inside a render pass */
    bool continued;
+   bool trailing_barrier, load_clear_pending;
    struct util_dynarray draws;
    struct util_dynarray queries; /* struct rd_render_query */
    struct rd_descriptor_block *descriptor_blocks;
@@ -349,7 +350,6 @@ struct rd_command_buffer {
    bool render_continue;
    struct rd_query_pool *occlusion_pool;
    uint32_t occlusion_query;
-   bool render_barrier;
    /* bound descriptor sets: [0] compute, [1] graphics */
    struct rd_bind_state {
       struct rd_descriptor_set *sets[RD_MAX_SETS];
@@ -415,6 +415,7 @@ void rd_render_free(struct rd_command_buffer *command, struct rd_render *render)
 bool rd_render_query(struct rd_command_buffer *command, struct rd_query_pool *pool,
                      uint32_t query, bool end);
 bool rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *render);
+void rd_render_barrier(struct rd_command_buffer *command);
 void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
 bool rd_descriptor_ready(const struct rd_descriptor *descriptor);

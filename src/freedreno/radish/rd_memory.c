@@ -243,6 +243,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 rd_BindBufferMemory2(VkDevice handle, uint32_t count,
                      const VkBindBufferMemoryInfo *infos)
 {
+   VK_FROM_HANDLE(rd_device, device, handle);
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(rd_buffer, buffer, infos[i].buffer);
       VK_FROM_HANDLE(rd_memory, memory, infos[i].memory);
@@ -251,10 +252,17 @@ rd_BindBufferMemory2(VkDevice handle, uint32_t count,
       if (group && (group->deviceIndexCount > 1 ||
           (group->deviceIndexCount && (!group->pDeviceIndices || group->pDeviceIndices[0]))))
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      if (!memory || infos[i].memoryOffset > memory->vk.size ||
-          buffer->vk.size > memory->vk.size - infos[i].memoryOffset ||
+      if (!buffer || !memory || buffer->vk.base.device != &device->vk ||
+          memory->vk.base.device != &device->vk || buffer->memory ||
+          !memory->bo || memory->vk.memory_type_index != 0 ||
+          infos[i].memoryOffset > memory->vk.size ||
+          align64(buffer->vk.size, 64) > memory->vk.size - infos[i].memoryOffset ||
           infos[i].memoryOffset % 64)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   for (uint32_t i = 0; i < count; i++) {
+      VK_FROM_HANDLE(rd_buffer, buffer, infos[i].buffer);
+      VK_FROM_HANDLE(rd_memory, memory, infos[i].memory);
       buffer->memory = memory;
       buffer->offset = infos[i].memoryOffset;
       buffer->vk.device_address = fd_bo_get_iova(memory->bo) + buffer->offset;

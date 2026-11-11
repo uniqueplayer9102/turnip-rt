@@ -631,6 +631,7 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    }
    if (ds_aspects)
       rd_render_add_clear(command, render, render->area, -1, ds_aspects, ds_value, 0, render->layers);
+   render->load_clear_pending = render->draws.size != 0;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -746,6 +747,41 @@ rd_render_new(struct rd_command_buffer *command)
    return render;
 }
 
+void
+rd_render_barrier(struct rd_command_buffer *command)
+{
+   if (!command->render && command->render_continue) {
+      command->render = rd_render_new(command);
+      if (!command->render)
+         return;
+      command->render->continued = true;
+   }
+   if (command->render)
+      command->render->trailing_barrier = true;
+}
+
+static bool
+rd_draw_uses_input_attachment(const struct rd_draw *draw)
+{
+   const struct rd_pipeline *stage = draw->pipeline->gfx->fs.res;
+   for (uint32_t i = 0; i < stage->resource_count; i++)
+      if ((stage->resource_usage.descriptors & (UINT64_C(1) << i)) &&
+          stage->resources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)
+         return true;
+   return false;
+}
+
+static void
+rd_render_append_draw(struct rd_render *render, struct rd_draw draw)
+{
+   bool input = render->load_clear_pending && rd_draw_uses_input_attachment(&draw);
+   draw.barrier |= render->trailing_barrier || input;
+   util_dynarray_append(&render->draws, draw);
+   render->trailing_barrier = false;
+   if (input)
+      render->load_clear_pending = false;
+}
+
 static bool
 rd_clone_descriptors(struct rd_command_buffer *command, struct rd_render *render,
                      const struct rd_descriptor *src, uint32_t count,
@@ -778,6 +814,8 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
       dst->queries = queries;
       dst->descriptor_blocks = blocks;
       dst->descriptor_arena = arena;
+      dst->trailing_barrier = false;
+      dst->load_clear_pending = false;
    } else if (!dst) {
       rd_set_error(&primary->vk, VK_ERROR_UNKNOWN);
       return false;
@@ -791,7 +829,7 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
          rd_render_free_descriptors(primary, dst, copy.descriptors[0]);
          return false;
       }
-      util_dynarray_append(&dst->draws, copy);
+      rd_render_append_draw(dst, copy);
    }
    unsigned base = util_dynarray_num_elements(&dst->draws, struct rd_draw) -
                    util_dynarray_num_elements(&src->draws, struct rd_draw);
@@ -800,6 +838,8 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
       copy.draw_index += base;
       util_dynarray_append(&dst->queries, copy);
    }
+   dst->trailing_barrier |= src->trailing_barrier;
+   dst->load_clear_pending |= src->load_clear_pending;
    return true;
 }
 
@@ -859,9 +899,7 @@ rd_record_draw(struct rd_command_buffer *command)
       .index_type = command->index_type,
       .occlusion_pool = command->occlusion_pool,
       .occlusion_query = command->occlusion_query,
-      .barrier = command->render_barrier,
    };
-   command->render_barrier = false;
    memcpy(draw.vertex_buffers, command->vertex_buffers, sizeof(draw.vertex_buffers));
    memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
    memcpy(draw.push, command->push, sizeof(draw.push));
@@ -871,7 +909,7 @@ rd_record_draw(struct rd_command_buffer *command)
       rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return NULL;
    }
-   util_dynarray_append(&command->render->draws, draw);
+   rd_render_append_draw(command->render, draw);
    return util_dynarray_top_ptr(&command->render->draws, struct rd_draw);
 }
 
@@ -2262,15 +2300,30 @@ rd_execute_render_layers(struct rd_device *device, const struct rd_render *rende
       struct util_dynarray draws, queries;
       util_dynarray_init(&draws, NULL);
       util_dynarray_init(&queries, NULL);
+      bool barrier = false;
       util_dynarray_foreach(&render->draws, struct rd_draw, d) {
+         barrier |= d->barrier;
          bool keep = d->layer_count ? layer >= d->layer_first &&
-                                      layer < d->layer_first + d->layer_count : layer == 0;
-         if (keep)
-            util_dynarray_append(&draws, *d);
+                                       layer < d->layer_first + d->layer_count : layer == 0;
+         if (keep) {
+            struct rd_draw draw = *d;
+            draw.barrier |= barrier;
+            util_dynarray_append(&draws, draw);
+            barrier = false;
+         }
       }
-      if (layer == 0)
-         util_dynarray_foreach(&render->queries, struct rd_render_query, q)
-            util_dynarray_append(&queries, *q);
+      if (layer == 0) {
+         const struct rd_draw *source = util_dynarray_begin(&render->draws);
+         unsigned source_index = 0, kept_index = 0;
+         util_dynarray_foreach(&render->queries, struct rd_render_query, q) {
+            for (; source_index < q->draw_index; source_index++)
+               if (!source[source_index].layer_count || !source[source_index].layer_first)
+                  kept_index++;
+            struct rd_render_query query = *q;
+            query.draw_index = kept_index;
+            util_dynarray_append(&queries, query);
+         }
+      }
       copy.draws = draws;
       copy.queries = queries;
       result = rd_execute_render_view(device, &copy, window);
@@ -2461,16 +2514,6 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
             break;
          draw = &indirect;
       }
-      if (!draw->vertex_count || !draw->instance_count)
-         continue;
-      if (draw->indexed && (!draw->index_buffer || !draw->index_buffer->memory)) {
-         result = VK_ERROR_UNKNOWN;
-         break;
-      }
-      if (queries)
-         resolved[i] = *draw;
-      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->vs.bo);
-      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->fs.bo);
       if (draw->barrier) {
          /* make the colour writes so far visible to texture fetches */
          rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
@@ -2483,6 +2526,16 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          OUT_RING(ring, 0x00000012);
          OUT_WFI5(ring);
       }
+      if (!draw->vertex_count || !draw->instance_count)
+         continue;
+      if (draw->indexed && (!draw->index_buffer || !draw->index_buffer->memory)) {
+         result = VK_ERROR_UNKNOWN;
+         break;
+      }
+      if (queries)
+         resolved[i] = *draw;
+      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->vs.bo);
+      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->fs.bo);
       if (queries && coverage[i]) {
          /* fragment-shader invocations: count the rasterized samples of the
           * draw with depth/stencil tests off and nothing written (the shader
@@ -2651,7 +2704,7 @@ rd_execute_render_gmem_supported(struct rd_device *device,
    if (!list_is_empty(&device->active_queries))
       return false;
    util_dynarray_foreach(&render->draws, struct rd_draw, d) {
-      if (d->indirect || d->barrier || d->occlusion_pool)
+      if (d->indirect || d->barrier || d->occlusion_pool || rd_draw_uses_input_attachment(d))
          return false;
       const struct rd_image *image =
          container_of(render->color[0].view->vk.image, struct rd_image, vk);
@@ -3318,7 +3371,7 @@ rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
    rd_clear_draw(pipeline, rect, color, aspects, value, &draw);
    draw.layer_first = layer_first;
    draw.layer_count = layer_count;
-   util_dynarray_append(&render->draws, draw);
+   rd_render_append_draw(render, draw);
    return true;
 }
 

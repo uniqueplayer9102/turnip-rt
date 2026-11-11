@@ -945,11 +945,12 @@ rd_submit_sync_marker(struct rd_device *device,
    if (!signal_count)
       return VK_SUCCESS;
 
+   uint32_t imported = 0;
    if (fence->fence_fd >= 0) {
       VkResult result = VK_SUCCESS;
-      for (uint32_t i = 0; i < signal_count; i++) {
-         result = rd_import_sync_file_at_value(device, signals[i].sync,
-                                                signals[i].signal_value,
+      for (; imported < signal_count; imported++) {
+         result = rd_import_sync_file_at_value(device, signals[imported].sync,
+                                                signals[imported].signal_value,
                                                 fence->fence_fd);
          if (result != VK_SUCCESS)
             break;
@@ -961,7 +962,7 @@ rd_submit_sync_marker(struct rd_device *device,
    VkResult wait_result = rd_window_drain(device, window, "signal-fallback");
    if (wait_result != VK_SUCCESS)
       return wait_result;
-   return vk_sync_signal_many(&device->vk, signal_count, signals);
+   return vk_sync_signal_many(&device->vk, signal_count - imported, signals + imported);
 }
 
 VkResult

@@ -449,8 +449,7 @@ rd_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
    }
    /* inside a render pass (a subpass self-dependency): the next draw waits
     * for the attachment writes before it and reads them through textures */
-   if (command->render)
-      command->render_barrier = true;
+   rd_render_barrier(command);
 }
 
 struct rd_command *
