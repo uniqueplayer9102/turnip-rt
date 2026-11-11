@@ -11,6 +11,7 @@ struct rd_nir_resource_binding {
    uint32_t descriptor_set, binding, array_element, logical_slot, descriptor_slot;
    VkDescriptorType type;
    uint32_t buffer_slot, texture_slot, sampler_slot, image_slot;
+   uint32_t plane_count;
 };
 
 struct rd_nir_resource_usage {

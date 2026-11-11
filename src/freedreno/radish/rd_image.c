@@ -5,9 +5,66 @@
 #include "vk_format.h"
 #include "vk_format_info.h"
 #include "vk_util.h"
+#include "vk_ycbcr_conversion.h"
 #include "util/format/u_format.h"
 #include <limits.h>
 #include <math.h>
+
+bool
+rd_ycbcr_format_supported(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+   case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
+   case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+   case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
+   case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+const struct rd_image_level *
+rd_image_plane_level(const struct rd_image *image, uint32_t plane, uint32_t level)
+{
+   assert(plane < vk_format_get_plane_count(image->vk.format));
+   assert(level < image->vk.mip_levels);
+   return plane ? &image->extra_planes[plane - 1].levels[level] : &image->levels[level];
+}
+
+const struct fdl_layout *
+rd_image_plane_native(const struct rd_image *image, uint32_t plane)
+{
+   assert(plane < vk_format_get_plane_count(image->vk.format));
+   return plane ? &image->extra_planes[plane - 1].native_layout : &image->native_layout;
+}
+
+static uint32_t
+rd_image_aspect_plane(VkFormat format, VkImageAspectFlags aspect)
+{
+   if (!aspect)
+      return UINT32_MAX;
+   if (!rd_ycbcr_format_supported(format))
+      return !(aspect & ~vk_format_aspects(format)) ? 0 : UINT32_MAX;
+   if ((aspect & (aspect - 1)) || !(aspect & vk_format_aspects(format)))
+      return UINT32_MAX;
+   return aspect == VK_IMAGE_ASPECT_PLANE_0_BIT ? 0 :
+          aspect == VK_IMAGE_ASPECT_PLANE_1_BIT ? 1 :
+          aspect == VK_IMAGE_ASPECT_PLANE_2_BIT ? 2 : UINT32_MAX;
+}
+
+static VkExtent3D
+rd_image_plane_extent(const struct rd_image *image, uint32_t plane, uint32_t level)
+{
+   VkExtent3D extent = vk_image_mip_level_extent(&image->vk, level);
+   const struct vk_format_ycbcr_info *info = vk_format_get_ycbcr_info(image->vk.format);
+   if (info) {
+      extent.width = DIV_ROUND_UP(extent.width, info->planes[plane].denominator_scales[0]);
+      extent.height = DIV_ROUND_UP(extent.height, info->planes[plane].denominator_scales[1]);
+   }
+   return extent;
+}
 
 static uint32_t
 rd_image_texel_size(VkFormat format)
@@ -360,6 +417,13 @@ static bool
 rd_image_parameters(VkFormat format, VkImageType type, VkImageTiling tiling,
                     VkImageUsageFlags2KHR usage, VkImageCreateFlags2KHR flags)
 {
+   if (rd_ycbcr_format_supported(format))
+      return type == VK_IMAGE_TYPE_2D &&
+         (tiling == VK_IMAGE_TILING_LINEAR || tiling == VK_IMAGE_TILING_OPTIMAL ||
+          tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) && usage &&
+         !(usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
+         !(flags & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_ALIAS_BIT));
    if (!rd_image_texel_size(format))
       return false;
    if (vk_format_is_depth_or_stencil(format) && type != VK_IMAGE_TYPE_2D)
@@ -436,6 +500,8 @@ rd_image_sample_counts(VkFormat format, VkImageType type, VkImageTiling tiling,
 static bool
 rd_drm_modifier_format_supported(VkFormat format)
 {
+   if (rd_ycbcr_format_supported(format))
+      return true;
    switch (format) {
    case VK_FORMAT_R8G8B8A8_UNORM:
    case VK_FORMAT_R8G8B8A8_SRGB:
@@ -451,6 +517,7 @@ VKAPI_ATTR void VKAPI_CALL
 rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
                                       VkFormatProperties2 *out)
 {
+   bool ycbcr = rd_ycbcr_format_supported(format);
    VkFormatFeatureFlags flags = rd_image_texel_size(format) ?
       VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT : 0;
    VkFormatFeatureFlags buffer = rd_image_required_vertex_buffer(format) ?
@@ -489,6 +556,13 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
    }
    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
       attachment |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   if (ycbcr) {
+      flags = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+         VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
+      buffer = attachment = linear_blit = 0;
+   }
    out->formatProperties = (VkFormatProperties) {
       .linearTilingFeatures = vk_format_is_compressed(format) ? 0 : flags | linear_blit,
       .optimalTilingFeatures = flags | attachment,
@@ -515,7 +589,7 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
       if (rd_drm_modifier_format_supported(format)) {
          vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &modifier_out, mod) {
             mod->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
-            mod->drmFormatModifierPlaneCount = 1;
+            mod->drmFormatModifierPlaneCount = vk_format_get_plane_count(format);
             mod->drmFormatModifierTilingFeatures = modifier_features;
          }
       }
@@ -529,7 +603,7 @@ rd_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice handle, VkFormat format,
       if (rd_drm_modifier_format_supported(format)) {
          vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &modifier_out, mod) {
             mod->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
-            mod->drmFormatModifierPlaneCount = 1;
+            mod->drmFormatModifierPlaneCount = vk_format_get_plane_count(format);
             mod->drmFormatModifierTilingFeatures = modifier_features;
          }
       }
@@ -579,6 +653,10 @@ rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
       out->imageFormatProperties.maxMipLevels = 1;
       out->imageFormatProperties.maxArrayLayers = 1;
    }
+   if (rd_ycbcr_format_supported(info->format)) {
+      out->imageFormatProperties.maxMipLevels = 1;
+      out->imageFormatProperties.maxArrayLayers = 1;
+   }
    VkExternalMemoryProperties external_memory = {0};
    if (external && external->handleType) {
       external_memory = (VkExternalMemoryProperties) {
@@ -592,6 +670,9 @@ rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
       if (sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES)
          ((VkExternalImageFormatProperties *)next)->externalMemoryProperties =
             external_memory;
+      else if (sType == VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES)
+         ((VkSamplerYcbcrConversionImageFormatProperties *)next)->combinedImageSamplerDescriptorCount =
+            vk_format_get_plane_count(info->format);
    }
    return VK_SUCCESS;
 }
@@ -600,6 +681,31 @@ static bool
 rd_image_layout(struct rd_image *image)
 {
    VkDeviceSize size = 0;
+   if (rd_ycbcr_format_supported(image->vk.format)) {
+      const struct vk_format_ycbcr_info *info = vk_format_get_ycbcr_info(image->vk.format);
+      for (uint32_t plane = 0; plane < info->n_planes; plane++) {
+         struct fdl_layout *native = plane ? &image->extra_planes[plane - 1].native_layout : &image->native_layout;
+         struct rd_image_level *level = plane ? &image->extra_planes[plane - 1].levels[0] : &image->levels[0];
+         VkExtent3D extent = rd_image_plane_extent(image, plane, 0);
+         const struct fdl_image_params parameters = {
+            .format = vk_format_to_pipe_format(info->planes[plane].format), .nr_samples = 1,
+            .width0 = extent.width, .height0 = extent.height, .depth0 = 1,
+            .mip_levels = 1, .array_size = 1,
+         };
+         fdl5_layout_image(native, &parameters);
+         native->mip_levels = 1;
+         size = align64(size, 4096);
+         if (!native->size || size > RD_IMAGE_MAX_SIZE || native->size > RD_IMAGE_MAX_SIZE - size)
+            return false;
+         *level = (struct rd_image_level) {
+            .offset = size, .row_pitch = fdl_pitch(native, 0), .depth_pitch = native->slices[0].size0,
+            .array_pitch = native->layer_size, .size = native->size,
+         };
+         size += native->size;
+      }
+      image->size = size;
+      return true;
+   }
    bool shader = image->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
@@ -670,6 +776,24 @@ rd_image_layout(struct rd_image *image)
    return true;
 }
 
+static bool
+rd_gtk_rgb_import(const VkImageCreateInfo *info,
+                  const VkImageDrmFormatModifierExplicitCreateInfoEXT *modifier,
+                  const VkExternalMemoryImageCreateInfo *external,
+                  VkImageCreateFlags2KHR flags)
+{
+   return modifier && modifier->drmFormatModifier == DRM_FORMAT_MOD_LINEAR &&
+      modifier->drmFormatModifierPlaneCount == 1 && modifier->pPlaneLayouts &&
+      external && external->handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+      rd_drm_modifier_format_supported(info->format) && !rd_ycbcr_format_supported(info->format) &&
+      info->imageType == VK_IMAGE_TYPE_2D && info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+      info->samples == VK_SAMPLE_COUNT_1_BIT && info->mipLevels == 1 && info->arrayLayers == 1 &&
+      info->sharingMode == VK_SHARING_MODE_EXCLUSIVE && !flags &&
+      (vk_image_usage_flags(info) & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+      !(vk_image_usage_flags(info) & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) &&
+      debug_get_bool_option("RADISH_GTK_YCBCR_COMPAT", false);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
                const VkAllocationCallbacks *allocator, VkImage *out)
@@ -684,7 +808,10 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
       vk_find_struct_const(info->pNext, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
    const VkImageDrmFormatModifierExplicitCreateInfoEXT *modifier_explicit =
       vk_find_struct_const(info->pNext, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+   const VkExternalMemoryImageCreateInfo *external =
+      vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+   bool ycbcr = rd_ycbcr_format_supported(info->format);
    if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       if (info->imageType != VK_IMAGE_TYPE_2D || info->samples != VK_SAMPLE_COUNT_1_BIT ||
           info->mipLevels != 1 || info->arrayLayers != 1 ||
@@ -702,7 +829,7 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
             }
          }
       } else if (modifier_explicit->drmFormatModifier == DRM_FORMAT_MOD_LINEAR &&
-                 modifier_explicit->drmFormatModifierPlaneCount == 1 &&
+                 modifier_explicit->drmFormatModifierPlaneCount == vk_format_get_plane_count(info->format) &&
                  modifier_explicit->pPlaneLayouts) {
          modifier = DRM_FORMAT_MOD_LINEAR;
       }
@@ -723,8 +850,18 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
        info->arrayLayers > 256 || !info->extent.width || !info->extent.height ||
        !info->extent.depth ||
        (info->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
-        info->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED))
+        info->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED &&
+         !(modifier == DRM_FORMAT_MOD_LINEAR && info->initialLayout == VK_IMAGE_LAYOUT_GENERAL &&
+           (ycbcr || rd_gtk_rgb_import(info, modifier_explicit, external, flags)))))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (ycbcr && (info->samples != VK_SAMPLE_COUNT_1_BIT || info->mipLevels != 1 || info->arrayLayers != 1))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (ycbcr) {
+      const struct vk_format_ycbcr_info *format_info = vk_format_get_ycbcr_info(info->format);
+      if (info->extent.width % format_info->planes[1].denominator_scales[0] ||
+          info->extent.height % format_info->planes[1].denominator_scales[1])
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
    if ((flags & VK_IMAGE_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT) &&
        (info->mipLevels != 1 || info->arrayLayers != 1))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -737,8 +874,6 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
        ((flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
         (info->extent.width != info->extent.height || info->arrayLayers < 6)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   const VkExternalMemoryImageCreateInfo *external =
-      vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    if (external && external->handleTypes &&
        (modifier != DRM_FORMAT_MOD_LINEAR ||
         (external->handleTypes & ~VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)))
@@ -747,19 +882,55 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
    if (!image)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    image->vk.drm_format_mod = modifier;
-   image->texel_size = rd_image_texel_size(info->format);
+   image->texel_size = rd_image_texel_size(ycbcr ? vk_format_get_plane_format(info->format, 0) : info->format);
    if (!rd_image_layout(image)) {
       vk_image_destroy(&device->vk, allocator, &image->vk);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
-   if (modifier_explicit) {
+   if (modifier_explicit && ycbcr) {
+      VkDeviceSize size = 0;
+      uint32_t count = vk_format_get_plane_count(info->format);
+      for (uint32_t plane = 0; plane < count; plane++) {
+         const VkSubresourceLayout *explicit = &modifier_explicit->pPlaneLayouts[plane];
+         struct fdl_layout *native = plane ? &image->extra_planes[plane - 1].native_layout : &image->native_layout;
+         struct rd_image_level *level = plane ? &image->extra_planes[plane - 1].levels[0] : &image->levels[0];
+         VkExtent3D extent = rd_image_plane_extent(image, plane, 0);
+         uint32_t cpp = vk_format_get_blocksize(vk_format_get_plane_format(info->format, plane));
+         uint64_t row_bytes = (uint64_t)extent.width * cpp;
+         if (!explicit->rowPitch || explicit->rowPitch < row_bytes || explicit->rowPitch > 0x3fffffu ||
+             explicit->rowPitch % (1u << native->pitchalign) || explicit->offset % 64 ||
+             explicit->offset > RD_IMAGE_MAX_SIZE ||
+             extent.height > (RD_IMAGE_MAX_SIZE - explicit->offset) / explicit->rowPitch) {
+            vk_image_destroy(&device->vk, allocator, &image->vk);
+            return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+         }
+         uint64_t size_bytes = explicit->rowPitch * extent.height;
+         for (uint32_t previous = 0; previous < plane; previous++) {
+            const struct rd_image_level *other = rd_image_plane_level(image, previous, 0);
+            if (explicit->offset < other->offset + other->size && other->offset < explicit->offset + size_bytes) {
+               vk_image_destroy(&device->vk, allocator, &image->vk);
+               return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+            }
+         }
+         *level = (struct rd_image_level) {
+            .offset = explicit->offset, .row_pitch = explicit->rowPitch, .depth_pitch = size_bytes,
+            .array_pitch = size_bytes, .size = size_bytes,
+         };
+         native->pitch0 = explicit->rowPitch;
+         native->slices[0].size0 = size_bytes;
+         native->layer_size = size_bytes;
+         native->size = size_bytes;
+         size = MAX2(size, explicit->offset + size_bytes);
+      }
+      image->size = size;
+   } else if (modifier_explicit) {
       const VkSubresourceLayout *plane = &modifier_explicit->pPlaneLayouts[0];
       const uint64_t row_bytes = (uint64_t)image->vk.extent.width * image->texel_size;
       const uint64_t min_depth_pitch = (uint64_t)plane->rowPitch * image->vk.extent.height;
       const uint64_t plane_size = plane->size ? plane->size : min_depth_pitch;
       const uint64_t pitch_alignment = 1u << image->native_layout.pitchalign;
       if (!plane->rowPitch || plane->rowPitch < row_bytes ||
-          plane->rowPitch > UINT32_MAX || plane->rowPitch % pitch_alignment ||
+           plane->rowPitch > 0x3fffffu || plane->rowPitch % pitch_alignment ||
           plane->offset % 64 || plane->offset > RD_IMAGE_MAX_SIZE ||
           plane_size > RD_IMAGE_MAX_SIZE - plane->offset ||
           (plane->size && plane->size < (uint64_t)plane->rowPitch * (image->vk.extent.height - 1) + row_bytes) ||
@@ -916,15 +1087,23 @@ rd_GetImageSubresourceLayout(VkDevice handle, VkImage image_handle,
 {
    VK_FROM_HANDLE(rd_image, image, image_handle);
    *out = (VkSubresourceLayout){0};
-   bool modifier_plane = image &&
-      image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
-      subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;
+   if (!image)
+      return;
+   uint32_t plane = rd_image_aspect_plane(image->vk.format, subresource->aspectMask);
+   bool modifier_plane = image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+      (subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT ||
+       subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT ||
+       subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT);
+   if (modifier_plane)
+      plane = subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT ? 0 :
+              subresource->aspectMask == VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT ? 1 : 2;
    if (!subresource->aspectMask ||
        (!modifier_plane && (subresource->aspectMask & ~vk_format_aspects(image->vk.format))) ||
        (subresource->aspectMask & (subresource->aspectMask - 1)) ||
+       plane >= vk_format_get_plane_count(image->vk.format) ||
        subresource->mipLevel >= image->vk.mip_levels || subresource->arrayLayer >= image->vk.array_layers)
       return;
-   const struct rd_image_level *level = &image->levels[subresource->mipLevel];
+   const struct rd_image_level *level = rd_image_plane_level(image, plane, subresource->mipLevel);
    *out = (VkSubresourceLayout) {
       .offset = level->offset + subresource->arrayLayer * level->array_pitch,
       .size = level->size, .rowPitch = level->row_pitch,
@@ -943,6 +1122,12 @@ rd_CreateImageView(VkDevice handle, const VkImageViewCreateInfo *info,
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
    const VkImageSubresourceRange *r = &info->subresourceRange;
+   bool ycbcr = image && rd_ycbcr_format_supported(image->vk.format);
+   bool converted = ycbcr && r->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+   uint32_t plane = ycbcr && !converted ? rd_image_aspect_plane(image->vk.format, r->aspectMask) : 0;
+   const VkSamplerYcbcrConversionInfo *conversion_info =
+      vk_find_struct_const(info->pNext, SAMPLER_YCBCR_CONVERSION_INFO);
+   VK_FROM_HANDLE(vk_ycbcr_conversion, conversion, conversion_info ? conversion_info->conversion : VK_NULL_HANDLE);
    bool block_view = image && (image->vk.create_flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) &&
       !vk_format_is_compressed(info->format) &&
       vk_format_get_blocksize(info->format) == vk_format_get_blocksize(image->vk.format);
@@ -950,11 +1135,25 @@ rd_CreateImageView(VkDevice handle, const VkImageViewCreateInfo *info,
       ((image->vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
        !vk_format_is_depth_or_stencil(image->vk.format) &&
        !vk_format_is_depth_or_stencil(info->format) &&
-       vk_format_get_class_info(info->format) == vk_format_get_class_info(image->vk.format)));
+        vk_format_get_class_info(info->format) == vk_format_get_class_info(image->vk.format)));
+   if (ycbcr) {
+      VkFormat plane_format = plane < vk_format_get_plane_count(image->vk.format) ?
+         vk_format_get_plane_format(image->vk.format, plane) : VK_FORMAT_UNDEFINED;
+      format_compatible = converted ? info->format == image->vk.format && conversion &&
+         conversion->state.format == info->format :
+         (image->vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && plane_format != VK_FORMAT_UNDEFINED &&
+         vk_format_get_class_info(info->format) == vk_format_get_class_info(plane_format) && !conversion;
+   }
    if (!image || info->flags || !format_compatible ||
        !(image->vk.usage & view_usage) || !r->aspectMask ||
-       (r->aspectMask & ~vk_format_aspects(image->vk.format)) ||
+       (!converted && (r->aspectMask & ~vk_format_aspects(image->vk.format))) ||
        r->baseMipLevel >= image->vk.mip_levels)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (converted &&
+       ((info->components.r != VK_COMPONENT_SWIZZLE_IDENTITY && info->components.r != VK_COMPONENT_SWIZZLE_R) ||
+        (info->components.g != VK_COMPONENT_SWIZZLE_IDENTITY && info->components.g != VK_COMPONENT_SWIZZLE_G) ||
+        (info->components.b != VK_COMPONENT_SWIZZLE_IDENTITY && info->components.b != VK_COMPONENT_SWIZZLE_B) ||
+        (info->components.a != VK_COMPONENT_SWIZZLE_IDENTITY && info->components.a != VK_COMPONENT_SWIZZLE_A)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    bool slice_view = image->vk.image_type == VK_IMAGE_TYPE_3D &&
       (image->vk.create_flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) &&
@@ -984,7 +1183,7 @@ rd_CreateImageView(VkDevice handle, const VkImageViewCreateInfo *info,
    const VkImageViewUsageCreateInfo *usage_info =
       vk_find_struct_const(info->pNext, IMAGE_VIEW_USAGE_CREATE_INFO);
    VkImageUsageFlags2KHR usage = usage_info ? usage_info->usage : image->vk.usage;
-   if ((usage & ~image->vk.usage) || !rd_shader_format_supported(info->format) ||
+   if ((usage & ~image->vk.usage) || (!converted && !rd_shader_format_supported(info->format)) ||
        ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !rd_storage_shader_format_supported(info->format)) ||
        (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                  VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &
@@ -995,6 +1194,12 @@ rd_CreateImageView(VkDevice handle, const VkImageViewCreateInfo *info,
    struct rd_image_view *view = vk_image_view_create(&device->vk, info, allocator, sizeof(*view));
    if (!view)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   view->plane = plane;
+   view->ycbcr = converted;
+   if (converted)
+      view->conversion = conversion->state;
+   else if (ycbcr)
+      view->vk.extent = rd_image_plane_extent(image, plane, r->baseMipLevel);
    *out = rd_image_view_to_handle(view);
    return VK_SUCCESS;
 }
@@ -1047,11 +1252,69 @@ rd_DestroyBufferView(VkDevice handle, VkBufferView view_handle, const VkAllocati
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
+rd_CreateSamplerYcbcrConversion(VkDevice handle, const VkSamplerYcbcrConversionCreateInfo *info,
+                               const VkAllocationCallbacks *allocator, VkSamplerYcbcrConversion *out)
+{
+   VK_FROM_HANDLE(rd_device, device, handle);
+   *out = VK_NULL_HANDLE;
+   if (!rd_ycbcr_format_supported(info->format) ||
+       info->ycbcrModel > VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_2020 ||
+       info->ycbcrRange > VK_SAMPLER_YCBCR_RANGE_ITU_NARROW ||
+       info->components.r > VK_COMPONENT_SWIZZLE_A || info->components.g > VK_COMPONENT_SWIZZLE_A ||
+       info->components.b > VK_COMPONENT_SWIZZLE_A || info->components.a > VK_COMPONENT_SWIZZLE_A ||
+       info->xChromaOffset > VK_CHROMA_LOCATION_MIDPOINT || info->yChromaOffset > VK_CHROMA_LOCATION_MIDPOINT ||
+       (info->chromaFilter != VK_FILTER_NEAREST && info->chromaFilter != VK_FILTER_LINEAR) ||
+       info->forceExplicitReconstruction)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   const struct vk_format_ycbcr_info *format_info = vk_format_get_ycbcr_info(info->format);
+   bool subsampled = format_info->planes[1].denominator_scales[0] > 1 ||
+                     format_info->planes[1].denominator_scales[1] > 1;
+   VkComponentSwizzle mapping[4] = {info->components.r, info->components.g, info->components.b, info->components.a};
+   for (uint32_t i = 0; i < ARRAY_SIZE(mapping); i++)
+      if (mapping[i] == VK_COMPONENT_SWIZZLE_IDENTITY)
+         mapping[i] = VK_COMPONENT_SWIZZLE_R + i;
+   if (subsampled &&
+       (mapping[1] != VK_COMPONENT_SWIZZLE_G ||
+        (mapping[3] != VK_COMPONENT_SWIZZLE_A && mapping[3] != VK_COMPONENT_SWIZZLE_ONE &&
+         mapping[3] != VK_COMPONENT_SWIZZLE_ZERO) ||
+        !((mapping[0] == VK_COMPONENT_SWIZZLE_R && mapping[2] == VK_COMPONENT_SWIZZLE_B) ||
+          (mapping[0] == VK_COMPONENT_SWIZZLE_B && mapping[2] == VK_COMPONENT_SWIZZLE_R))))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (info->ycbcrModel != VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY)
+      for (uint32_t i = 0; i < 3; i++)
+         if (mapping[i] < VK_COMPONENT_SWIZZLE_R || mapping[i] > VK_COMPONENT_SWIZZLE_B)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   struct vk_ycbcr_conversion *conversion = vk_object_zalloc(&device->vk, allocator,
+      sizeof(*conversion), VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION);
+   if (!conversion)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   conversion->state = (struct vk_ycbcr_conversion_state) {
+      .format = info->format, .ycbcr_model = info->ycbcrModel, .ycbcr_range = info->ycbcrRange,
+      .mapping = {mapping[0], mapping[1], mapping[2], mapping[3]},
+      .chroma_offsets = {info->xChromaOffset, info->yChromaOffset}, .chroma_filter = info->chromaFilter,
+      .chroma_reconstruction = subsampled &&
+         (info->xChromaOffset == VK_CHROMA_LOCATION_COSITED_EVEN ||
+          info->yChromaOffset == VK_CHROMA_LOCATION_COSITED_EVEN),
+   };
+   *out = vk_ycbcr_conversion_to_handle(conversion);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
 rd_CreateSampler(VkDevice handle, const VkSamplerCreateInfo *info,
                   const VkAllocationCallbacks *allocator, VkSampler *out)
 {
    VK_FROM_HANDLE(rd_device, device, handle);
    *out = VK_NULL_HANDLE;
+   const VkSamplerYcbcrConversionInfo *conversion_info =
+      vk_find_struct_const(info->pNext, SAMPLER_YCBCR_CONVERSION_INFO);
+   VK_FROM_HANDLE(vk_ycbcr_conversion, conversion, conversion_info ? conversion_info->conversion : VK_NULL_HANDLE);
+   if (conversion && (info->magFilter != conversion->state.chroma_filter ||
+       info->minFilter != conversion->state.chroma_filter || info->compareEnable || info->unnormalizedCoordinates ||
+       info->addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE ||
+       info->addressModeV != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE ||
+       info->addressModeW != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
    if (info->flags || info->anisotropyEnable ||
        (info->magFilter != VK_FILTER_NEAREST && info->magFilter != VK_FILTER_LINEAR) ||
        (info->minFilter != VK_FILTER_NEAREST && info->minFilter != VK_FILTER_LINEAR) ||
@@ -1092,7 +1355,8 @@ rd_DestroySampler(VkDevice handle, VkSampler sampler_handle, const VkAllocationC
 static bool
 rd_image_range(const struct rd_image *image, const VkImageSubresourceRange *range)
 {
-   if (!image || !range->aspectMask || (range->aspectMask & ~vk_format_aspects(image->vk.format)) ||
+   bool color = image && rd_ycbcr_format_supported(image->vk.format) && range->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+   if (!image || !range->aspectMask || (!color && (range->aspectMask & ~vk_format_aspects(image->vk.format))) ||
        range->baseMipLevel >= image->vk.mip_levels)
       return false;
    /* a 3D image's slices may be named as layers (2D views of slices) */
@@ -1121,17 +1385,21 @@ rd_image_box(struct rd_image *image, const VkImageSubresourceLayers *subresource
              VkOffset3D offset, VkExtent3D extent, VkDeviceSize *base,
              VkDeviceSize *row, VkDeviceSize *slice, uint32_t *slices)
 {
+   uint32_t plane = image ? rd_image_aspect_plane(image->vk.format, subresource->aspectMask) : UINT32_MAX;
    if (!image || !subresource->aspectMask ||
+       plane == UINT32_MAX ||
        (subresource->aspectMask & ~vk_format_aspects(image->vk.format)) ||
        subresource->mipLevel >= image->vk.mip_levels || !subresource->layerCount ||
        subresource->baseArrayLayer >= image->vk.array_layers ||
        subresource->layerCount > image->vk.array_layers - subresource->baseArrayLayer ||
        offset.x < 0 || offset.y < 0 || offset.z < 0 || !extent.width || !extent.height || !extent.depth)
       return false;
-   VkExtent3D limit = vk_image_mip_level_extent(&image->vk, subresource->mipLevel);
-   uint32_t bw = vk_format_get_blockwidth(image->vk.format);
-   uint32_t bh = vk_format_get_blockheight(image->vk.format);
-   VkExtent3D elements = vk_image_extent_to_elements(&image->vk, limit);
+   VkExtent3D limit = rd_image_plane_extent(image, plane, subresource->mipLevel);
+   VkFormat format = rd_ycbcr_format_supported(image->vk.format) ?
+      vk_format_get_plane_format(image->vk.format, plane) : image->vk.format;
+   uint32_t bw = vk_format_get_blockwidth(format);
+   uint32_t bh = vk_format_get_blockheight(format);
+   VkExtent3D elements = {DIV_ROUND_UP(limit.width, bw), DIV_ROUND_UP(limit.height, bh), limit.depth};
    uint32_t width = elements.width * bw;
    uint32_t height = elements.height * bh;
    if ((uint32_t)offset.x > width || extent.width > width - offset.x ||
@@ -1142,11 +1410,11 @@ rd_image_box(struct rd_image *image, const VkImageSubresourceLayers *subresource
        (extent.width % bw && extent.width != limit.width - offset.x) ||
        (extent.height % bh && extent.height != limit.height - offset.y))
       return false;
-   VkOffset3D element_offset = vk_image_offset_to_elements(&image->vk, offset);
-   const struct rd_image_level *level = &image->levels[subresource->mipLevel];
+   VkOffset3D element_offset = {offset.x / bw, offset.y / bh, offset.z};
+   const struct rd_image_level *level = rd_image_plane_level(image, plane, subresource->mipLevel);
    *base = level->offset + subresource->baseArrayLayer * level->array_pitch +
            element_offset.z * level->depth_pitch + element_offset.y * level->row_pitch +
-           (uint64_t)element_offset.x * image->texel_size * image->vk.samples;
+            (uint64_t)element_offset.x * vk_format_get_blocksize(format) * image->vk.samples;
    *row = level->row_pitch;
    *slice = image->vk.image_type == VK_IMAGE_TYPE_3D ? level->depth_pitch : level->array_pitch;
    *slices = image->vk.image_type == VK_IMAGE_TYPE_3D ? extent.depth : subresource->layerCount;
@@ -1175,7 +1443,8 @@ rd_CmdCopyImage(VkCommandBuffer handle, VkImage src_handle, VkImageLayout src_la
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_image, src, src_handle);
    VK_FROM_HANDLE(rd_image, dst, dst_handle);
-   if (!rd_image_command_valid(command, src && dst && src->texel_size == dst->texel_size &&
+   bool ycbcr = src && dst && (rd_ycbcr_format_supported(src->vk.format) || rd_ycbcr_format_supported(dst->vk.format));
+   if (!rd_image_command_valid(command, src && dst && (ycbcr || src->texel_size == dst->texel_size) &&
        src->vk.samples == dst->vk.samples &&
        (!(vk_format_is_depth_or_stencil(src->vk.format) || vk_format_is_depth_or_stencil(dst->vk.format)) ||
         src->vk.format == dst->vk.format) &&
@@ -1189,8 +1458,19 @@ rd_CmdCopyImage(VkCommandBuffer handle, VkImage src_handle, VkImageLayout src_la
    for (uint32_t i = 0; i < count; i++) {
       struct rd_image_transfer transfer = {.src_image = src, .dst_image = dst};
       if (!rd_image_command_valid(command,
-          regions[i].srcSubresource.aspectMask == regions[i].dstSubresource.aspectMask))
+          ycbcr || regions[i].srcSubresource.aspectMask == regions[i].dstSubresource.aspectMask))
          return;
+      VkFormat src_format = src->vk.format, dst_format = dst->vk.format;
+      if (ycbcr) {
+         uint32_t src_plane = rd_image_aspect_plane(src_format, regions[i].srcSubresource.aspectMask);
+         uint32_t dst_plane = rd_image_aspect_plane(dst_format, regions[i].dstSubresource.aspectMask);
+         if (!rd_image_command_valid(command, src_plane != UINT32_MAX && dst_plane != UINT32_MAX))
+            return;
+         src_format = vk_format_get_plane_format(src_format, src_plane);
+         dst_format = vk_format_get_plane_format(dst_format, dst_plane);
+         if (!rd_image_command_valid(command, vk_format_get_blocksize(src_format) == vk_format_get_blocksize(dst_format)))
+            return;
+      }
       if (src->vk.format == VK_FORMAT_D24_UNORM_S8_UINT) {
          if (regions[i].srcSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT)
             transfer.copy_mask = 0x00ffffffu;
@@ -1205,9 +1485,10 @@ rd_CmdCopyImage(VkCommandBuffer handle, VkImage src_handle, VkImageLayout src_la
          else
             dst_extent.depth = 1;
       }
-      VkExtent3D elements = vk_image_extent_to_elements(&src->vk, src_extent);
-      dst_extent.width = elements.width * vk_format_get_blockwidth(dst->vk.format);
-      dst_extent.height = elements.height * vk_format_get_blockheight(dst->vk.format);
+      VkExtent3D elements = {DIV_ROUND_UP(src_extent.width, vk_format_get_blockwidth(src_format)),
+         DIV_ROUND_UP(src_extent.height, vk_format_get_blockheight(src_format)), src_extent.depth};
+      dst_extent.width = elements.width * vk_format_get_blockwidth(dst_format);
+      dst_extent.height = elements.height * vk_format_get_blockheight(dst_format);
       uint32_t src_slices, dst_slices;
       if (!rd_image_command_valid(command,
           rd_image_box(src, &regions[i].srcSubresource, regions[i].srcOffset, src_extent,
@@ -1215,7 +1496,7 @@ rd_CmdCopyImage(VkCommandBuffer handle, VkImage src_handle, VkImageLayout src_la
           rd_image_box(dst, &regions[i].dstSubresource, regions[i].dstOffset, dst_extent,
              &transfer.dst_offset, &transfer.dst_row_pitch, &transfer.dst_slice_pitch, &dst_slices) && src_slices == dst_slices))
          return;
-      transfer.row_bytes = (uint64_t)elements.width * src->texel_size * src->vk.samples;
+      transfer.row_bytes = (uint64_t)elements.width * vk_format_get_blocksize(src_format) * src->vk.samples;
       transfer.rows = elements.height;
       transfer.slices = src_slices;
       struct rd_command *recorded = rd_command_append(command, RD_CMD_IMAGE_COPY);
@@ -1237,6 +1518,12 @@ rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buff
       return;
    for (uint32_t i = 0; i < count; i++) {
       const VkBufferImageCopy *region = &regions[i];
+      uint32_t plane = rd_image_aspect_plane(image->vk.format, region->imageSubresource.aspectMask);
+      if (!rd_image_command_valid(command, plane != UINT32_MAX))
+         return;
+      VkFormat format = rd_ycbcr_format_supported(image->vk.format) ?
+         vk_format_get_plane_format(image->vk.format, plane) : image->vk.format;
+      uint32_t cpp = vk_format_get_blocksize(format);
       /* Depth/stencil: single-aspect formats copy texels as they are stored.
        * The depth aspect of D24S8 is stored and copied as X8_D24 words; on
        * the way in, the stencil byte of each word is preserved. The stencil
@@ -1260,15 +1547,15 @@ rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buff
          return;
       uint64_t row_length = region->bufferRowLength ? region->bufferRowLength : region->imageExtent.width;
       uint64_t height = region->bufferImageHeight ? region->bufferImageHeight : region->imageExtent.height;
-      uint32_t bw = vk_format_get_blockwidth(image->vk.format);
-      uint32_t bh = vk_format_get_blockheight(image->vk.format);
-      uint64_t row = DIV_ROUND_UP(row_length, bw) * image->texel_size;
+      uint32_t bw = vk_format_get_blockwidth(format);
+      uint32_t bh = vk_format_get_blockheight(format);
+      uint64_t row = DIV_ROUND_UP(row_length, bw) * cpp;
       if (!rd_image_command_valid(command, row_length >= region->imageExtent.width &&
           height >= region->imageExtent.height && row <= RD_IMAGE_MAX_SIZE &&
           (!region->bufferRowLength || !(region->bufferRowLength % bw)) &&
           (!region->bufferImageHeight || !(region->bufferImageHeight % bh)) &&
           DIV_ROUND_UP(height, bh) <= RD_IMAGE_MAX_SIZE / row &&
-          !(region->bufferOffset % image->texel_size)))
+           !(region->bufferOffset % cpp)))
          return;
       VkBufferImageCopy2 region2 = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -1280,7 +1567,8 @@ rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buff
          .imageExtent = region->imageExtent,
       };
       struct vk_image_buffer_layout buffer_layout = vk_image_buffer_copy_layout(&image->vk, &region2);
-      VkExtent3D elements = vk_image_extent_to_elements(&image->vk, region->imageExtent);
+      VkExtent3D elements = {DIV_ROUND_UP(region->imageExtent.width, bw),
+         DIV_ROUND_UP(region->imageExtent.height, bh), region->imageExtent.depth};
       row = buffer_layout.row_stride_B;
       uint64_t slice = buffer_layout.image_stride_B;
       uint64_t rows = elements.height;
@@ -1337,6 +1625,7 @@ rd_CmdClearColorImage(VkCommandBuffer handle, VkImage image_handle, VkImageLayou
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_image, image, image_handle);
    if (!rd_image_command_valid(command, image && !vk_format_is_depth_or_stencil(image->vk.format) &&
+       !rd_ycbcr_format_supported(image->vk.format) &&
        !vk_format_is_compressed(image->vk.format) &&
        (image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
        rd_image_copy_layout(layout, false)))

@@ -123,7 +123,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(rd_buffer, vk.base, VkBuffer, VK_OBJECT_TYPE_BUFF
 struct rd_binding { uint32_t binding, count, slot; VkDescriptorType type; VkShaderStageFlags stages; uint32_t immutable_offset; };
 struct rd_set_layout {
    struct vk_descriptor_set_layout vk;
-   uint32_t binding_count, descriptor_count;
+   uint32_t binding_count, descriptor_count, pool_descriptor_count;
    uint32_t immutable_count;
    struct vk_sampler_state *immutable_sampler_states;
    struct rd_binding bindings[];
@@ -132,6 +132,8 @@ struct rd_pipeline_layout {
    struct vk_pipeline_layout vk;
    uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
    bool compatibility_cached;
+   bool gtk_ycbcr_compat;
+   uint8_t gtk_ycbcr_family[BLAKE3_OUT_LEN];
 };
 struct rd_descriptor {
    VkDescriptorType type;
@@ -191,6 +193,7 @@ struct rd_pipeline {
    uint32_t resource_count;
    struct rd_nir_resource_usage resource_usage;
    uint32_t texture_descriptors[16], sampler_descriptors[16], image_descriptors[16];
+   uint8_t texture_planes[16];
    uint32_t buffer_count, buffer_descriptors[32];
 };
 struct rd_dispatch {
@@ -352,6 +355,8 @@ struct rd_command_buffer {
       struct rd_descriptor_set *sets[RD_MAX_SETS];
       uint32_t dynamic_offsets[RD_MAX_SETS][RD_MAX_BINDINGS];
       uint8_t set_compatibility[RD_MAX_SETS][RD_MAX_SETS][BLAKE3_OUT_LEN];
+      uint8_t gtk_ycbcr_family[RD_MAX_SETS][BLAKE3_OUT_LEN];
+      bool gtk_ycbcr_tagged[RD_MAX_SETS];
    } bind[2];
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
@@ -371,6 +376,8 @@ VK_DEFINE_HANDLE_CASTS(rd_command_buffer, vk.base, VkCommandBuffer, VK_OBJECT_TY
 extern const struct vk_command_buffer_ops rd_command_buffer_ops;
 struct rd_command *rd_command_append(struct rd_command_buffer *command,
                                      enum rd_command_type type);
+void rd_layout_compatibility(const struct vk_pipeline_layout *layout,
+                             uint8_t hashes[RD_MAX_SETS][BLAKE3_OUT_LEN]);
 bool rd_shader_format_supported(VkFormat format);
 bool rd_storage_shader_format_supported(VkFormat format);
 bool rd_shader_format_filterable(VkFormat format);
@@ -388,6 +395,8 @@ void rd_emit_stage_textures(struct rd_device *device, struct fd_ringbuffer *ring
                             const struct rd_descriptor *descriptors);
 const struct rd_nir_resource_binding *rd_pipeline_resource(void *data, uint32_t set,
                                                            uint32_t binding, uint32_t element);
+const struct vk_ycbcr_conversion_state *rd_pipeline_ycbcr_conversion(const void *data,
+    uint32_t set, uint32_t binding, uint32_t element);
 bool rd_lower_stage_buffers(struct nir_shader *nir, struct rd_pipeline *stage);
 /* rd_graphics.c */
 bool rd_graphics_enabled(void);

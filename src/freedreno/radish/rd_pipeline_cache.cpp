@@ -15,7 +15,7 @@ static constexpr size_t meta_a = offsetof(rd_pipeline, descriptor_count);
 static constexpr size_t meta_a_size = offsetof(rd_pipeline, sampling_nir) - meta_a;
 static constexpr size_t meta_b = offsetof(rd_pipeline, sampling_mask);
 static constexpr size_t meta_b_size = sizeof(rd_pipeline) - meta_b;
-static constexpr uint32_t cache_version = 3;
+static constexpr uint32_t cache_version = 4;
 static constexpr size_t cache_max_entry = 64 * 1024 * 1024;
 struct rd_cache_object {
    vk_pipeline_cache_object base;
@@ -59,6 +59,7 @@ static bool rd_cache_key(rd_device *device, rd_pipeline *pipeline,
       const rd_set_layout *set = container_of(layout->set_layouts[i], const rd_set_layout, vk);
       _mesa_blake3_update(&ctx, &set->binding_count, sizeof(set->binding_count));
       _mesa_blake3_update(&ctx, set->bindings, set->binding_count * sizeof(rd_binding));
+      _mesa_blake3_update(&ctx, set->vk.blake3, BLAKE3_OUT_LEN);
       _mesa_blake3_update(&ctx, &layout->dynamic_descriptor_offset[i], sizeof(uint32_t));
       
    }

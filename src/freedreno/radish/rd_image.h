@@ -20,6 +20,11 @@ struct rd_image_level {
    VkDeviceSize offset, row_pitch, depth_pitch, array_pitch, size;
 };
 
+struct rd_image_plane {
+   struct fdl_layout native_layout;
+   struct rd_image_level levels[RD_IMAGE_MAX_LEVELS];
+};
+
 struct rd_image {
    struct vk_image vk;
    struct rd_memory *memory;
@@ -27,9 +32,15 @@ struct rd_image {
    uint32_t texel_size;
    struct fdl_layout native_layout;
    struct rd_image_level levels[RD_IMAGE_MAX_LEVELS];
+   struct rd_image_plane extra_planes[2];
 };
 
-struct rd_image_view { struct vk_image_view vk; };
+struct rd_image_view {
+   struct vk_image_view vk;
+   uint32_t plane;
+   bool ycbcr;
+   struct vk_ycbcr_conversion_state conversion;
+};
 struct rd_buffer_view { struct vk_buffer_view vk; };
 struct rd_sampler {
    struct vk_sampler vk;
@@ -63,4 +74,8 @@ bool rd_image_copy_gpu_supported(struct rd_device *device,
                                   const struct rd_image_transfer *transfer,
                                   bool small_copies);
 bool rd_image_barrier_valid(const VkImageMemoryBarrier2 *barrier);
+bool rd_ycbcr_format_supported(VkFormat format);
+const struct rd_image_level *rd_image_plane_level(const struct rd_image *image,
+                                                 uint32_t plane, uint32_t level);
+const struct fdl_layout *rd_image_plane_native(const struct rd_image *image, uint32_t plane);
 #endif

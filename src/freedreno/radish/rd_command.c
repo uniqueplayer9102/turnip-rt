@@ -20,6 +20,8 @@ rd_command_reset(struct vk_command_buffer *base, VkCommandBufferResetFlags flags
    for (unsigned i = 0; i < 2; i++) {
       memset(command->bind[i].sets, 0, sizeof(command->bind[i].sets));
       memset(command->bind[i].dynamic_offsets, 0, sizeof(command->bind[i].dynamic_offsets));
+      memset(command->bind[i].gtk_ycbcr_family, 0, sizeof(command->bind[i].gtk_ycbcr_family));
+      memset(command->bind[i].gtk_ycbcr_tagged, 0, sizeof(command->bind[i].gtk_ycbcr_tagged));
    }
    memset(command->vertex_buffers, 0, sizeof(command->vertex_buffers));
    command->index_buffer = NULL;
@@ -140,6 +142,40 @@ rd_compute_layout_compatibility(const struct vk_pipeline_layout *layout,
               layout->set_count, layout->push_range_count);
 }
 
+static bool
+rd_gtk_ycbcr_layout(const struct vk_pipeline_layout *layout, uint8_t family[BLAKE3_OUT_LEN])
+{
+   if (layout->create_flags || layout->set_count != 4 || layout->push_range_count)
+      return false;
+   uint32_t converted_sets = 0;
+   for (uint32_t i = 0; i < 4; i++) {
+      if (!layout->set_layouts[i])
+         return false;
+      const struct rd_set_layout *set = container_of(layout->set_layouts[i], const struct rd_set_layout, vk);
+      if (set->binding_count != 1)
+         return false;
+      const struct rd_binding *binding = &set->bindings[0];
+      if (binding->binding || binding->slot || binding->count != (i < 2 ? 3 : 1) ||
+          binding->type != (i == 3 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
+          binding->stages != (i == 3 ? VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_FRAGMENT_BIT))
+         return false;
+      if (binding->immutable_offset != UINT32_MAX) {
+         if (i >= 2 || ++converted_sets > 1)
+            return false;
+         const struct vk_sampler_state *samplers = &set->immutable_sampler_states[binding->immutable_offset];
+         for (uint32_t j = 0; j < binding->count; j++)
+            if (!samplers[j].has_ycbcr_conversion || memcmp(&samplers[0], &samplers[j], sizeof(*samplers)))
+               return false;
+      }
+   }
+   struct mesa_blake3 hash;
+   _mesa_blake3_init(&hash);
+   _mesa_blake3_update(&hash, layout->set_layouts[2]->blake3, BLAKE3_OUT_LEN);
+   _mesa_blake3_update(&hash, layout->set_layouts[3]->blake3, BLAKE3_OUT_LEN);
+   _mesa_blake3_final(&hash, family);
+   return true;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 rd_CreatePipelineLayout(VkDevice handle, const VkPipelineLayoutCreateInfo *info,
                         UNUSED const VkAllocationCallbacks *allocator, VkPipelineLayout *out)
@@ -152,11 +188,13 @@ rd_CreatePipelineLayout(VkDevice handle, const VkPipelineLayoutCreateInfo *info,
    layout->compatibility_cached = debug_get_bool_option("RADISH_LAYOUT_COMPATIBILITY_CACHE", true);
    if (layout->compatibility_cached)
       rd_compute_layout_compatibility(&layout->vk, layout->compatibility);
+   if (debug_get_bool_option("RADISH_GTK_YCBCR_COMPAT", false))
+      layout->gtk_ycbcr_compat = rd_gtk_ycbcr_layout(&layout->vk, layout->gtk_ycbcr_family);
    *out = vk_pipeline_layout_to_handle(&layout->vk);
    return VK_SUCCESS;
 }
 
-static void
+void
 rd_layout_compatibility(const struct vk_pipeline_layout *base,
                          uint8_t hashes[RD_MAX_SETS][BLAKE3_OUT_LEN])
 {
@@ -180,6 +218,8 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
       return;
    }
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
+   const struct rd_pipeline_layout *driver_layout = container_of(pipeline_layout, const struct rd_pipeline_layout, vk);
+   bool gtk_ycbcr_compat = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && driver_layout->gtk_ycbcr_compat;
    struct rd_bind_state *bound = &command->bind[bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS];
    uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
    rd_layout_compatibility(pipeline_layout, compatibility);
@@ -189,15 +229,25 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
          if (!bound->sets[i] || (i >= first && i <= last))
             continue;
          uint32_t compare = i < first ? i : last;
-         if (memcmp(bound->set_compatibility[i][compare], compatibility[compare], BLAKE3_OUT_LEN))
+         if (memcmp(bound->set_compatibility[i][compare], compatibility[compare], BLAKE3_OUT_LEN) &&
+             !(gtk_ycbcr_compat && bound->gtk_ycbcr_tagged[i] &&
+               !memcmp(bound->gtk_ycbcr_family[i], driver_layout->gtk_ycbcr_family, BLAKE3_OUT_LEN))) {
             bound->sets[i] = NULL;
+            bound->gtk_ycbcr_tagged[i] = false;
+            memset(bound->gtk_ycbcr_family[i], 0, BLAKE3_OUT_LEN);
+         }
       }
    }
    uint32_t dynamic = 0;
    for (uint32_t i = 0; i < count; i++) {
-      struct rd_descriptor_set *set = rd_descriptor_set_from_handle(sets[i]);
-      bound->sets[first + i] = set;
-      memcpy(bound->set_compatibility[first + i], compatibility, sizeof(compatibility));
+       struct rd_descriptor_set *set = rd_descriptor_set_from_handle(sets[i]);
+       bound->sets[first + i] = set;
+       memcpy(bound->set_compatibility[first + i], compatibility, sizeof(compatibility));
+       bound->gtk_ycbcr_tagged[first + i] = gtk_ycbcr_compat;
+       if (gtk_ycbcr_compat)
+          memcpy(bound->gtk_ycbcr_family[first + i], driver_layout->gtk_ycbcr_family, BLAKE3_OUT_LEN);
+       else
+          memset(bound->gtk_ycbcr_family[first + i], 0, BLAKE3_OUT_LEN);
       memset(bound->dynamic_offsets[first + i], 0,
              sizeof(bound->dynamic_offsets[first + i]));
       for (uint32_t j = 0; j < set->layout->binding_count; j++) {
@@ -349,8 +399,11 @@ rd_CmdExecuteCommands(VkCommandBuffer handle, uint32_t count,
    }
    primary->pipeline = NULL;
    primary->gfx_pipeline = NULL;
-   for (unsigned i = 0; i < 2; i++)
+   for (unsigned i = 0; i < 2; i++) {
       memset(primary->bind[i].sets, 0, sizeof(primary->bind[i].sets));
+      memset(primary->bind[i].gtk_ycbcr_family, 0, sizeof(primary->bind[i].gtk_ycbcr_family));
+      memset(primary->bind[i].gtk_ycbcr_tagged, 0, sizeof(primary->bind[i].gtk_ycbcr_tagged));
+   }
    memset(primary->push, 0, sizeof(primary->push));
 }
 

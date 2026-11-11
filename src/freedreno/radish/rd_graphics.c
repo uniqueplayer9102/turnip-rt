@@ -12,6 +12,7 @@
  * emitted into one ring and run synchronously, like a compute dispatch.
  */
 #include "rd_private.h"
+#include "vk_nir_convert_ycbcr.h"
 #include <unistd.h>
 #include "rd_format.h"
 #include "common/fd5_hw.h"
@@ -295,6 +296,9 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
+   const nir_lower_tex_options tex_options = { .lower_txp = ~0u };
+   NIR_PASS(_, nir, nir_lower_tex, &tex_options);
+   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, rd_pipeline_ycbcr_conversion, shader->res);
    struct rd_gfx_lower lower = { .ibo = nir->info.stage == MESA_SHADER_FRAGMENT,
                                  .buffer_count = shader->res->buffer_count };
    bool lowered = rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
@@ -681,10 +685,33 @@ rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *r
    if (!copy)
       return false;
    const struct rd_bind_state *bound = &command->bind[1];
+   const struct rd_pipeline_layout *layout = container_of(stage->layout, const struct rd_pipeline_layout, vk);
+   uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
+   bool compatibility_ready = false;
    for (uint32_t i = 0; i < stage->resource_count; i++) {
       const struct rd_nir_resource_binding *resource = &stage->resources[i];
-      const struct rd_descriptor_set *set = bound->sets[resource->descriptor_set];
-      if (!set) {
+      uint32_t index = resource->descriptor_set;
+      const struct rd_descriptor_set *set = index < RD_MAX_SETS ? bound->sets[index] : NULL;
+      bool compatible = set && resource->logical_slot < set->layout->descriptor_count &&
+                        resource->logical_slot < RD_MAX_BINDINGS;
+      if (compatible && (layout->gtk_ycbcr_compat || bound->gtk_ycbcr_tagged[index])) {
+         compatible = index < stage->layout->set_count && stage->layout->set_layouts[index] &&
+            !memcmp(set->layout->vk.blake3, stage->layout->set_layouts[index]->blake3, BLAKE3_OUT_LEN);
+         bool relaxed = layout->gtk_ycbcr_compat && bound->gtk_ycbcr_tagged[index] &&
+            !memcmp(bound->gtk_ycbcr_family[index], layout->gtk_ycbcr_family, BLAKE3_OUT_LEN);
+         if (compatible && !relaxed) {
+            if (!compatibility_ready) {
+               rd_layout_compatibility(stage->layout, compatibility);
+               compatibility_ready = true;
+            }
+            compatible = !memcmp(bound->set_compatibility[index][index], compatibility[index], BLAKE3_OUT_LEN);
+         }
+      }
+      if (!compatible) {
+         if (debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false))
+            fprintf(stderr, "radish: missing graphics descriptor stage=%u set=%u binding=%u element=%u resource=%u count=%u\n",
+                    stage->variant->type, resource->descriptor_set, resource->binding,
+                    resource->array_element, i, stage->resource_count);
          rd_render_free_descriptors(command, render, copy);
          rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return false;

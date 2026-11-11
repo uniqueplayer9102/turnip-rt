@@ -238,7 +238,7 @@ rd_view_swizzle(VkComponentSwizzle swizzle)
 }
 
 static bool
-rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out)
+rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out, uint32_t plane)
 {
    memset(out, 0, sizeof(*out));
    VkFormat format;
@@ -248,18 +248,28 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
       const struct rd_image *image = container_of(view->image, struct rd_image, vk);
       if (!image->memory)
          return false;
-      const struct rd_image_level *level = &image->levels[view->base_mip_level];
+      bool converted = descriptor->image_view->ycbcr;
+      plane = converted ? plane : descriptor->image_view->plane;
+      if (plane >= vk_format_get_plane_count(image->vk.format))
+         return false;
+      const struct rd_image_level *level = rd_image_plane_level(image, plane, view->base_mip_level);
+      const struct fdl_layout *native = rd_image_plane_native(image, plane);
       VkExtent3D extent = view->extent;
+      if (converted) {
+         const struct vk_format_ycbcr_info *info = vk_format_get_ycbcr_info(view->format);
+         extent.width = DIV_ROUND_UP(extent.width, info->planes[plane].denominator_scales[0]);
+         extent.height = DIV_ROUND_UP(extent.height, info->planes[plane].denominator_scales[1]);
+      }
       out->bo = image->memory->bo;
       out->offset = image->memory_offset + level->offset +
                     view->base_array_layer *
                     (image->vk.image_type == VK_IMAGE_TYPE_3D ? level->depth_pitch : level->array_pitch);
-      format = view->format;
+      format = converted ? vk_format_get_plane_format(view->format, plane) : view->format;
       samples = image->vk.samples == VK_SAMPLE_COUNT_4_BIT ? MSAA_FOUR : MSAA_ONE;
       out->format = rd_resource_format(format);
       if (format == VK_FORMAT_D24_UNORM_S8_UINT && view->aspects == VK_IMAGE_ASPECT_STENCIL_BIT)
          out->format = TFMT5_8_8_8_8_UINT;
-      out->cpp = image->texel_size;
+      out->cpp = rd_ycbcr_format_supported(image->vk.format) ? vk_format_get_blocksize(format) : image->texel_size;
       out->width = extent.width;
       out->height = extent.height;
       switch (view->view_type) {
@@ -286,15 +296,15 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
          out->height = view->layer_count;
       out->mip_levels = view->level_count - 1;
       out->image_size_only = descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-      out->pitchalign = image->native_layout.pitchalign - 6;
+      out->pitchalign = native->pitchalign - 6;
       /* MIN_LAYERSZ is where the layer size stops shrinking; the hardware
        * applies it from level 0, so it must not exceed any level's size.
        * fdl over-allocates the last level's rows, which for 2-level 3D
        * images made it larger than level 0 (2x2x2, 3x3x3 sampled level 1
        * from the wrong place). */
-      out->min_layer_size = image->native_layout.slices[image->vk.mip_levels - 1].size0;
+      out->min_layer_size = native->slices[image->vk.mip_levels - 1].size0;
       for (uint32_t l = 0; l < image->vk.mip_levels; l++)
-         out->min_layer_size = MIN2(out->min_layer_size, image->native_layout.slices[l].size0);
+         out->min_layer_size = MIN2(out->min_layer_size, native->slices[l].size0);
       out->row_pitch = level->row_pitch;
       out->array_pitch = view->view_type == VK_IMAGE_VIEW_TYPE_3D ?
                          level->depth_pitch : level->array_pitch;
@@ -336,7 +346,7 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
    if (format == VK_FORMAT_D24_UNORM_S8_UINT && descriptor->image_view &&
        descriptor->image_view->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT)
       swizzle[0] = PIPE_SWIZZLE_W;
-   if (descriptor->image_view) {
+   if (descriptor->image_view && !descriptor->image_view->ycbcr) {
       const VkComponentMapping *view = &descriptor->image_view->vk.swizzle;
       unsigned char requested[4] = {rd_view_swizzle(view->r), rd_view_swizzle(view->g),
                                     rd_view_swizzle(view->b), rd_view_swizzle(view->a)};
@@ -353,7 +363,7 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
       COND(vk_format_is_srgb(format), A5XX_TEX_CONST_0_SRGB);
    if (descriptor->image_view) {
       const struct rd_image *image = container_of(descriptor->image_view->vk.image, struct rd_image, vk);
-      out->format_word |= A5XX_TEX_CONST_0_TILE_MODE(image->native_layout.tile_mode);
+      out->format_word |= A5XX_TEX_CONST_0_TILE_MODE(rd_image_plane_native(image, plane)->tile_mode);
    }
    return out->format != TFMT5_NONE;
 }
@@ -374,7 +384,15 @@ rd_descriptor_ready(const struct rd_descriptor *descriptor)
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
       struct rd_resource resource;
-      return rd_make_resource(descriptor, &resource);
+      if (!rd_make_resource(descriptor, &resource, 0))
+         return false;
+      if (descriptor->image_view && descriptor->image_view->ycbcr) {
+         uint32_t count = vk_format_get_plane_count(descriptor->image_view->vk.format);
+         for (uint32_t plane = 1; plane < count; plane++)
+            if (!rd_make_resource(descriptor, &resource, plane))
+               return false;
+      }
+      return true;
    }
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
@@ -586,7 +604,7 @@ rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
          continue;
       struct rd_resource resource;
       if (rd_make_resource(&dispatch->descriptors[pipeline->texture_descriptors[i]],
-                            &resource)) {
+                            &resource, pipeline->texture_planes[i])) {
          if (pipeline->sampling_mask & (1u << i))
             resource.image_size_only = true;
          rd_emit_resource_texture(ring, i, &resource);
@@ -597,7 +615,7 @@ rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
          continue;
       struct rd_resource resource;
       if (rd_make_resource(&dispatch->descriptors[pipeline->image_descriptors[i]],
-                            &resource))
+                            &resource, 0))
          rd_emit_resource_image(ring, v->num_ssbos + i, &resource);
    }
    const struct ir3_ibo_mapping *mapping = &v->image_mapping;
@@ -607,7 +625,7 @@ rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
          pipeline->buffer_descriptors[resource_index & ~UAV_SSBO] :
          pipeline->image_descriptors[resource_index];
       struct rd_resource resource;
-      if (rd_make_resource(&dispatch->descriptors[slot], &resource))
+      if (rd_make_resource(&dispatch->descriptors[slot], &resource, 0))
          rd_emit_resource_texture(ring, mapping->tex_base + i, &resource);
    }
 }
@@ -629,7 +647,7 @@ rd_emit_image_constants_sb(struct fd_ringbuffer *ring, const struct rd_pipeline 
          continue;
       struct rd_resource resource;
       if (!rd_make_resource(&descriptors[pipeline->image_descriptors[i]],
-                             &resource))
+                             &resource, 0))
          continue;
       uint32_t offset = state->image_dims.off[i];
       values[offset] = resource.cpp;
@@ -713,7 +731,7 @@ rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,
       if (!(usage->images & (1u << i)))
          continue;
       struct rd_resource resource;
-      if (rd_make_resource(&descriptors[stage->image_descriptors[i]], &resource))
+      if (rd_make_resource(&descriptors[stage->image_descriptors[i]], &resource, 0))
          rd_emit_resource_image_sb(ring, v->num_ssbos + i, &resource, SB4_SSBO);
    }
    const struct ir3_ibo_mapping *mapping = &v->image_mapping;
@@ -723,7 +741,7 @@ rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,
          stage->buffer_descriptors[resource_index & ~UAV_SSBO] :
          stage->image_descriptors[resource_index];
       struct rd_resource resource;
-      if (rd_make_resource(&descriptors[slot], &resource))
+      if (rd_make_resource(&descriptors[slot], &resource, 0))
          rd_emit_resource_texture_sb(ring, mapping->tex_base + i, &resource, SB4_FS_TEX);
    }
    rd_emit_image_constants_sb(ring, stage, v, descriptors, false, SB4_FS_SHADER);
@@ -753,7 +771,7 @@ rd_emit_stage_textures(struct rd_device *device, struct fd_ringbuffer *ring,
       if (!(usage->textures & (1u << i)))
          continue;
       struct rd_resource resource;
-      if (rd_make_resource(&descriptors[stage->texture_descriptors[i]], &resource))
+      if (rd_make_resource(&descriptors[stage->texture_descriptors[i]], &resource, stage->texture_planes[i]))
          rd_emit_resource_texture_sb(ring, i, &resource, sb);
    }
 }

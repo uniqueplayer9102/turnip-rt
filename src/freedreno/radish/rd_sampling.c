@@ -20,7 +20,8 @@ rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
       const struct rd_descriptor *descriptor = &dispatch->descriptors[source->texture_descriptors[i]];
       if (!descriptor->image_view)
          continue;
-      const struct vk_image_view *view = &descriptor->image_view->vk;
+      const struct rd_image_view *driver_view = descriptor->image_view;
+      const struct vk_image_view *view = &driver_view->vk;
       const struct rd_image *image = container_of(view->image, struct rd_image, vk);
       if (vk_format_is_compressed(image->vk.format))
          continue;
@@ -29,24 +30,34 @@ rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
                   view->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
       if (!array && !cube)
          continue;
-      if (!force && image->levels[view->base_mip_level].array_pitch <= (0x3fffull << 12))
+      uint32_t plane = driver_view->ycbcr ? source->texture_planes[i] : driver_view->plane;
+      if (plane >= vk_format_get_plane_count(image->vk.format))
+         return VK_ERROR_UNKNOWN;
+      const struct rd_image_level *first_level = rd_image_plane_level(image, plane, view->base_mip_level);
+      if (!force && ((array && view->layer_count == 1) || first_level->array_pitch <= (0x3fffull << 12)))
          continue;
       if (!image->memory || view->level_count > RD_IMAGE_MAX_LEVELS)
          return VK_ERROR_UNKNOWN;
       key.mask |= 1u << i;
       struct rd_sampling_view *target = &key.views[i];
-      target->format = view->format;
+      target->format = driver_view->ycbcr ? vk_format_get_plane_format(view->format, plane) : view->format;
       if (view->format == VK_FORMAT_D24_UNORM_S8_UINT)
          target->format = view->view_format;
-      target->swizzle = view->swizzle;
+      target->swizzle = driver_view->ycbcr ? (VkComponentMapping){0} : view->swizzle;
       target->levels = view->level_count;
       target->layers = view->layer_count;
-      target->cpp = image->texel_size;
+      target->cpp = rd_ycbcr_format_supported(image->vk.format) ?
+                    vk_format_get_blocksize(target->format) : image->texel_size;
       target->samples = image->vk.samples;
       for (unsigned l = 0; l < view->level_count; l++) {
          unsigned level = view->base_mip_level + l;
-         const struct rd_image_level *layout = &image->levels[level];
+         const struct rd_image_level *layout = rd_image_plane_level(image, plane, level);
          VkExtent3D extent = vk_image_mip_level_extent(&image->vk, level);
+         const struct vk_format_ycbcr_info *info = vk_format_get_ycbcr_info(image->vk.format);
+         if (info) {
+            extent.width = DIV_ROUND_UP(extent.width, info->planes[plane].denominator_scales[0]);
+            extent.height = DIV_ROUND_UP(extent.height, info->planes[plane].denominator_scales[1]);
+         }
          VkDeviceSize offset = layout->offset + view->base_array_layer * layout->array_pitch;
          if (offset > UINT32_MAX || layout->row_pitch > UINT32_MAX || layout->array_pitch > UINT32_MAX)
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;

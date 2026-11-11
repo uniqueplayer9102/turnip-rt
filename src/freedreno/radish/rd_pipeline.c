@@ -2,6 +2,8 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "vk_pipeline.h"
+#include "vk_nir_convert_ycbcr.h"
+#include "vk_format.h"
 #include "ir3/ir3_nir.h"
 #include "util/u_math.h"
 
@@ -36,7 +38,7 @@ rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t elemen
           resource->array_element == element)
          return resource;
    }
-   if (set >= pipeline->layout->set_count ||
+   if (set >= pipeline->layout->set_count || !pipeline->layout->set_layouts[set] ||
        pipeline->resource_count >= RD_MAX_ACTIVE_RESOURCES)
       return NULL;
    const struct rd_set_layout *layout = container_of(pipeline->layout->set_layouts[set],
@@ -58,18 +60,29 @@ rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t elemen
    bool sampler = found->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
       found->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
    bool image = found->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
-      found->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+       found->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+   uint32_t plane_count = 1;
+   if (found->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && found->immutable_offset != UINT32_MAX) {
+      const struct vk_sampler_state *immutable = &layout->immutable_sampler_states[found->immutable_offset + element];
+      if (immutable->has_ycbcr_conversion)
+         plane_count = vk_format_get_plane_count(immutable->ycbcr_conversion.format);
+   }
    if ((!buffer && !texture && !sampler && !image) ||
        (buffer && pipeline->buffer_count >= 32))
       return NULL;
    uint32_t textures = 0, samplers = 0, images = 0;
    for (uint32_t i = 0; i < pipeline->resource_count; i++) {
       const struct rd_nir_resource_binding *resource = &pipeline->resources[i];
-      textures += resource->texture_slot != UINT32_MAX;
-      samplers += resource->sampler_slot != UINT32_MAX;
-      images += resource->image_slot != UINT32_MAX;
+      if (resource->texture_slot != UINT32_MAX)
+         textures = MAX2(textures, resource->texture_slot + resource->plane_count);
+      if (resource->sampler_slot != UINT32_MAX)
+         samplers = MAX2(samplers, resource->sampler_slot + resource->plane_count);
+      if (resource->image_slot != UINT32_MAX)
+         images = MAX2(images, resource->image_slot + 1);
    }
-   if ((texture && textures >= 16) || (sampler && samplers >= 16) || (image && images >= 16))
+   if ((texture && (textures > 16 || plane_count > 16 - textures)) ||
+       (sampler && (samplers > 16 || plane_count > 16 - samplers)) ||
+       (image && images >= 16))
       return NULL;
    uint32_t slot = pipeline->resource_count++;
    struct rd_nir_resource_binding *resource = &pipeline->resources[slot];
@@ -80,16 +93,41 @@ rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t elemen
       .texture_slot = texture ? textures : UINT32_MAX,
       .sampler_slot = sampler ? samplers : UINT32_MAX,
       .image_slot = image ? images : UINT32_MAX,
+      .plane_count = plane_count,
    };
    if (buffer)
       pipeline->buffer_descriptors[pipeline->buffer_count++] = slot;
-   if (texture)
-      pipeline->texture_descriptors[textures] = slot;
-   if (sampler)
-      pipeline->sampler_descriptors[samplers] = slot;
+   for (uint32_t plane = 0; plane < plane_count; plane++) {
+      if (texture) {
+         pipeline->texture_descriptors[textures + plane] = slot;
+         pipeline->texture_planes[textures + plane] = plane;
+      }
+      if (sampler) {
+         pipeline->sampler_descriptors[samplers + plane] = slot;
+      }
+   }
    if (image)
       pipeline->image_descriptors[images] = slot;
    return resource;
+}
+
+const struct vk_ycbcr_conversion_state *
+rd_pipeline_ycbcr_conversion(const void *data, uint32_t set, uint32_t binding, uint32_t element)
+{
+   const struct rd_pipeline *pipeline = data;
+   if (set >= pipeline->layout->set_count || !pipeline->layout->set_layouts[set])
+      return NULL;
+   const struct rd_set_layout *layout = container_of(pipeline->layout->set_layouts[set],
+                                                    const struct rd_set_layout, vk);
+   for (uint32_t i = 0; i < layout->binding_count; i++) {
+      const struct rd_binding *entry = &layout->bindings[i];
+      if (entry->binding != binding || entry->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          entry->immutable_offset == UINT32_MAX || element >= entry->count)
+         continue;
+      const struct vk_sampler_state *sampler = &layout->immutable_sampler_states[entry->immutable_offset + element];
+      return sampler->has_ycbcr_conversion ? &sampler->ycbcr_conversion : NULL;
+   }
+   return NULL;
 }
 
 static const struct rd_nir_resource_binding *
@@ -293,6 +331,9 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
    }
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
+   const nir_lower_tex_options tex_options = { .lower_txp = ~0u };
+   NIR_PASS(_, nir, nir_lower_tex, &tex_options);
+   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, rd_pipeline_ycbcr_conversion, pipeline);
    if (!rd_nir_lower_compute_resources(nir, rd_pipeline_resource,
           pipeline, &pipeline->resource_usage)) {
       ralloc_free(nir);

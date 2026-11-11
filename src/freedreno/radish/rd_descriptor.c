@@ -1,5 +1,6 @@
 #include "rd_private.h"
 #include "vk_descriptor_update_template.h"
+#include "vk_format.h"
 
 static bool
 rd_descriptor_type_supported(VkDescriptorType type)
@@ -37,6 +38,21 @@ rd_descriptor_layout_supported(const VkDescriptorSetLayoutCreateInfo *info,
       if (!rd_descriptor_type_supported(binding->descriptorType) ||
           binding->descriptorCount > RD_MAX_BINDINGS - *descriptor_count)
          return false;
+      if (binding->pImmutableSamplers &&
+          (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
+           binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
+         bool converted = false;
+         for (uint32_t j = 0; j < binding->descriptorCount; j++) {
+            VK_FROM_HANDLE(rd_sampler, sampler, binding->pImmutableSamplers[j]);
+            if (!sampler || (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER &&
+                             sampler->state.has_ycbcr_conversion))
+               return false;
+            if (!j)
+               converted = sampler->state.has_ycbcr_conversion;
+            else if (converted != sampler->state.has_ycbcr_conversion)
+               return false;
+         }
+      }
       *descriptor_count += binding->descriptorCount;
       (*binding_count)++;
    }
@@ -57,6 +73,7 @@ rd_CreateDescriptorSetLayout(VkDevice handle,
    const VkAllocationCallbacks *allocator, VkDescriptorSetLayout *out)
 {
    VK_FROM_HANDLE(rd_device, device, handle);
+   *out = VK_NULL_HANDLE;
    uint32_t bindings, descriptors;
    if (!rd_descriptor_layout_supported(info, &bindings, &descriptors))
       return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -77,6 +94,7 @@ rd_CreateDescriptorSetLayout(VkDevice handle,
    layout->immutable_count = immutable_count;
    layout->immutable_sampler_states = (void *)&layout->bindings[bindings];
    layout->descriptor_count = descriptors;
+   layout->pool_descriptor_count = descriptors;
    uint32_t slot = 0, index = 0;
    for (uint32_t i = 0; i < info->bindingCount; i++) {
       if (!info->pBindings[i].descriptorCount)
@@ -130,6 +148,18 @@ rd_CreateDescriptorSetLayout(VkDevice handle,
             layout->immutable_sampler_states[offset] = sampler->state;
          }
       }
+   }
+   for (uint32_t i = 0; i < layout->binding_count; i++) {
+      const struct rd_binding *binding = &layout->bindings[i];
+      if (binding->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || binding->immutable_offset == UINT32_MAX)
+         continue;
+      uint32_t count = 1;
+      for (uint32_t j = 0; j < binding->count; j++) {
+         const struct vk_sampler_state *sampler = &layout->immutable_sampler_states[binding->immutable_offset + j];
+         if (sampler->has_ycbcr_conversion)
+            count = MAX2(count, vk_format_get_plane_count(sampler->ycbcr_conversion.format));
+      }
+      layout->pool_descriptor_count += (count - 1) * binding->count;
    }
    struct mesa_blake3 hash;
    _mesa_blake3_init(&hash);
@@ -199,7 +229,7 @@ rd_free_set(struct rd_device *device, struct rd_descriptor_set *set)
 {
    list_del(&set->link);
    set->pool->used_sets--;
-   set->pool->used_descriptors -= set->layout->descriptor_count;
+   set->pool->used_descriptors -= set->layout->pool_descriptor_count;
    vk_descriptor_set_layout_unref(&device->vk, &set->layout->vk);
    vk_object_free(&device->vk, &set->pool->alloc, set);
 }
@@ -237,7 +267,7 @@ rd_AllocateDescriptorSets(VkDevice handle, const VkDescriptorSetAllocateInfo *in
    uint64_t descriptors = 0;
    for (uint32_t i = 0; i < info->descriptorSetCount; i++) {
       VK_FROM_HANDLE(rd_set_layout, layout, info->pSetLayouts[i]);
-      descriptors += layout->descriptor_count;
+      descriptors += layout->pool_descriptor_count;
    }
    if (info->descriptorSetCount > pool->max_sets - pool->used_sets ||
        descriptors > pool->max_descriptors - pool->used_descriptors)
@@ -269,7 +299,7 @@ rd_AllocateDescriptorSets(VkDevice handle, const VkDescriptorSetAllocateInfo *in
       }
       set->pool = pool;
       pool->used_sets++;
-      pool->used_descriptors += layout->descriptor_count;
+      pool->used_descriptors += layout->pool_descriptor_count;
       list_addtail(&set->link, &pool->sets);
       out[i] = rd_descriptor_set_to_handle(set);
    }
@@ -285,6 +315,21 @@ rd_FreeDescriptorSets(VkDevice handle, VkDescriptorPool pool, uint32_t count,
       if (sets[i])
          rd_free_set(device, rd_descriptor_set_from_handle(sets[i]));
    return VK_SUCCESS;
+}
+
+static void
+rd_validate_descriptor_conversion(struct rd_descriptor *descriptor, const struct vk_sampler_state *immutable)
+{
+   bool converted = descriptor->image_view && descriptor->image_view->ycbcr;
+   bool immutable_conversion = immutable && immutable->has_ycbcr_conversion;
+   if (!converted && !immutable_conversion)
+      return;
+   if (descriptor->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !converted ||
+       !immutable_conversion || memcmp(&descriptor->image_view->conversion, &immutable->ycbcr_conversion,
+                                      sizeof(immutable->ycbcr_conversion))) {
+      descriptor->image_view = NULL;
+      descriptor->has_sampler = false;
+   }
 }
 
 static void
@@ -334,6 +379,7 @@ rd_write_descriptor(struct rd_descriptor_set *set, uint32_t slot,
       break;
    }
    }
+   rd_validate_descriptor_conversion(&descriptor, immutable);
    set->descriptors[slot] = descriptor;
 }
 
@@ -388,6 +434,7 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
             dst->descriptors[slot].has_sampler = true;
             rd_sampler_descriptor(immutable, dst->descriptors[slot].sampler);
          }
+         rd_validate_descriptor_conversion(&dst->descriptors[slot], immutable);
       }
    }
 }

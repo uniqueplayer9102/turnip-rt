@@ -90,7 +90,9 @@ static const struct vk_device_extension_table rd_device_extensions = {
    .KHR_incremental_present = true,
    .KHR_device_group = true,
    .KHR_descriptor_update_template = true,
+   .KHR_maintenance1 = true,
    .KHR_maintenance3 = true,
+   .KHR_sampler_ycbcr_conversion = true,
    .KHR_bind_memory2 = true,
    .KHR_get_memory_requirements2 = true,
    .KHR_external_memory = true,
@@ -327,6 +329,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    extensions.KHR_timeline_semaphore = timeline;
    properties.maxTimelineSemaphoreValueDifference = timeline ? UINT64_MAX : 0;
    const struct vk_features features = { .pipelineStatisticsQuery = true, .robustBufferAccess = true,
+      .samplerYcbcrConversion = true,
       .synchronization2 = true,
       .multiview = true, .occlusionQueryPrecise = true, .hostQueryReset = true,
       .textureCompressionETC2 = true,

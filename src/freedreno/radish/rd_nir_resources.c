@@ -118,10 +118,21 @@ rd_lower_texture(nir_tex_instr *tex, struct rd_resource_lower *state)
    if ((tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) !=
        (entry->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER))
       return false;
-   if (!rd_mark_resource(state, entry, element, entry->texture_slot,
+   uint32_t plane = 0;
+   int plane_src = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   if (plane_src >= 0) {
+      if (!nir_src_is_const(tex->src[plane_src].src))
+         return false;
+      plane = nir_src_as_uint(tex->src[plane_src].src);
+      if (plane >= entry->plane_count)
+         return false;
+      nir_tex_instr_remove_src(tex, plane_src);
+      texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   }
+   if (!rd_mark_resource(state, entry, element, entry->texture_slot + plane,
                         &state->usage->textures, &state->usage->texture_count))
       return false;
-   tex->texture_index = entry->texture_slot + element;
+   tex->texture_index = entry->texture_slot + plane + element;
    if (tex->op == nir_texop_txf)
       state->textures_by_txf |= 1u << tex->texture_index;
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
@@ -133,10 +144,11 @@ rd_lower_texture(nir_tex_instr *tex, struct rd_resource_lower *state)
          nir_src_as_deref(tex->src[sampler].src), &element);
       if (!entry || (entry->type != VK_DESCRIPTOR_TYPE_SAMPLER &&
                      entry->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
-          !rd_mark_resource(state, entry, element, entry->sampler_slot,
+          plane >= entry->plane_count ||
+          !rd_mark_resource(state, entry, element, entry->sampler_slot + plane,
                             &state->usage->samplers, &state->usage->sampler_count))
          return false;
-      tex->sampler_index = entry->sampler_slot + element;
+      tex->sampler_index = entry->sampler_slot + plane + element;
       nir_tex_instr_remove_src(tex, sampler);
    } else if (tex->op == nir_texop_txl || tex->op == nir_texop_txd ||
               tex->op == nir_texop_tg4 || tex->op == nir_texop_tex ||
