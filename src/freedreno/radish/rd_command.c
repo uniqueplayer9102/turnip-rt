@@ -249,7 +249,7 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
        else
           memset(bound->gtk_ycbcr_family[first + i], 0, BLAKE3_OUT_LEN);
       memset(bound->dynamic_offsets[first + i], 0,
-             sizeof(bound->dynamic_offsets[first + i]));
+             set->layout->descriptor_count * sizeof(bound->dynamic_offsets[first + i][0]));
       for (uint32_t j = 0; j < set->layout->binding_count; j++) {
          const struct rd_binding *binding = &set->layout->bindings[j];
          if (binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
