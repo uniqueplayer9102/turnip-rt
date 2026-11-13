@@ -101,12 +101,13 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    } else {
       struct passwd entry, *user = NULL;
       char buffer[4096];
-      if (!getpwuid_r(geteuid(), &entry, buffer, sizeof(buffer), &user) && user && user->pw_dir)
+      if (!getpwuid_r(geteuid(), &entry, buffer, sizeof(buffer), &user) && user && user->pw_dir) {
          device->gmem_disable_file = vk_asprintf(&device->vk.alloc,
             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "%s/.local/radish/gmem_disabled", user->pw_dir);
-      if (!device->gmem_disable_file) {
-         result = VK_ERROR_OUT_OF_HOST_MEMORY;
-         goto fail;
+         if (!device->gmem_disable_file) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail;
+         }
       }
    }
    if (marker && *marker && !device->gmem_disable_file) {

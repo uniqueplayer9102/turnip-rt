@@ -28,11 +28,12 @@ rd_AllocateMemory(VkDevice handle, const VkMemoryAllocateInfo *info,
    if (!memory)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    memory->cached = info->memoryTypeIndex == 1;
-   if (memory->cached && (fd_info || memory->vk.export_handle_types)) {
+   if (memory->cached &&
+       ((fd_info && fd_info->handleType) || memory->vk.export_handle_types)) {
       vk_device_memory_destroy(&device->vk, allocator, &memory->vk);
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
-   if (fd_info) {
+   if (fd_info && fd_info->handleType) {
       if (fd_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
           fd_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
          vk_device_memory_destroy(&device->vk, allocator, &memory->vk);
@@ -50,11 +51,8 @@ rd_AllocateMemory(VkDevice handle, const VkMemoryAllocateInfo *info,
       uint32_t size = align64(info->allocationSize, 4096);
       uint32_t gem_handle;
       int fd = fd_device_fd(device->fd);
-      if (!msm_common_gem_new(fd, size, MSM_BO_CACHED, &gem_handle)) {
+      if (!msm_common_gem_new(fd, size, MSM_BO_CACHED, &gem_handle))
          memory->bo = fd_bo_from_handle(device->fd, gem_handle, size);
-         if (!memory->bo)
-            msm_common_gem_close(fd, gem_handle);
-      }
    } else {
       const struct wsi_memory_allocate_info *wsi_info =
          vk_find_struct_const(info->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA);

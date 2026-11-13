@@ -653,6 +653,12 @@ rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
       .sampleCounts = rd_image_sample_counts(info->format, info->type, info->tiling, info->usage, info->flags),
       .maxResourceSize = RD_IMAGE_MAX_SIZE,
    };
+   if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      out->imageFormatProperties.maxExtent = (VkExtent3D){side, side, 1};
+      out->imageFormatProperties.maxMipLevels = 1;
+      out->imageFormatProperties.maxArrayLayers = 1;
+      out->imageFormatProperties.sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+   }
    if (info->flags & VK_IMAGE_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT) {
       out->imageFormatProperties.maxMipLevels = 1;
       out->imageFormatProperties.maxArrayLayers = 1;

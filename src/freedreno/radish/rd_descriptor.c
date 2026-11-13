@@ -403,7 +403,7 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
          continue;
       const struct rd_binding *binding = rd_find_binding(set->layout, writes[i].dstBinding);
       if (!binding || writes[i].descriptorType != binding->type ||
-          writes[i].dstArrayElement >= binding->count ||
+          writes[i].dstArrayElement > set->layout->descriptor_count - binding->slot ||
           writes[i].descriptorCount > set->layout->descriptor_count -
              binding->slot - writes[i].dstArrayElement)
          continue;
@@ -431,7 +431,8 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
       const struct rd_binding *sb = rd_find_binding(src->layout, copies[i].srcBinding);
       const struct rd_binding *db = rd_find_binding(dst->layout, copies[i].dstBinding);
       if (!sb || !db || sb->type != db->type ||
-          copies[i].srcArrayElement >= sb->count || copies[i].dstArrayElement >= db->count ||
+          copies[i].srcArrayElement > src->layout->descriptor_count - sb->slot ||
+          copies[i].dstArrayElement > dst->layout->descriptor_count - db->slot ||
           copies[i].descriptorCount > src->layout->descriptor_count - sb->slot - copies[i].srcArrayElement ||
           copies[i].descriptorCount > dst->layout->descriptor_count - db->slot - copies[i].dstArrayElement)
          continue;
@@ -446,7 +447,6 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
             dst->descriptors[slot].has_sampler = true;
             rd_sampler_descriptor(immutable, dst->descriptors[slot].sampler);
          }
-         rd_validate_descriptor_conversion(&dst->descriptors[slot], immutable);
       }
    }
 }
@@ -462,7 +462,8 @@ rd_UpdateDescriptorSetWithTemplate(VkDevice handle, VkDescriptorSet set_handle,
    for (uint32_t i = 0; i < update->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &update->entries[i];
       const struct rd_binding *binding = rd_find_binding(set->layout, entry->binding);
-      if (!binding || entry->type != binding->type || entry->array_element >= binding->count ||
+      if (!binding || entry->type != binding->type ||
+          entry->array_element > set->layout->descriptor_count - binding->slot ||
           entry->array_count > set->layout->descriptor_count - binding->slot - entry->array_element)
          continue;
       for (uint32_t j = 0; j < entry->array_count; j++)
