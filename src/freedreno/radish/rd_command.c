@@ -26,6 +26,7 @@ rd_command_reset(struct vk_command_buffer *base, VkCommandBufferResetFlags flags
    memset(command->vertex_buffers, 0, sizeof(command->vertex_buffers));
    command->index_buffer = NULL;
    memset(command->push, 0, sizeof(command->push));
+   memset(command->gfx_push, 0, sizeof(command->gfx_push));
    util_dynarray_clear(&command->commands);
 }
 
@@ -82,6 +83,13 @@ rd_BeginCommandBuffer(VkCommandBuffer handle, const VkCommandBufferBeginInfo *in
    vk_command_buffer_begin(&command->vk, info);
    command->render_continue = command->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
       (info->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
+   command->inherit_view_mask = 0;
+   if (command->render_continue && info->pInheritanceInfo) {
+      const VkCommandBufferInheritanceRenderingInfo *rendering =
+         vk_find_struct_const(info->pInheritanceInfo->pNext, COMMAND_BUFFER_INHERITANCE_RENDERING_INFO);
+      if (rendering)
+         command->inherit_view_mask = rendering->viewMask;
+   }
    return VK_SUCCESS;
 }
 
@@ -308,9 +316,9 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   /* Push constant values are shared by every stage and bind point. */
-   (void)stages;
-   memcpy((uint8_t *)command->push + offset, values, size);
+   uint32_t *target = (stages & VK_SHADER_STAGE_COMPUTE_BIT) ?
+      command->push : command->gfx_push;
+   memcpy((uint8_t *)target + offset, values, size);
 }
 
 static struct rd_dispatch_record *

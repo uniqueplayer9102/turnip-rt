@@ -23,8 +23,6 @@ rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
       const struct rd_image_view *driver_view = descriptor->image_view;
       const struct vk_image_view *view = &driver_view->vk;
       const struct rd_image *image = container_of(view->image, struct rd_image, vk);
-      if (vk_format_is_compressed(image->vk.format))
-         continue;
       bool array = view->view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY;
       bool cube = view->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
                   view->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -34,6 +32,11 @@ rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
       if (plane >= vk_format_get_plane_count(image->vk.format))
          return VK_ERROR_UNKNOWN;
       const struct rd_image_level *first_level = rd_image_plane_level(image, plane, view->base_mip_level);
+      if (vk_format_is_compressed(image->vk.format)) {
+         if (first_level->array_pitch > (0x3fffull << 12))
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         continue;
+      }
       if (!force && ((array && view->layer_count == 1) || first_level->array_pitch <= (0x3fffull << 12)))
          continue;
       if (!image->memory || view->level_count > RD_IMAGE_MAX_LEVELS)

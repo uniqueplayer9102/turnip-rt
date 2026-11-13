@@ -432,8 +432,8 @@ rd_lower_fetch(nir_builder *b, nir_instr *instr, void *data)
       if (tex->sampler_index >= 16) { state->failed = true; return false; }
       const uint32_t *sampler = state->key->samplers[tex->sampler_index];
       bool integer = util_format_is_pure_integer(rd_sample_format(view));
-      if ((sampler[1] & (1u << 5)) || ((sampler[0] >> 5) & 7) > 3 ||
-          ((sampler[0] >> 8) & 7) > 3 || (sampler[2] >> 7) > 5 ||
+      if ((sampler[1] & (1u << 5)) || ((sampler[0] >> 5) & 7) > 4 ||
+          ((sampler[0] >> 8) & 7) > 4 || (sampler[2] >> 7) > 5 ||
           ((sampler[0] >> 1) & 3) > 1 || ((sampler[0] >> 3) & 3) > 1 ||
           (integer && tex->op != nir_texop_tg4 &&
            ((sampler[0] & 1) || ((sampler[0] >> 1) & 3) || ((sampler[0] >> 3) & 3))) ||

@@ -950,6 +950,7 @@ rd_record_draw(struct rd_command_buffer *command)
       .line_width = dyn->rs.line.width,
       .sample_mask = dyn->ms.sample_mask,
       .alpha_to_coverage = dyn->ms.alpha_to_coverage_enable,
+      .rasterizer_discard = dyn->rs.rasterizer_discard_enable,
       .index_buffer = command->index_buffer,
       .index_offset = command->index_offset,
       .index_type = command->index_type,
@@ -958,7 +959,7 @@ rd_record_draw(struct rd_command_buffer *command)
    };
    memcpy(draw.vertex_buffers, command->vertex_buffers, sizeof(draw.vertex_buffers));
    memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
-   memcpy(draw.push, command->push, sizeof(draw.push));
+   memcpy(draw.push, command->gfx_push, sizeof(draw.push));
    if (!rd_copy_stage_descriptors(command, command->render, pipeline->gfx->vs.res, &draw.descriptors[0]) ||
        !rd_copy_stage_descriptors(command, command->render, pipeline->gfx->fs.res, &draw.descriptors[1])) {
       rd_render_free_descriptors(command, command->render, draw.descriptors[0]);
@@ -1917,7 +1918,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    if (has_depth && ds->depth.test_enable)
       depth_cntl |= A5XX_RB_DEPTH_CNTL_ZFUNC((enum adreno_compare_func)ds->depth.compare_op) |
                     A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE | A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE |
-                    COND(ds->depth.write_enable, A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE);
+                    COND(ds->depth.write_enable && !draw->rasterizer_discard, A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE);
    if (has_stencil && ds->stencil.test_enable) {
       const struct vk_stencil_test_face_state *f = &ds->stencil.front, *b = &ds->stencil.back;
       stencil_cntl = A5XX_RB_STENCIL_CONTROL_STENCIL_READ | A5XX_RB_STENCIL_CONTROL_STENCIL_ENABLE |
@@ -1929,10 +1930,10 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
                      A5XX_RB_STENCIL_CONTROL_ZFAIL_BF((enum adreno_stencil_op)b->op.depth_fail);
       refmask = A5XX_RB_STENCILREFMASK_STENCILREF(f->reference) |
                 A5XX_RB_STENCILREFMASK_STENCILMASK(f->compare_mask) |
-                A5XX_RB_STENCILREFMASK_STENCILWRITEMASK(f->write_mask);
+                A5XX_RB_STENCILREFMASK_STENCILWRITEMASK(draw->rasterizer_discard ? 0 : f->write_mask);
       refmask_bf = A5XX_RB_STENCILREFMASK_BF_STENCILREF(b->reference) |
                    A5XX_RB_STENCILREFMASK_BF_STENCILMASK(b->compare_mask) |
-                   A5XX_RB_STENCILREFMASK_BF_STENCILWRITEMASK(b->write_mask);
+                   A5XX_RB_STENCILREFMASK_BF_STENCILWRITEMASK(draw->rasterizer_discard ? 0 : b->write_mask);
    }
    bool fragz = gfx->fs.v->no_earlyz || gfx->fs.v->has_kill || gfx->fs.v->writes_pos;
    OUT_PKT4(ring, REG_A5XX_RB_ALPHA_CONTROL, 1);
@@ -2031,7 +2032,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
       const struct vk_color_blend_attachment_state *a =
          i < draw->cb.attachment_count ? &draw->cb.attachments[i] : NULL;
-      uint32_t mask = a ? a->write_mask : 0;
+      uint32_t mask = (a && !draw->rasterizer_discard) ? a->write_mask : 0;
       uint32_t control = A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
                          A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(mask);
       uint32_t blend = 0;
@@ -2062,7 +2063,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_PKT4(ring, REG_A5XX_RB_BLEND_CNTL, 1);
    OUT_RING(ring, A5XX_RB_BLEND_CNTL_ENABLE_BLEND(mrt_blend) | A5XX_RB_BLEND_CNTL_INDEPENDENT_BLEND |
                   COND(draw->alpha_to_coverage, A5XX_RB_BLEND_CNTL_ALPHA_TO_COVERAGE) |
-                  A5XX_RB_BLEND_CNTL_SAMPLE_MASK(render->samples > 1 ? draw->sample_mask : 0xffff));
+                  A5XX_RB_BLEND_CNTL_SAMPLE_MASK(draw->sample_mask));
    const float *bc = draw->cb.blend_constants;
    OUT_PKT4(ring, REG_A5XX_RB_BLEND_RED, 8);
    for (unsigned c = 0; c < 4; c++) {

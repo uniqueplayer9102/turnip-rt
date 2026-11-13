@@ -26,7 +26,7 @@ rd_query_layout(const struct rd_query_pool *pool, uint32_t count,
    const size_t words = pool->value_count +
       !!(flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
    const size_t one = words * width;
-   if ((stride % width) || (count > 1 && stride < one) ||
+   if ((count > 1 && stride % width) || (count > 1 && stride < one) ||
        (count > 1 && stride > (SIZE_MAX - one) / (count - 1)))
       return false;
    *bytes = count ? (size_t)(count - 1) * stride + one : 0;
@@ -281,9 +281,9 @@ rd_CmdWriteTimestamp2(VkCommandBuffer handle, VkPipelineStageFlags2 stage,
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   /* in a multiview render pass a timestamp fills one query per view */
-   uint32_t count = command->render && command->render->view_mask ?
-      util_bitcount(command->render->view_mask) : 1;
+   uint32_t view_mask = command->render ? command->render->view_mask :
+      command->inherit_view_mask;
+   uint32_t count = view_mask ? util_bitcount(view_mask) : 1;
    struct rd_query_command *recorded =
       rd_record_query(command, RD_CMD_QUERY_TIMESTAMP, pool, query, count);
    if (recorded)

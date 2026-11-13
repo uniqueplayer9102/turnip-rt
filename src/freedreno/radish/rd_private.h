@@ -269,6 +269,7 @@ struct rd_draw {
    float bias_constant, bias_clamp, bias_slope, line_width;
    uint16_t sample_mask;
    bool alpha_to_coverage;
+   bool rasterizer_discard;
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
    uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS];
@@ -355,6 +356,7 @@ struct rd_command_buffer {
    struct rd_pipeline *gfx_pipeline;
    struct rd_render *render;
    bool render_continue;
+   uint32_t inherit_view_mask;
    struct rd_query_pool *occlusion_pool;
    uint32_t occlusion_query;
    /* bound descriptor sets: [0] compute, [1] graphics */
@@ -371,6 +373,7 @@ struct rd_command_buffer {
    VkDeviceSize index_offset;
    VkIndexType index_type;
    uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS];
+   uint32_t gfx_push[RD_MAX_PUSH_CONSTANTS_DWORDS];
    struct util_dynarray commands;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(rd_set_layout, vk.base, VkDescriptorSetLayout, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
