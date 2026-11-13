@@ -181,6 +181,15 @@ rd_CreatePipelineLayout(VkDevice handle, const VkPipelineLayoutCreateInfo *info,
                         UNUSED const VkAllocationCallbacks *allocator, VkPipelineLayout *out)
 {
    VK_FROM_HANDLE(rd_device, device, handle);
+   *out = VK_NULL_HANDLE;
+    if (info->flags || info->setLayoutCount > RD_MAX_SETS ||
+        info->pushConstantRangeCount >= MESA_VK_MAX_PUSH_CONSTANT_RANGES ||
+        (info->setLayoutCount && !info->pSetLayouts) ||
+        (info->pushConstantRangeCount && !info->pPushConstantRanges))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   for (uint32_t i = 0; i < info->setLayoutCount; i++)
+      if (!info->pSetLayouts[i])
+         return VK_ERROR_FEATURE_NOT_PRESENT;
    struct rd_pipeline_layout *layout = vk_pipeline_layout_zalloc(&device->vk,
       sizeof(*layout), info);
    if (!layout)
@@ -217,7 +226,13 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
+    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
+   if (!pipeline_layout || first > pipeline_layout->set_count ||
+       count > pipeline_layout->set_count - first || (count && !sets) ||
+       (dynamic_count && !offsets)) {
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
    const struct rd_pipeline_layout *driver_layout = container_of(pipeline_layout, const struct rd_pipeline_layout, vk);
    bool gtk_ycbcr_compat = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && driver_layout->gtk_ycbcr_compat;
    struct rd_bind_state *bound = &command->bind[bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS];
@@ -239,8 +254,12 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
       }
    }
    uint32_t dynamic = 0;
-   for (uint32_t i = 0; i < count; i++) {
-       struct rd_descriptor_set *set = rd_descriptor_set_from_handle(sets[i]);
+    for (uint32_t i = 0; i < count; i++) {
+        struct rd_descriptor_set *set = rd_descriptor_set_from_handle(sets[i]);
+       if (!set || set->layout->descriptor_count > RD_MAX_BINDINGS) {
+          rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+          return;
+       }
        bound->sets[first + i] = set;
        memcpy(bound->set_compatibility[first + i], compatibility, sizeof(compatibility));
        bound->gtk_ycbcr_tagged[first + i] = gtk_ycbcr_compat;
@@ -294,7 +313,7 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
    memcpy((uint8_t *)command->push + offset, values, size);
 }
 
-static struct rd_dispatch *
+static struct rd_dispatch_record *
 rd_record_dispatch(struct rd_command_buffer *command)
 {
    if (!command->pipeline) {
@@ -304,7 +323,7 @@ rd_record_dispatch(struct rd_command_buffer *command)
    struct rd_command *recorded = rd_command_append(command, RD_CMD_DISPATCH);
    if (!recorded)
       return NULL;
-   struct rd_dispatch *dispatch = &recorded->dispatch;
+   struct rd_dispatch_record *dispatch = &recorded->dispatch;
    dispatch->pipeline = command->pipeline;
    memcpy(dispatch->push, command->push, sizeof(dispatch->push));
    uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
@@ -314,8 +333,10 @@ rd_record_dispatch(struct rd_command_buffer *command)
          continue;
       const struct rd_nir_resource_binding *resource = &command->pipeline->resources[i];
       uint32_t index = resource->descriptor_set;
-      struct rd_descriptor_set *set = command->bind[0].sets[index];
-      if (!set || memcmp(command->bind[0].set_compatibility[index][index], compatibility[index], BLAKE3_OUT_LEN)) {
+      struct rd_descriptor_set *set = index < RD_MAX_SETS ? command->bind[0].sets[index] : NULL;
+      if (!set || resource->logical_slot >= set->layout->descriptor_count ||
+          resource->logical_slot >= RD_MAX_BINDINGS ||
+          memcmp(command->bind[0].set_compatibility[index][index], compatibility[index], BLAKE3_OUT_LEN)) {
          rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return NULL;
       }
@@ -335,7 +356,7 @@ rd_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   struct rd_dispatch *dispatch = rd_record_dispatch(command);
+   struct rd_dispatch_record *dispatch = rd_record_dispatch(command);
    if (!dispatch)
       return;
    dispatch->grid[0] = x;
@@ -355,7 +376,7 @@ rd_CmdDispatchBase(VkCommandBuffer handle, uint32_t bx, uint32_t by, uint32_t bz
    }
    if (!x || !y || !z)
       return;
-   struct rd_dispatch *dispatch = rd_record_dispatch(command);
+   struct rd_dispatch_record *dispatch = rd_record_dispatch(command);
    if (!dispatch)
       return;
    dispatch->base[0] = bx;
@@ -420,7 +441,7 @@ rd_CmdDispatchIndirect(VkCommandBuffer handle, VkBuffer buffer_handle,
       rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
-   struct rd_dispatch *dispatch = rd_record_dispatch(command);
+   struct rd_dispatch_record *dispatch = rd_record_dispatch(command);
    if (!dispatch)
       return;
    dispatch->indirect = buffer;
@@ -443,9 +464,7 @@ rd_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
                     bar->subresourceRange.layerCount, img ? img->vk.array_layers : 0,
                     img ? img->vk.image_type : -1);
          }
-         rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
+       }
    }
    /* inside a render pass (a subpass self-dependency): the next draw waits
     * for the attachment writes before it and reads them through textures */

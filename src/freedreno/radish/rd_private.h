@@ -84,6 +84,7 @@ struct rd_device {
    uint32_t gmem_size;
    uint64_t gmem_base;
    bool gmem_size_valid;
+   char *gmem_disable_file;
    struct list_head active_queries;
    uint32_t queue_priority;
    struct rd_trace *trace;
@@ -196,14 +197,20 @@ struct rd_pipeline {
    uint8_t texture_planes[16];
    uint32_t buffer_count, buffer_descriptors[32];
 };
+struct rd_dispatch_record {
+   struct rd_pipeline *pipeline;
+   struct rd_buffer *indirect;
+   VkDeviceSize indirect_offset;
+   struct rd_descriptor_set *sets[RD_MAX_SETS];
+   uint32_t dynamic_offsets[RD_MAX_ACTIVE_RESOURCES];
+   uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS], grid[3], base[3];
+};
 struct rd_dispatch {
    struct rd_pipeline *pipeline;
    struct rd_buffer *indirect;
    struct fd_bo *sampling_addresses, *sampling_bos[16];
    VkDeviceSize indirect_offset;
    struct rd_descriptor descriptors[RD_MAX_ACTIVE_RESOURCES];
-   struct rd_descriptor_set *sets[RD_MAX_SETS];
-   uint32_t dynamic_offsets[RD_MAX_ACTIVE_RESOURCES];
    uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS], grid[3], base[3];
 };
 struct rd_event {
@@ -333,7 +340,7 @@ struct rd_transfer {
 struct rd_command {
    enum rd_command_type type;
    union {
-      struct rd_dispatch dispatch;
+      struct rd_dispatch_record dispatch;
       struct rd_transfer transfer;
       struct rd_image_transfer image_transfer;
       struct rd_event_command event;
@@ -419,6 +426,8 @@ void rd_render_barrier(struct rd_command_buffer *command);
 void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
 bool rd_descriptor_ready(const struct rd_descriptor *descriptor);
+bool rd_descriptor_apply_dynamic_offset(struct rd_descriptor *descriptor,
+                                        uint32_t offset);
 void rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,
                         const struct rd_pipeline *stage, const struct ir3_shader_variant *v,
                         const struct rd_descriptor *descriptors);

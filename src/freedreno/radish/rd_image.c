@@ -10,6 +10,14 @@
 #include <limits.h>
 #include <math.h>
 
+DEBUG_GET_ONCE_BOOL_OPTION(gpu_image_copy, "RADISH_GPU_IMAGE_COPY", true)
+DEBUG_GET_ONCE_BOOL_OPTION(image_transfer_cache_ranges, "RADISH_IMAGE_TRANSFER_CACHE_RANGES", true)
+DEBUG_GET_ONCE_BOOL_OPTION(image_transfer_cache_debug, "RADISH_IMAGE_TRANSFER_CACHE_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_clear_bulk, "RADISH_CPU_IMAGE_CLEAR_BULK", true)
+DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_clear_debug, "RADISH_CPU_IMAGE_CLEAR_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_copy_bulk, "RADISH_CPU_IMAGE_COPY_BULK", true)
+DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_copy_debug, "RADISH_CPU_IMAGE_COPY_DEBUG", false)
+
 bool
 rd_ycbcr_format_supported(VkFormat format)
 {
@@ -106,10 +114,9 @@ rd_image_texel_size(VkFormat format)
    case VK_FORMAT_R32G32_UINT:
    case VK_FORMAT_R32G32_SINT:
    case VK_FORMAT_R32G32_SFLOAT:
-   case VK_FORMAT_R32G32B32A32_UINT:
-   case VK_FORMAT_R32G32B32A32_SINT:
-   case VK_FORMAT_R32G32B32A32_SFLOAT:
-      return vk_format_get_blocksize(format);
+    case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
    case VK_FORMAT_R5G6B5_UNORM_PACK16:
    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
@@ -121,16 +128,14 @@ rd_image_texel_size(VkFormat format)
    case VK_FORMAT_A2R10G10B10_UINT_PACK32:
    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
    case VK_FORMAT_A2B10G10R10_UINT_PACK32:
-   case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-   case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
-      return vk_format_get_blocksize(format);
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
    case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
    case VK_FORMAT_B5G6R5_UNORM_PACK16:
-   case VK_FORMAT_B8G8R8A8_SNORM:
-   case VK_FORMAT_B8G8R8A8_UINT:
-   case VK_FORMAT_B8G8R8A8_SINT:
-      return vk_format_get_blocksize(format);
+    case VK_FORMAT_B8G8R8A8_SNORM:
+    case VK_FORMAT_B8G8R8A8_UINT:
+    case VK_FORMAT_B8G8R8A8_SINT:
    case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
    case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
    case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
@@ -139,9 +144,8 @@ rd_image_texel_size(VkFormat format)
    case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
    case VK_FORMAT_EAC_R11_UNORM_BLOCK:
    case VK_FORMAT_EAC_R11_SNORM_BLOCK:
-   case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
-   case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
-      return vk_format_get_blocksize(format);
+    case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
+    case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
    case VK_FORMAT_D16_UNORM:
    case VK_FORMAT_D32_SFLOAT:
    case VK_FORMAT_S8_UINT:
@@ -736,8 +740,11 @@ rd_image_layout(struct rd_image *image)
       /* The texture unit fetches past the end of small 3D images (IOMMU
        * faults a few pages after the BO in pipeline.monolithic.image 3d
        * sampling); give 3D images slack so those reads stay mapped. */
-      if (image->vk.image_type == VK_IMAGE_TYPE_3D)
-         image->size += 64 * 1024;
+       if (image->vk.image_type == VK_IMAGE_TYPE_3D) {
+          if (image->size > limit - 64 * 1024)
+             return false;
+          image->size += 64 * 1024;
+       }
       for (uint32_t level = 0; level < image->vk.mip_levels; level++) {
          VkExtent3D extent = vk_image_mip_level_extent(&image->vk, level);
          struct rd_image_level *layout = &image->levels[level];
@@ -763,8 +770,6 @@ rd_image_layout(struct rd_image *image)
       VkExtent3D elements = vk_image_extent_to_elements(&image->vk, extent);
       layout->row_pitch = align64((uint64_t)elements.width * image->texel_size * image->vk.samples, 64);
       layout->depth_pitch = layout->row_pitch * elements.height;
-      if (shader)
-         layout->depth_pitch = align64(layout->depth_pitch, 4096);
       layout->array_pitch = layout->depth_pitch * extent.depth;
       layout->size = layout->array_pitch;
       VkDeviceSize level_size = layout->array_pitch * image->vk.array_layers;
@@ -1027,6 +1032,9 @@ rd_BindImageMemory2(VkDevice handle, uint32_t count, const VkBindImageMemoryInfo
    VK_FROM_HANDLE(rd_device, device, handle);
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(rd_image, image, infos[i].image);
+      for (uint32_t j = 0; j < i; j++)
+         if (infos[j].image == infos[i].image)
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       struct rd_memory *memory = rd_image_bind_memory(&infos[i]);
       const VkBindImageMemoryDeviceGroupInfo *group =
          vk_find_struct_const(infos[i].pNext, BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO);
@@ -1224,7 +1232,7 @@ rd_CreateBufferView(VkDevice handle, const VkBufferViewCreateInfo *info,
    if (!buffer || info->flags || !rd_shader_format_supported(info->format) ||
        vk_format_is_compressed(info->format) || vk_format_is_srgb(info->format) || vk_format_is_depth_or_stencil(info->format) ||
        !size || info->offset >= buffer->vk.size ||
-       (info->offset & 31) || !(buffer->vk.usage &
+        (info->offset & 63) || !(buffer->vk.usage &
        (VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    VkDeviceSize range = info->range == VK_WHOLE_SIZE ? buffer->vk.size - info->offset : info->range;
@@ -1700,7 +1708,7 @@ bool
 rd_image_copy_gpu_supported(struct rd_device *device,
                             const struct rd_image_transfer *transfer, bool small_copies)
 {
-   if (!debug_get_bool_option("RADISH_GPU_IMAGE_COPY", true) ||
+   if (!debug_get_option_gpu_image_copy() ||
        fd_device_version(device->fd) < FD_VERSION_SOFTPIN ||
        !transfer->src_buffer || !transfer->dst_image ||
        transfer->src_image || transfer->dst_buffer || transfer->copy_mask || transfer->lane_step ||
@@ -1737,7 +1745,7 @@ static void
 rd_image_transfer_cache(struct rd_memory *memory, void *map, VkDeviceSize offset,
                         const struct rd_image_transfer *transfer, bool dst, bool flush)
 {
-   bool ranges = debug_get_bool_option("RADISH_IMAGE_TRANSFER_CACHE_RANGES", true);
+   bool ranges = debug_get_option_image_transfer_cache_ranges();
    uint64_t bytes = 0, count = 0;
    if (!ranges) {
       if (flush)
@@ -1786,7 +1794,7 @@ rd_image_transfer_cache(struct rd_memory *memory, void *map, VkDeviceSize offset
       else
          util_post_flush_inval_fence();
    }
-   if (debug_get_bool_option("RADISH_IMAGE_TRANSFER_CACHE_DEBUG", false))
+   if (debug_get_option_image_transfer_cache_debug())
       fprintf(stderr, "RADISH_IMAGE_TRANSFER_CACHE op=%s path=%s ranges=%" PRIu64
               " bytes=%" PRIu64 " allocation=%" PRIu64 "\n",
               flush ? "flush" : "invalidate", ranges ? "ranges" : "full",
@@ -1840,6 +1848,32 @@ rd_image_clear_cpu(uint8_t *map, const struct rd_image_transfer *transfer)
    return (uint64_t)rows * slices * (uniform ? 1 : DIV_ROUND_UP(span, block_bytes));
 }
 
+static uint64_t
+rd_image_copy_cpu(uint8_t *dst, const uint8_t *src,
+                   const struct rd_image_transfer *transfer, bool coalesce)
+{
+   VkDeviceSize span = transfer->row_bytes;
+   uint32_t rows = transfer->rows, slices = transfer->slices;
+   if (coalesce && transfer->src_row_pitch == span && transfer->dst_row_pitch == span) {
+      span *= rows;
+      rows = 1;
+   }
+   if (coalesce && rows == 1 && transfer->src_slice_pitch == span &&
+       transfer->dst_slice_pitch == span) {
+      span *= slices;
+      slices = 1;
+   }
+   for (uint32_t z = 0; z < slices; z++) {
+      for (uint32_t y = 0; y < rows; y++) {
+         memmove(dst + transfer->dst_offset + z * transfer->dst_slice_pitch +
+                    y * transfer->dst_row_pitch,
+                 src + transfer->src_offset + z * transfer->src_slice_pitch +
+                    y * transfer->src_row_pitch, span);
+      }
+   }
+   return (uint64_t)rows * slices;
+}
+
 VkResult
 rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transfer *transfer,
                            bool clear, struct rd_submit_window *window)
@@ -1882,10 +1916,18 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
    if (dst->cached)
       rd_image_transfer_cache(dst, dst_map, dst_offset, transfer, true, false);
    __sync_synchronize();
-   bool bulk_clear = clear && debug_get_bool_option("RADISH_CPU_IMAGE_CLEAR_BULK", true);
+   bool bulk_clear = clear && debug_get_option_cpu_image_clear_bulk();
    uint64_t clear_calls = bulk_clear ? rd_image_clear_cpu(dst_map + dst_offset, transfer) :
       clear ? transfer->row_bytes / transfer->texel_size * transfer->rows * transfer->slices : 0;
-   if (!bulk_clear) {
+   bool plain_copy = !clear && !transfer->copy_mask && !transfer->lane_step;
+   if (plain_copy) {
+      uint64_t calls = rd_image_copy_cpu(dst_map + dst_offset, src_map + src_offset,
+         transfer, src->bo != dst->bo && debug_get_option_cpu_image_copy_bulk());
+      if (debug_get_option_cpu_image_copy_debug())
+         fprintf(stderr, "RADISH_CPU_IMAGE_COPY bytes=%" PRIu64 " calls=%" PRIu64 "\n",
+                 transfer->row_bytes * transfer->rows * transfer->slices, calls);
+   }
+   if (!bulk_clear && !plain_copy) {
       for (uint32_t z = 0; z < transfer->slices; z++) {
          for (uint32_t y = 0; y < transfer->rows; y++) {
             uint8_t *to = dst_map + dst_offset + transfer->dst_offset +
@@ -1915,7 +1957,7 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
          }
       }
    }
-   if (clear && debug_get_bool_option("RADISH_CPU_IMAGE_CLEAR_DEBUG", false))
+   if (clear && debug_get_option_cpu_image_clear_debug())
       fprintf(stderr, "RADISH_CPU_IMAGE_CLEAR path=%s bytes=%" PRIu64 " texel=%u calls=%" PRIu64 "\n",
               bulk_clear ? "bulk" : "texel", transfer->row_bytes * transfer->rows * transfer->slices,
               transfer->texel_size, clear_calls);

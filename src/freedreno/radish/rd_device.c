@@ -2,6 +2,7 @@
 #include "rd_trace.h"
 #include "util/os_time.h"
 #include <time.h>
+#include <pwd.h>
 
 void
 rd_wake_device_waiters(struct vk_device *device)
@@ -41,7 +42,7 @@ rd_sync_wait_many(struct vk_device *device, uint32_t count,
          rd_wake_device_waiters(device);
          return VK_ERROR_DEVICE_LOST;
       }
-      if (result != VK_SUCCESS && result != VK_TIMEOUT) {
+      if (result == VK_ERROR_DEVICE_LOST) {
          vk_device_set_lost(device, "Radish sync wait failed");
          rd_wake_device_waiters(device);
          return VK_ERROR_DEVICE_LOST;
@@ -66,6 +67,7 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
                 const VkAllocationCallbacks *allocator, VkDevice *out)
 {
    VK_FROM_HANDLE(rd_physical_device, physical, handle);
+   *out = VK_NULL_HANDLE;
    const VkDeviceGroupDeviceCreateInfo *group =
       vk_find_struct_const(info->pNext, DEVICE_GROUP_DEVICE_CREATE_INFO);
    if (group && group->physicalDeviceCount &&
@@ -90,6 +92,27 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       vk_free2(&physical->vk.instance->alloc, allocator, device);
       return result;
    }
+   bool queue_initialized = false, meta_initialized = false;
+   const char *marker = debug_get_option("RADISH_GMEM_DISABLE_FILE", NULL);
+   if (marker) {
+      if (*marker)
+         device->gmem_disable_file = vk_strdup(&device->vk.alloc, marker,
+                                               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   } else {
+      struct passwd entry, *user = NULL;
+      char buffer[4096];
+      if (!getpwuid_r(geteuid(), &entry, buffer, sizeof(buffer), &user) && user && user->pw_dir)
+         device->gmem_disable_file = vk_asprintf(&device->vk.alloc,
+            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "%s/.local/radish/gmem_disabled", user->pw_dir);
+      if (!device->gmem_disable_file) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail;
+      }
+   }
+   if (marker && *marker && !device->gmem_disable_file) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail;
+   }
    device->queue_priority =
       info->pQueueCreateInfos[0].pQueuePriorities[0] >= 0.5f;
    device->fd = fd_device_ref(physical->fd);
@@ -99,7 +122,6 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       goto fail;
    }
    if (fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &device->faults)) {
-      fd_pipe_del(device->pipe);
       result = VK_ERROR_INITIALIZATION_FAILED;
       goto fail;
    }
@@ -108,10 +130,9 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    list_inithead(&device->active_queries);
    result = vk_queue_init(&device->queue, &device->vk,
                           &info->pQueueCreateInfos[0], 0);
-   if (result != VK_SUCCESS) {
-      fd_pipe_del(device->pipe);
+   if (result != VK_SUCCESS)
       goto fail;
-   }
+   queue_initialized = true;
    device->queue.driver_submit = rd_queue_submit;
    device->vk.command_buffer_ops = &rd_command_buffer_ops;
    device->info = fd_dev_info(fd_pipe_dev_id(device->pipe));
@@ -132,31 +153,38 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
                                          &device->info, &options);
    device->control = fd_bo_new(device->fd, 4096, 0, "radish-control");
    if (!device->compiler || !device->control) {
-      if (device->compiler) ir3_compiler_destroy(device->compiler);
-      if (device->control) fd_bo_del(device->control);
-      vk_queue_finish(&device->queue);
-      fd_pipe_del(device->pipe);
       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       goto fail;
    }
    device->compiler->nir_options.lower_device_index_to_zero = true;
    simple_mtx_init(&device->meta_mutex, mtx_plain);
+   meta_initialized = true;
    rd_trace_init(device);
    result = rd_init_border_colors(device);
    if (result == VK_SUCCESS)
       result = vk_queue_enable_submit_thread(&device->queue);
-   if (result != VK_SUCCESS) {
-      if (device->border_colors) fd_bo_del(device->border_colors);
-      fd_bo_del(device->control);
-      ir3_compiler_destroy(device->compiler);
-      vk_queue_finish(&device->queue);
-      fd_pipe_del(device->pipe);
+   if (result != VK_SUCCESS)
       goto fail;
-   }
    *out = rd_device_to_handle(device);
    return VK_SUCCESS;
 fail:
-   fd_device_del(device->fd);
+   if (queue_initialized)
+      vk_queue_finish(&device->queue);
+   if (meta_initialized) {
+      rd_trace_finish(device);
+      simple_mtx_destroy(&device->meta_mutex);
+   }
+   if (device->border_colors)
+      fd_bo_del(device->border_colors);
+   if (device->control)
+      fd_bo_del(device->control);
+   if (device->compiler)
+      ir3_compiler_destroy(device->compiler);
+   if (device->pipe)
+      fd_pipe_del(device->pipe);
+   if (device->fd)
+      fd_device_del(device->fd);
+   vk_free(&device->vk.alloc, device->gmem_disable_file);
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
    return result;
@@ -178,6 +206,7 @@ rd_DestroyDevice(VkDevice handle, const VkAllocationCallbacks *allocator)
    ir3_compiler_destroy(device->compiler);
    fd_pipe_del(device->pipe);
    fd_device_del(device->fd);
+   vk_free(&device->vk.alloc, device->gmem_disable_file);
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
 }

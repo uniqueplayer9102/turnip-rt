@@ -31,6 +31,13 @@ void rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pi
 #include "vk_util.h"
 #include "util/u_debug.h"
 
+DEBUG_GET_ONCE_BOOL_OPTION(gmem, "RADISH_GMEM", true)
+DEBUG_GET_ONCE_BOOL_OPTION(gmem_cull, "RADISH_GMEM_CULL", true)
+DEBUG_GET_ONCE_BOOL_OPTION(gmem_viewport_reuse, "RADISH_GMEM_VIEWPORT_REUSE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(gmem_dump, "RADISH_GMEM_DUMP", false)
+DEBUG_GET_ONCE_NUM_OPTION(gmem_stop, "RADISH_GMEM_STOP", -1)
+DEBUG_GET_ONCE_BOOL_OPTION(descriptor_arena, "RADISH_DESCRIPTOR_ARENA", true)
+
 /* The queue family has VK_QUEUE_GRAPHICS_BIT and graphics pipelines are
  * accepted unless RADISH_GRAPHICS=0. */
 bool
@@ -68,7 +75,8 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
 #define RD_GFX_MAX_BUFFERS 16
 /* one vec4 after the buffer addresses: x = view index (multiview replay) */
 #define RD_GFX_VIEW_DWORD (RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS)
-#define RD_GFX_CONST_VEC4 ((RD_GFX_VIEW_DWORD + 4) / 4)
+#define RD_GFX_BUFFER_SIZE_DWORD (RD_GFX_VIEW_DWORD + 4)
+#define RD_GFX_CONST_VEC4 ((RD_GFX_BUFFER_SIZE_DWORD + RD_GFX_MAX_BUFFERS) / 4)
 
 struct rd_gfx_lower { bool failed; bool ibo; unsigned buffer_count; };
 
@@ -82,7 +90,8 @@ rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    switch (intr->intrinsic) {
    case nir_intrinsic_load_ssbo: {
       if (intr->def.bit_size != 32 ||
-          (nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) >= RD_GFX_MAX_BUFFERS)) {
+          !state->buffer_count ||
+          (nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) >= state->buffer_count)) {
          if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
             fprintf(stderr, "radish: graphics buffer load: bits %u\n", intr->def.bit_size);
          state->failed = true;
@@ -109,8 +118,9 @@ rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       if (nir_src_is_const(intr->src[1])) {
          value = nir_load_global_offset(b, intr->def.num_components, 32,
                                         nir_pack_64_2x32(b, address), intr->src[1].ssa,
-                                        .align_mul = nir_intrinsic_align_mul(intr),
-                                        .align_offset = nir_intrinsic_align_offset(intr));
+                                         .align_mul = nir_intrinsic_align_mul(intr),
+                                         .align_offset = nir_intrinsic_align_offset(intr),
+                                         .access = nir_intrinsic_access(intr));
       } else {
          /* a dynamic offset (indexed uniform arrays): add it to the address
           * in 32-bit halves with the carry */
@@ -119,16 +129,36 @@ rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          hi = nir_iadd(b, hi, nir_b2i32(b, nir_ult(b, sum, lo)));
          value = nir_load_global_offset(b, intr->def.num_components, 32,
                                         nir_pack_64_2x32_split(b, sum, hi), nir_imm_int(b, 0),
-                                        .align_mul = nir_intrinsic_align_mul(intr),
-                                        .align_offset = nir_intrinsic_align_offset(intr));
+                                         .align_mul = nir_intrinsic_align_mul(intr),
+                                         .align_offset = nir_intrinsic_align_offset(intr),
+                                         .access = nir_intrinsic_access(intr));
       }
       nir_def_replace(&intr->def, value);
+      return true;
+   }
+   case nir_intrinsic_get_ssbo_size: {
+      if (intr->def.bit_size != 32 || !state->buffer_count ||
+          (nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) >= state->buffer_count)) {
+         state->failed = true;
+         return false;
+      }
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *size = nir_load_const_ir3(b, 1, 32, nir_imm_int(b, 0),
+         .base = RD_GFX_BUFFER_SIZE_DWORD +
+                 (nir_src_is_const(intr->src[0]) ? nir_src_as_uint(intr->src[0]) : 0));
+      if (!nir_src_is_const(intr->src[0])) {
+         for (unsigned slot = 1; slot < state->buffer_count; slot++) {
+            nir_def *other = nir_load_const_ir3(b, 1, 32, nir_imm_int(b, 0),
+               .base = RD_GFX_BUFFER_SIZE_DWORD + slot);
+            size = nir_bcsel(b, nir_ieq_imm(b, intr->src[0].ssa, slot), other, size);
+         }
+      }
+      nir_def_replace(&intr->def, size);
       return true;
    }
    case nir_intrinsic_store_ssbo:
    case nir_intrinsic_ssbo_atomic:
    case nir_intrinsic_ssbo_atomic_swap:
-   case nir_intrinsic_get_ssbo_size:
       state->failed = true;
       return false;
    default:
@@ -304,8 +334,10 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    bool lowered = rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
                                                  &shader->res->resource_usage);
    bool buffers = lowered && rd_lower_stage_buffers(nir, shader->res);
+   bool robust = buffers && (!device->vk.enabled_features.robustBufferAccess ||
+                             rd_nir_lower_robust_buffers(nir));
    bool fragment = nir->info.stage == MESA_SHADER_FRAGMENT;
-   if (!lowered || !buffers || (!fragment && shader->res->resource_usage.image_count) ||
+   if (!lowered || !buffers || !robust || (!fragment && shader->res->resource_usage.image_count) ||
        shader->res->buffer_count > RD_GFX_MAX_BUFFERS) {
       if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
          fprintf(stderr, "radish: %s shader refused: resources %d buffers %d images %u buffer count %u\n",
@@ -338,11 +370,12 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    ir3_nir_lower_io(nir);
    struct ir3_shader_options options = {
       .nir_options.disable_optimizations = flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT,
-      .nir_options.a5xx_raw_global_loads = true,
+       .nir_options.a5xx_raw_global_loads = true,
+       .nir_options.a5xx_ssbo_size_consts = true,
       .api_wavesize = IR3_SINGLE_ONLY,
       .real_wavesize = IR3_SINGLE_ONLY,
       .push_consts_type = IR3_PUSH_CONSTS_PER_STAGE,
-      .push_consts_dwords = RD_GFX_VIEW_DWORD + 4,
+      .push_consts_dwords = RD_GFX_BUFFER_SIZE_DWORD + RD_GFX_MAX_BUFFERS,
       .const_allocs = {
          .consts[IR3_CONST_ALLOC_PUSH_CONSTS] = { .offset_vec4 = 0, .size_vec4 = RD_GFX_CONST_VEC4 },
          .max_const_offset_vec4 = RD_GFX_CONST_VEC4,
@@ -592,7 +625,7 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
       return;
    }
    util_dynarray_init(&render->draws, NULL);
-   render->descriptor_arena = debug_get_bool_option("RADISH_DESCRIPTOR_ARENA", true);
+   render->descriptor_arena = debug_get_option_descriptor_arena();
    render->area = info->renderArea;
    render->layers = info->layerCount;
    render->view_mask = info->viewMask;
@@ -685,11 +718,14 @@ rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *r
    struct rd_descriptor *copy = rd_render_alloc_descriptors(command, render, stage->resource_count);
    if (!copy)
       return false;
+   memset(copy, 0, stage->resource_count * sizeof(*copy));
    const struct rd_bind_state *bound = &command->bind[1];
    const struct rd_pipeline_layout *layout = container_of(stage->layout, const struct rd_pipeline_layout, vk);
    uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
    bool compatibility_ready = false;
    for (uint32_t i = 0; i < stage->resource_count; i++) {
+      if (!((stage->used_descriptors | stage->resource_usage.descriptors) & (UINT64_C(1) << i)))
+         continue;
       const struct rd_nir_resource_binding *resource = &stage->resources[i];
       uint32_t index = resource->descriptor_set;
       const struct rd_descriptor_set *set = index < RD_MAX_SETS ? bound->sets[index] : NULL;
@@ -718,9 +754,18 @@ rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *r
          return false;
       }
       copy[i] = set->descriptors[resource->logical_slot];
-      if (copy[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
-          copy[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
-         copy[i].offset += bound->dynamic_offsets[resource->descriptor_set][resource->logical_slot];
+      if ((copy[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+           copy[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) &&
+          !rd_descriptor_apply_dynamic_offset(&copy[i], bound->dynamic_offsets[index][resource->logical_slot])) {
+         rd_render_free_descriptors(command, render, copy);
+         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+         return false;
+      }
+      if (!rd_descriptor_ready(&copy[i])) {
+         rd_render_free_descriptors(command, render, copy);
+         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+         return false;
+      }
    }
    *out = copy;
    return true;
@@ -737,7 +782,7 @@ rd_render_new(struct rd_command_buffer *command)
    }
    util_dynarray_init(&render->draws, NULL);
    util_dynarray_init(&render->queries, NULL);
-   render->descriptor_arena = debug_get_bool_option("RADISH_DESCRIPTOR_ARENA", true);
+   render->descriptor_arena = debug_get_option_descriptor_arena();
    struct rd_command *recorded = rd_command_append(command, RD_CMD_RENDER);
    if (!recorded) {
       rd_render_free(command, render);
@@ -1648,6 +1693,14 @@ rd_gfx_consts(struct fd_ringbuffer *ring, struct rd_device *device,
    }
    /* buffer addresses, two dwords each */
    const struct rd_pipeline *res = shader->res;
+   if (res->buffer_count && RD_GFX_BUFFER_SIZE_DWORD < constlen) {
+      uint32_t sizes[RD_GFX_MAX_BUFFERS] = {0};
+      for (unsigned i = 0; i < res->buffer_count; i++) {
+         const struct rd_descriptor *descriptor = &descriptors[res->buffer_descriptors[i]];
+         sizes[i] = descriptor->buffer ? descriptor->range : 0;
+      }
+      rd_gfx_const(ring, sb, RD_GFX_BUFFER_SIZE_DWORD, res->buffer_count, sizes);
+   }
    if (res->buffer_count && RD_GFX_PUSH_DWORDS < constlen) {
       unsigned count = res->buffer_count;
       unsigned dwords = align(2 * count, 4);
@@ -2449,10 +2502,10 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
             samples = MAX2(samples, ms->rasterization_samples);
       }
    }
-   if (!width || !util_dynarray_num_elements(&render->draws, struct rd_draw)) {
+   if (!width || !height || !util_dynarray_num_elements(&render->draws, struct rd_draw)) {
       util_dynarray_foreach(&render->queries, struct rd_render_query, op)
          rd_render_query_op(device, op);
-      return width ? rd_render_resolves(device, render) : VK_SUCCESS;
+      return width && height ? rd_render_resolves(device, render) : VK_SUCCESS;
    }
    struct fd_submit *submit = fd_submit_new(device->pipe);
    if (!submit)
@@ -2543,7 +2596,8 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       }
       if (!draw->vertex_count || !draw->instance_count)
          continue;
-      if (draw->indexed && (!draw->index_buffer || !draw->index_buffer->memory)) {
+      if (draw->indexed && (!draw->index_buffer || !draw->index_buffer->memory ||
+                            !draw->index_buffer->memory->bo)) {
          result = VK_ERROR_UNKNOWN;
          break;
       }
@@ -2658,6 +2712,9 @@ rd_gmem_layout_init(struct rd_gmem_layout *l, uint32_t cpp, uint32_t width,
                     uint32_t height, const struct fd_dev_info *info,
                     uint32_t gmem_size)
 {
+   if (!cpp || !width || !height || !gmem_size || !info->tile_align_w ||
+       !info->tile_align_h || !info->tile_max_w || !info->tile_max_h)
+      return false;
    l->cpp = cpp;
    l->cbuf_base = 0;
    l->bin_w = rd_gmem_div_align(width, 1, info->tile_align_w);
@@ -2687,11 +2744,11 @@ rd_gmem_layout_init(struct rd_gmem_layout *l, uint32_t cpp, uint32_t width,
  * honored so a long-lived compositor can fall back to bypass without being
  * restarted. */
 static bool
-rd_gmem_enabled(void)
+rd_gmem_enabled(const struct rd_device *device)
 {
-   if (!debug_get_bool_option("RADISH_GMEM", true))
+   if (!debug_get_option_gmem())
       return false;
-   if (access("/home/user/.local/radish/gmem_disabled", F_OK) == 0)
+   if (device->gmem_disable_file && access(device->gmem_disable_file, F_OK) == 0)
       return false;
    return true;
 }
@@ -2700,7 +2757,7 @@ static bool
 rd_execute_render_gmem_supported(struct rd_device *device,
                                  const struct rd_render *render)
 {
-   if (!rd_gmem_enabled())
+   if (!rd_gmem_enabled(device))
       return false;
    if (render->depth.view || render->stencil.view)
       return false;
@@ -2720,6 +2777,9 @@ rd_execute_render_gmem_supported(struct rd_device *device,
       return false;
    util_dynarray_foreach(&render->draws, struct rd_draw, d) {
       if (d->indirect || d->barrier || d->occlusion_pool || rd_draw_uses_input_attachment(d))
+         return false;
+      if (d->indexed && (!d->index_buffer || !d->index_buffer->memory ||
+                         !d->index_buffer->memory->bo))
          return false;
       const struct rd_image *image =
          container_of(render->color[0].view->vk.image, struct rd_image, vk);
@@ -2993,27 +3053,30 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    size_t nr_segs = 0;
-   bool cull = debug_get_bool_option("RADISH_GMEM_CULL", true);
-   bool viewport_reuse = cull && debug_get_bool_option("RADISH_GMEM_VIEWPORT_REUSE", true);
+   bool cull = debug_get_option_gmem_cull();
+   bool viewport_reuse = cull && debug_get_option_gmem_viewport_reuse();
    uint64_t candidates = 0, skipped = 0, draw_ibs = 0;
    uint64_t viewport_updates = 0, viewport_reuses = 0, state_waits = 0;
    util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
-      struct rd_draw d = *draw;
-      if (d.indirect) {
-         result = rd_resolve_draw_indirect(device, &d);
+      const struct rd_draw *d = draw;
+      struct rd_draw indirect;
+      if (d->indirect) {
+         indirect = *d;
+         result = rd_resolve_draw_indirect(device, &indirect);
          if (result != VK_SUCCESS)
             break;
+         d = &indirect;
       }
-      if (!d.vertex_count || !d.instance_count)
+      if (!d->vertex_count || !d->instance_count)
          continue;
       struct rd_gmem_draw_seg *seg = &segs[nr_segs];
       seg->draw = draw;
       seg->first_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->first_offset = draw_ring->cur - draw_ring->start;
-      rd_gfx_draw(draw_ring, device, render, &d, NULL, !viewport_reuse);
+      rd_gfx_draw(draw_ring, device, render, d, NULL, !viewport_reuse);
       seg->last_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->last_offset = draw_ring->cur - draw_ring->start;
-      rd_gmem_draw_bounds(render, &d, seg);
+      rd_gmem_draw_bounds(render, d, seg);
       nr_segs++;
    }
    if (result != VK_SUCCESS) {
@@ -3027,7 +3090,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    rd_gfx_restore(ring, device);
    /* bisect probe: honored only when RADISH_GMEM_STOP is set to a stage
     * __LINE__ (see RD_GMEM_STAGE); unset means run the full GMEM path */
-   long stop_at = debug_get_num_option("RADISH_GMEM_STOP", -1);
+   long stop_at = debug_get_option_gmem_stop();
 #define RD_GMEM_STAGE(name) if (stop_at && stop_at == __LINE__) { \
       rd_flush(device, ring); \
       fd_ringbuffer_del(draw_ring); \
@@ -3035,7 +3098,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       return rd_finish_window_submit(device, submit, ring, window, \
                                      initial_ring_start, true); }
 
-   if (debug_get_bool_option("RADISH_GMEM_DUMP", false)) {
+   if (debug_get_option_gmem_dump()) {
       fprintf(stderr, "radish gmem: bin=%ux%u tiles=%ux%u cpp=%u base=0x%"
               PRIx64 " load=%d store=%d\n", l.bin_w, l.bin_h, nbins_x,
               nbins_y, l.cpp, device->gmem_base,
@@ -3163,7 +3226,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       }
    }
 
-   if (debug_get_bool_option("RADISH_GMEM_DUMP", false)) {
+   if (debug_get_option_gmem_dump()) {
       fprintf(stderr, "radish gmem cull: draws=%zu chunks=%u candidates=%" PRIu64
               " skipped=%" PRIu64 " ibs=%" PRIu64 " enabled=%u\n",
               nr_segs, fd_ringbuffer_cmd_count(draw_ring), candidates, skipped,

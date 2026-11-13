@@ -65,6 +65,10 @@ rd_GetDescriptorSetLayoutSupport(VkDevice handle,
 {
    uint32_t bindings, descriptors;
    support->supported = rd_descriptor_layout_supported(info, &bindings, &descriptors);
+   VkDescriptorSetVariableDescriptorCountLayoutSupport *variable =
+      vk_find_struct(support->pNext, DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT);
+   if (variable)
+      variable->maxVariableDescriptorCount = 0;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -186,6 +190,8 @@ rd_find_binding(struct rd_set_layout *layout, uint32_t binding)
 static const struct vk_sampler_state *
 rd_immutable_sampler(const struct rd_set_layout *layout, uint32_t slot)
 {
+   if (!layout->immutable_count)
+      return NULL;
    for (uint32_t i = 0; i < layout->binding_count; i++) {
       const struct rd_binding *binding = &layout->bindings[i];
       if (slot >= binding->slot && slot - binding->slot < binding->count) {
@@ -339,6 +345,8 @@ rd_write_descriptor(struct rd_descriptor_set *set, uint32_t slot,
    const struct vk_sampler_state *immutable = rd_immutable_sampler(set->layout, slot);
    if (type == VK_DESCRIPTOR_TYPE_SAMPLER && immutable)
       return;
+   if (!data)
+      return;
    struct rd_descriptor descriptor = { .type = type };
    switch (type) {
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
@@ -349,7 +357,8 @@ rd_write_descriptor(struct rd_descriptor_set *set, uint32_t slot,
       memcpy(&info, data, sizeof(info));
       descriptor.buffer = rd_buffer_from_handle(info.buffer);
       descriptor.offset = info.offset;
-      descriptor.range = vk_buffer_range(&descriptor.buffer->vk, info.offset, info.range);
+      descriptor.range = descriptor.buffer && info.offset <= descriptor.buffer->vk.size ?
+         vk_buffer_range(&descriptor.buffer->vk, info.offset, info.range) : 0;
       break;
    }
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
@@ -390,21 +399,24 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
 {
    for (uint32_t i = 0; i < write_count; i++) {
       VK_FROM_HANDLE(rd_descriptor_set, set, writes[i].dstSet);
+      if (!set)
+         continue;
       const struct rd_binding *binding = rd_find_binding(set->layout, writes[i].dstBinding);
-      assert(binding && writes[i].descriptorType == binding->type);
-      assert(writes[i].dstArrayElement < binding->count);
-      assert(writes[i].descriptorCount <= set->layout->descriptor_count -
-             binding->slot - writes[i].dstArrayElement);
+      if (!binding || writes[i].descriptorType != binding->type ||
+          writes[i].dstArrayElement >= binding->count ||
+          writes[i].descriptorCount > set->layout->descriptor_count -
+             binding->slot - writes[i].dstArrayElement)
+         continue;
       for (uint32_t j = 0; j < writes[i].descriptorCount; j++) {
          const void *data;
          if (binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
              binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
              binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
              binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
-            data = &writes[i].pBufferInfo[j];
+            data = writes[i].pBufferInfo ? &writes[i].pBufferInfo[j] : NULL;
          else if (binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
                   binding->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)
-            data = &writes[i].pTexelBufferView[j];
+            data = writes[i].pTexelBufferView ? &writes[i].pTexelBufferView[j] : NULL;
          else
             data = writes[i].pImageInfo ? &writes[i].pImageInfo[j] : NULL;
          rd_write_descriptor(set, binding->slot + writes[i].dstArrayElement + j,
@@ -414,15 +426,15 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
    for (uint32_t i = 0; i < copy_count; i++) {
       VK_FROM_HANDLE(rd_descriptor_set, src, copies[i].srcSet);
       VK_FROM_HANDLE(rd_descriptor_set, dst, copies[i].dstSet);
+      if (!src || !dst)
+         continue;
       const struct rd_binding *sb = rd_find_binding(src->layout, copies[i].srcBinding);
       const struct rd_binding *db = rd_find_binding(dst->layout, copies[i].dstBinding);
-      assert(sb && db && sb->type == db->type);
-      assert(copies[i].srcArrayElement < sb->count);
-      assert(copies[i].descriptorCount <= src->layout->descriptor_count -
-             sb->slot - copies[i].srcArrayElement);
-      assert(copies[i].dstArrayElement < db->count);
-      assert(copies[i].descriptorCount <= dst->layout->descriptor_count -
-             db->slot - copies[i].dstArrayElement);
+      if (!sb || !db || sb->type != db->type ||
+          copies[i].srcArrayElement >= sb->count || copies[i].dstArrayElement >= db->count ||
+          copies[i].descriptorCount > src->layout->descriptor_count - sb->slot - copies[i].srcArrayElement ||
+          copies[i].descriptorCount > dst->layout->descriptor_count - db->slot - copies[i].dstArrayElement)
+         continue;
       uint32_t first = db->slot + copies[i].dstArrayElement;
       memmove(&dst->descriptors[first],
               &src->descriptors[sb->slot + copies[i].srcArrayElement],
@@ -445,15 +457,28 @@ rd_UpdateDescriptorSetWithTemplate(VkDevice handle, VkDescriptorSet set_handle,
 {
    VK_FROM_HANDLE(rd_descriptor_set, set, set_handle);
    VK_FROM_HANDLE(vk_descriptor_update_template, update, template_handle);
+   if (!set || !update || !data)
+      return;
    for (uint32_t i = 0; i < update->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &update->entries[i];
       const struct rd_binding *binding = rd_find_binding(set->layout, entry->binding);
-      assert(binding && entry->type == binding->type);
-      assert(entry->array_element < binding->count);
-      assert(entry->array_count <= set->layout->descriptor_count -
-             binding->slot - entry->array_element);
+      if (!binding || entry->type != binding->type || entry->array_element >= binding->count ||
+          entry->array_count > set->layout->descriptor_count - binding->slot - entry->array_element)
+         continue;
       for (uint32_t j = 0; j < entry->array_count; j++)
          rd_write_descriptor(set, binding->slot + entry->array_element + j,
             entry->type, (const uint8_t *)data + entry->offset + j * entry->stride);
    }
+}
+
+bool
+rd_descriptor_apply_dynamic_offset(struct rd_descriptor *descriptor, uint32_t offset)
+{
+   if (!descriptor->buffer || descriptor->offset > descriptor->buffer->vk.size)
+      return false;
+   VkDeviceSize remaining = descriptor->buffer->vk.size - descriptor->offset;
+   if (offset > remaining || descriptor->range > remaining - offset)
+      return false;
+   descriptor->offset += offset;
+   return true;
 }

@@ -52,9 +52,6 @@ struct fd5_format {
 
 /* clang-format off */
 static struct fd5_format formats[PIPE_FORMAT_COUNT] = {
-   /* for blitting, treat PIPE_FORMAT_NONE as 8bit R8: */
-   _T(R8_UINT,    8_UINT,  R8_UINT,  WZYX),
-
    /* 8-bit */
    VT(R8_UNORM,   8_UNORM, R8_UNORM, WZYX),
    _T(R8_SRGB,    8_UNORM, R8_UNORM, WZYX),
@@ -350,7 +347,7 @@ static struct fd5_format formats[PIPE_FORMAT_COUNT] = {
 enum a5xx_vtx_fmt
 rd5_pipe2vtx(enum pipe_format format)
 {
-   if (!formats[format].present)
+   if ((unsigned)format >= PIPE_FORMAT_COUNT || !formats[format].present)
       return VFMT5_NONE;
    return formats[format].vtx;
 }
@@ -359,7 +356,7 @@ rd5_pipe2vtx(enum pipe_format format)
 enum a5xx_tex_fmt
 rd5_pipe2tex(enum pipe_format format)
 {
-   if (!formats[format].present)
+   if ((unsigned)format >= PIPE_FORMAT_COUNT || !formats[format].present)
       return TFMT5_NONE;
    return formats[format].tex;
 }
@@ -368,7 +365,7 @@ rd5_pipe2tex(enum pipe_format format)
 enum a5xx_color_fmt
 rd5_pipe2color(enum pipe_format format)
 {
-   if (!formats[format].present)
+   if ((unsigned)format >= PIPE_FORMAT_COUNT || !formats[format].present)
       return RB5_NONE;
    return formats[format].rb;
 }
@@ -376,7 +373,7 @@ rd5_pipe2color(enum pipe_format format)
 enum a3xx_color_swap
 rd5_pipe2swap(enum pipe_format format)
 {
-   if (!formats[format].present)
+   if ((unsigned)format >= PIPE_FORMAT_COUNT || !formats[format].present)
       return WZYX;
    return formats[format].swap;
 }
@@ -399,24 +396,3 @@ rd5_pipe2depth(enum pipe_format format)
       return ~0;
    }
 }
-
-static inline enum a5xx_tex_swiz
-tex_swiz(unsigned swiz)
-{
-   switch (swiz) {
-   default:
-   case PIPE_SWIZZLE_X:
-      return A5XX_TEX_X;
-   case PIPE_SWIZZLE_Y:
-      return A5XX_TEX_Y;
-   case PIPE_SWIZZLE_Z:
-      return A5XX_TEX_Z;
-   case PIPE_SWIZZLE_W:
-      return A5XX_TEX_W;
-   case PIPE_SWIZZLE_0:
-      return A5XX_TEX_ZERO;
-   case PIPE_SWIZZLE_1:
-      return A5XX_TEX_ONE;
-   }
-}
-
