@@ -2299,6 +2299,7 @@ rd_create_sample_counters(struct rd_device *device, unsigned count,
 
 static VkResult rd_render_resolves(struct rd_device *device, const struct rd_render *render);
 static VkResult rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render);
+static bool rd_gmem_draw_needs_idle(const struct rd_draw *previous, const struct rd_draw *draw);
 
 static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
@@ -2541,6 +2542,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    }
    int fragments = 0;
    unsigned counted = 0;
+   const struct rd_draw *previous = NULL;
    if (queries) {
       list_for_each_entry(struct rd_query_slot, slot, &device->active_queries, active_link)
          fragments += rd_stats_need_fragments(slot->pool);
@@ -2621,7 +2623,12 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       }
       if (queries && slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2) * 16);
-      rd_gfx_draw(ring, device, render, draw, &program_cache, true);
+      bool emit_vp = !previous ||
+         memcmp(&previous->viewport, &draw->viewport, sizeof(draw->viewport));
+      if (!emit_vp && rd_gmem_draw_needs_idle(previous, draw))
+         OUT_WFI5(ring);
+      rd_gfx_draw(ring, device, render, draw, &program_cache, emit_vp);
+      previous = draw;
       if (queries && slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2 + 1) * 16);
    }

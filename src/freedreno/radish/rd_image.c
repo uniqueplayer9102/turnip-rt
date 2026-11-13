@@ -1720,7 +1720,7 @@ rd_image_copy_gpu_supported(struct rd_device *device,
        transfer->src_image || transfer->dst_buffer || transfer->copy_mask || transfer->lane_step ||
        transfer->dst_image->vk.image_type != VK_IMAGE_TYPE_2D ||
        transfer->dst_image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
-       transfer->dst_image->vk.external_handle_types || transfer->dst_image->native_layout.tile_mode ||
+       transfer->dst_image->native_layout.tile_mode ||
        transfer->rows > 65535 || transfer->slices > 65535)
       return false;
    VkFormat format = transfer->dst_image->vk.format;
