@@ -1562,7 +1562,7 @@ rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buff
           height >= region->imageExtent.height && row <= RD_IMAGE_MAX_SIZE &&
           (!region->bufferRowLength || !(region->bufferRowLength % bw)) &&
           (!region->bufferImageHeight || !(region->bufferImageHeight % bh)) &&
-          DIV_ROUND_UP(height, bh) <= RD_IMAGE_MAX_SIZE / row &&
+          (slices == 1 || DIV_ROUND_UP(height, bh) <= RD_IMAGE_MAX_SIZE / row) &&
            !(region->bufferOffset % cpp)))
          return;
       VkBufferImageCopy2 region2 = {
