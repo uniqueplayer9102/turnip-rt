@@ -2291,8 +2291,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    bool deferred = !profile && debug_get_num_option("RADISH_BATCH_CHUNKS", 1) == 8;
    bool async_requested = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC", false);
    bool small_copies = async_requested && !profile && !device->trace &&
-      debug_get_bool_option("RADISH_GPU_IMAGE_COPY_SMALL", true) &&
-      rd_queue_submit_has_render(submit);
+      debug_get_bool_option("RADISH_GPU_IMAGE_COPY_SMALL", true);
    bool commands_supported = async_requested &&
       rd_async_queue_submit_supported(device, submit, small_copies);
    bool syncs_supported = async_requested && rd_async_syncs_supported(device, submit);

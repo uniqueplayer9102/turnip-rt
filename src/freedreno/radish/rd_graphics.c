@@ -36,6 +36,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(gmem_cull, "RADISH_GMEM_CULL", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_viewport_reuse, "RADISH_GMEM_VIEWPORT_REUSE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_dump, "RADISH_GMEM_DUMP", false)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_stop, "RADISH_GMEM_STOP", -1)
+DEBUG_GET_ONCE_NUM_OPTION(gmem_min_draws, "RADISH_GMEM_MIN_DRAWS", 4)
 DEBUG_GET_ONCE_BOOL_OPTION(descriptor_arena, "RADISH_DESCRIPTOR_ARENA", true)
 
 /* The queue family has VK_QUEUE_GRAPHICS_BIT and graphics pipelines are
@@ -2774,6 +2775,9 @@ rd_execute_render_gmem_supported(struct rd_device *device,
       return false;
    if (!util_dynarray_num_elements(&render->draws, struct rd_draw))
       return false;
+   if (util_dynarray_num_elements(&render->draws, struct rd_draw) <
+       (unsigned)debug_get_option_gmem_min_draws())
+      return false;
    if (!list_is_empty(&device->active_queries))
       return false;
    util_dynarray_foreach(&render->draws, struct rd_draw, d) {
@@ -3056,6 +3060,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    size_t nr_segs = 0;
    bool cull = debug_get_option_gmem_cull();
    bool viewport_reuse = cull && debug_get_option_gmem_viewport_reuse();
+   struct rd_gfx_program_cache program_cache = {0};
    uint64_t candidates = 0, skipped = 0, draw_ibs = 0;
    uint64_t viewport_updates = 0, viewport_reuses = 0, state_waits = 0;
    util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
@@ -3074,7 +3079,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       seg->draw = draw;
       seg->first_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->first_offset = draw_ring->cur - draw_ring->start;
-      rd_gfx_draw(draw_ring, device, render, d, NULL, !viewport_reuse);
+      rd_gfx_draw(draw_ring, device, render, d, cull ? NULL : &program_cache, !viewport_reuse);
       seg->last_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->last_offset = draw_ring->cur - draw_ring->start;
       rd_gmem_draw_bounds(render, d, seg);
@@ -3139,6 +3144,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
 
    bool load = render->color[0].load == VK_ATTACHMENT_LOAD_OP_LOAD;
    bool store = render->color[0].store == VK_ATTACHMENT_STORE_OP_STORE;
+   const struct rd_draw *previous = NULL;
 
    for (uint32_t ty = 0; ty < nbins_y && result == VK_SUCCESS; ty++) {
       for (uint32_t tx = 0; tx < nbins_x; tx++) {
@@ -3186,7 +3192,6 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
          if (cull) {
             int64_t tmaxx = (int64_t)x1 + tw;
             int64_t tmaxy = (int64_t)y1 + th;
-            const struct rd_draw *previous = NULL;
             for (size_t s = 0; s < nr_segs; s++) {
                const struct rd_gmem_draw_seg *seg = &segs[s];
                if (seg->cullable &&
