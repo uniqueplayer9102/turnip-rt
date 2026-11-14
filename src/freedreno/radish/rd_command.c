@@ -316,9 +316,10 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   uint32_t *target = (stages & VK_SHADER_STAGE_COMPUTE_BIT) ?
-      command->push : command->gfx_push;
-   memcpy((uint8_t *)target + offset, values, size);
+   if (stages & VK_SHADER_STAGE_COMPUTE_BIT)
+      memcpy((uint8_t *)command->push + offset, values, size);
+   if (stages & VK_SHADER_STAGE_ALL_GRAPHICS)
+      memcpy((uint8_t *)command->gfx_push + offset, values, size);
 }
 
 static struct rd_dispatch_record *

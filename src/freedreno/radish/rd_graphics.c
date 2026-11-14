@@ -1893,7 +1893,7 @@ rd_gfx_viewport(struct fd_ringbuffer *ring, const VkViewport *vp)
    OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZSCALE_0(vp->maxDepth - vp->minDepth));
 }
 
-static void
+static bool
 rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
             const struct rd_render *render, const struct rd_draw *draw,
             struct rd_gfx_program_cache *program_cache, bool emit_viewport)
@@ -1964,7 +1964,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
                        (int64_t)render->area.offset.y + render->area.extent.height) - 1;
    if (maxx < minx || maxy < miny) {
       /* Empty scissor: nothing to draw. */
-      return;
+      return false;
    }
    OUT_PKT4(ring, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0, 2);
    OUT_RING(ring, A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_X(minx) | A5XX_GRAS_SC_SCREEN_SCISSOR_TL_0_Y(miny));
@@ -2127,6 +2127,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
       OUT_RING(ring, draw->instance_count);
       OUT_RING(ring, draw->vertex_count);
    }
+   return true;
 }
 
 /* Indirect parameters are read on the CPU: commands run in order and each
@@ -2577,7 +2578,8 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       fprintf(stderr, "RADISH_RENDER_QUERY path=%s draws=%u counters=%u allocations=%u\n",
               queries ? "accounting" : "query-free", ndraws, counted, queries ? 3 : 0);
    for (unsigned i = 0; i < ndraws; i++) {
-      const struct rd_draw *draw = util_dynarray_element(&render->draws, struct rd_draw, i);
+      const struct rd_draw *recorded = util_dynarray_element(&render->draws, struct rd_draw, i);
+      const struct rd_draw *draw = recorded;
       struct rd_draw indirect;
       if (draw->indirect) {
          indirect = *draw;
@@ -2627,8 +2629,8 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          memcmp(&previous->viewport, &draw->viewport, sizeof(draw->viewport));
       if (!emit_vp && rd_gmem_draw_needs_idle(previous, draw))
          OUT_WFI5(ring);
-      rd_gfx_draw(ring, device, render, draw, &program_cache, emit_vp);
-      previous = draw;
+      previous = rd_gfx_draw(ring, device, render, draw, &program_cache, emit_vp) ?
+         recorded : NULL;
       if (queries && slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2 + 1) * 16);
    }

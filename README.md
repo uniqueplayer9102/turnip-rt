@@ -89,6 +89,8 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_RENDER_QUERY_DEBUG` | `0` | log per-draw render query counters |
 | `RADISH_RESOURCE_DIAGNOSTICS` | `0` | dump resource/sampler/image descriptor words |
 | `RADISH_PROFILE` | `0` | per-command CPU/submit timing to stderr |
+| `RADISH_GPU_ELAPSED` | unset | `1` + `RADISH_PROFILE=1`: [`rd_gpu_elapsed_prepare`](src/freedreno/radish/rd_queue.c), [`rd_execute_dispatch`](src/freedreno/radish/rd_queue.c) |
+| `RADISH_GPU_ELAPSED_CALIBRATION` | unset | `mad`, `mad-unroll4`, `copy`, `shared-hot`, `packed-a`: [`rd_execute_dispatch`](src/freedreno/radish/rd_queue.c) |
 | `RADISH_TRACE` | unset | path to write a GPU/CPU trace file |
 
 ### Render path
@@ -102,8 +104,8 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_GMEM_DUMP` | `0` | print tile layout and cull/viewport counters per GMEM render |
 | `RADISH_GMEM_STOP` | `-1` | flush and return after a given stage line; bisection helper |
 | `RADISH_GMEM_DISABLE_FILE` | unset | override the bypass marker-file path |
-| `RADISH_GFX_CACHE` | `1` | reuse program/linkage state across consecutive same-pipeline draws |
-| `RADISH_GFX_CACHE_DEBUG` | `0` | log graphics program-cache hits |
+| `RADISH_GFX_CACHE` | `1` | `0`: `cache = VK_NULL_HANDLE` in [`rd_CreateGraphicsPipelines`](src/freedreno/radish/rd_graphics.c); `rd_pipeline_cache_restore` / `rd_pipeline_cache_store` |
+| `RADISH_GFX_CACHE_DEBUG` | `0` | `RADISH_GFX_CACHE stage=… enabled=… hit=…`: [`rd_gfx_compile`](src/freedreno/radish/rd_graphics.c) |
 | `RADISH_QUERY_FREE_RENDER` | `1` | allow the query-free render fast path |
 | `RADISH_NO_COVERAGE_PASS` | `0` | disable the coverage pass used by some query paths |
 
@@ -137,6 +139,7 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_BARRIER_GROUPS` | `0` | barrier workgroup batching override |
 | `RADISH_TILED_BATCH_CHUNKS` | `1` | tiled compute chunks per submit |
 | `RADISH_TILED_GROUPS_X` | `1` | tiled workgroup X factor (`2` enables x2 tiling) |
+| `RADISH_WAVESIZE` | unset (`IR3_SINGLE_ONLY`) | `double`: `IR3_DOUBLE_ONLY`; `any`: `IR3_SINGLE_OR_DOUBLE` ([`rd_real_wavesize`](src/freedreno/radish/rd_pipeline.c)) |
 
 ### Descriptors / sampling / compatibility
 
