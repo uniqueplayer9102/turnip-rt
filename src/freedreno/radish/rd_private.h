@@ -319,6 +319,7 @@ enum rd_command_type {
    RD_CMD_QUERY_RESET, RD_CMD_QUERY_BEGIN, RD_CMD_QUERY_END,
    RD_CMD_QUERY_TIMESTAMP, RD_CMD_QUERY_COPY,
    RD_CMD_RENDER, RD_CMD_BLIT,
+   RD_CMD_BARRIER,
 };
 /* Image operations done as internal renders: one region of vkCmdBlitImage,
  * vkCmdResolveImage or one range of vkCmdClearDepthStencilImage. */

@@ -25,6 +25,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+DEBUG_GET_ONCE_NUM_OPTION(shared_groups, "RADISH_SHARED_GROUPS", 1)
+DEBUG_GET_ONCE_NUM_OPTION(groups, "RADISH_GROUPS", 0)
+DEBUG_GET_ONCE_NUM_OPTION(barrier_groups, "RADISH_BARRIER_GROUPS", 0)
+DEBUG_GET_ONCE_NUM_OPTION(batch_chunks, "RADISH_BATCH_CHUNKS", 1)
+DEBUG_GET_ONCE_NUM_OPTION(tiled_batch_chunks, "RADISH_TILED_BATCH_CHUNKS", 1)
+DEBUG_GET_ONCE_NUM_OPTION(tiled_groups_x, "RADISH_TILED_GROUPS_X", 1)
+
 struct rd_submit_profile {
    uint64_t chunks;
    int64_t total_ns;
@@ -706,11 +713,16 @@ rd_queue_submit_has_render(const struct vk_queue_submit *submit)
    return false;
 }
 
+static bool rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch);
+static VkResult rd_resolve_dispatch(const struct rd_dispatch_record *record,
+                                   struct rd_dispatch *dispatch);
+
 static bool
 rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit *submit,
                                 bool small_copies)
 {
    bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   bool compute_deferred = debug_get_option_batch_chunks() == 8;
    bool supported = true;
    if (vk_queue_submit_has_bind(submit))
       return false;
@@ -719,6 +731,14 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
       struct rd_command_buffer *command = container_of(submit->command_buffers[i],
          struct rd_command_buffer, vk);
       util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
+         if (recorded->type == RD_CMD_BARRIER)
+            continue;
+         if (recorded->type == RD_CMD_DISPATCH && compute_deferred) {
+            struct rd_dispatch execution;
+            if (rd_resolve_dispatch(&recorded->dispatch, &execution) == VK_SUCCESS &&
+                rd_window_pipeline(device, &execution))
+               continue;
+         }
          if (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE &&
              rd_transfer_gpu_supported(recorded->type, &recorded->transfer))
             continue;
@@ -1491,7 +1511,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
       window = NULL;
    }
    uint32_t tile[3], budget = v->has_barrier ? 1 : 64;
-   int64_t shared_groups = debug_get_num_option("RADISH_SHARED_GROUPS", 1);
+   int64_t shared_groups = debug_get_option_shared_groups();
    const bool packed_shared = dispatch->pipeline->packed_1d_barrier &&
       (rd_packed_quant_batch_resources(device, dispatch->pipeline) ||
        rd_packed_attention_batch_resources(device, dispatch->pipeline) ||
@@ -1501,7 +1521,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
        ((uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] <= 32 || packed_shared) &&
        shared_groups >= 1 && shared_groups <= 8)
       budget = shared_groups;
-   bool tiled_x2 = debug_get_num_option("RADISH_TILED_GROUPS_X", 1) == 2 &&
+   bool tiled_x2 = debug_get_option_tiled_groups_x() == 2 &&
       dispatch->grid[0] >= 2 &&
       fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) == 506 &&
       v->local_size[0] == 16 && v->local_size[1] == 8 &&
@@ -1513,8 +1533,8 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
    if (tiled_x2)
       budget = 2;
    /* Experiment knobs: workgroups per CP_EXEC_CS chunk. */
-   const int64_t barrier_groups = debug_get_num_option("RADISH_BARRIER_GROUPS", 0);
-   const int64_t plain_groups = debug_get_num_option("RADISH_GROUPS", 0);
+   const int64_t barrier_groups = debug_get_option_barrier_groups();
+   const int64_t plain_groups = debug_get_option_groups();
    if (v->has_barrier && barrier_groups >= 1 && barrier_groups <= 65535)
       budget = barrier_groups;
    if (!v->has_barrier && plain_groups >= 1 && plain_groups <= 65535)
@@ -1525,7 +1545,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
       tile[i] = MIN2(budget, dispatch->grid[i]);
       budget /= tile[i];
    }
-   int64_t requested_chunks = debug_get_num_option("RADISH_BATCH_CHUNKS", 1);
+   int64_t requested_chunks = debug_get_option_batch_chunks();
    unsigned max_chunks = 1;
    if (!v->loops && !v->has_barrier &&
        (v->instrlen <= 32 || rd_short_buffer_batch_resources(device, dispatch->pipeline) ||
@@ -1538,7 +1558,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
         rd_packed_rms_batch_resources(device, dispatch->pipeline) ||
         rd_local_two_buffer_batch_resources(device, dispatch->pipeline)))
       max_chunks = requested_chunks;
-   int64_t tiled_chunks = debug_get_num_option("RADISH_TILED_BATCH_CHUNKS", 1);
+   int64_t tiled_chunks = debug_get_option_tiled_batch_chunks();
    if ((tiled_chunks == 2 || tiled_chunks == 4 || tiled_chunks == 8) &&
        fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) == 506 &&
        v->local_size[0] == 16 && v->local_size[1] == 8 &&
@@ -2059,6 +2079,85 @@ rd_emit_gpu_fill(struct rd_device *device, struct fd_ringbuffer *ring,
    return VK_SUCCESS;
 }
 
+static unsigned
+rd_transfer_batch_count(const struct rd_command *first, const struct rd_command *end)
+{
+   struct fd_bo *bos[8];
+   unsigned count = 0, bo_count = 0, dwords = 0;
+   for (const struct rd_command *command = first; command < end && count < 8; command++) {
+      const struct rd_transfer *transfer = &command->transfer;
+      if (command->type < RD_CMD_COPY || command->type > RD_CMD_UPDATE ||
+          !rd_transfer_gpu_supported(command->type, transfer) || !transfer->size ||
+          (command->type != RD_CMD_UPDATE && transfer->size >= 16384))
+         break;
+      uint64_t words = command->type == RD_CMD_COPY ? transfer->size / 4 * 6 :
+                                                     transfer->size / 4 + 4;
+      words += 32;
+      if (words > 6000 - dwords)
+         break;
+      struct fd_bo *used[] = {transfer->dst->memory->bo,
+         command->type == RD_CMD_COPY ? transfer->src->memory->bo : NULL};
+      for (unsigned i = 0; i < ARRAY_SIZE(used); i++) {
+         bool found = !used[i];
+         for (unsigned j = 0; j < bo_count; j++)
+            found |= bos[j] == used[i];
+         if (found)
+            continue;
+         if (bo_count == ARRAY_SIZE(bos))
+            return count;
+         bos[bo_count++] = used[i];
+      }
+      dwords += words;
+      count++;
+   }
+   return count;
+}
+
+static VkResult
+rd_execute_transfer_batch(struct rd_device *device, const struct rd_command *commands,
+                          unsigned count, struct rd_submit_window *window)
+{
+   assert(count > 1 && count <= 8);
+   struct fd_submit *submit = fd_submit_new(device->pipe);
+   if (!submit)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0,
+      FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+   if (!ring) {
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   uint32_t *initial_ring_start = ring->start;
+   uint64_t bytes = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const struct rd_command *command = &commands[i];
+      const struct rd_transfer *transfer = &command->transfer;
+      VkDeviceSize dst_offset = transfer->dst->offset + transfer->dst_offset;
+      if (command->type == RD_CMD_COPY) {
+         VkDeviceSize src_offset = transfer->src->offset + transfer->src_offset;
+         for (uint32_t j = 0; j < transfer->size; j += 4) {
+            OUT_PKT7(ring, CP_MEM_TO_MEM, 5);
+            OUT_RING(ring, 0);
+            OUT_RELOC(ring, transfer->dst->memory->bo, dst_offset + j, 0, 0);
+            OUT_RELOC(ring, transfer->src->memory->bo, src_offset + j, 0, 0);
+         }
+      } else {
+         OUT_PKT7(ring, CP_MEM_WRITE, 2 + transfer->size / 4);
+         OUT_RELOC(ring, transfer->dst->memory->bo, dst_offset, 0, 0);
+         for (uint32_t j = 0; j < transfer->size; j += 4)
+            OUT_RING(ring, command->type == RD_CMD_FILL ? transfer->value :
+               ((const uint32_t *)transfer->data)[j / 4]);
+      }
+      OUT_PKT7(ring, CP_WAIT_MEM_WRITES, 0);
+      rd_flush(device, ring);
+      bytes += transfer->size;
+   }
+   if (debug_get_bool_option("RADISH_GPU_BUFFER_TRANSFER_DEBUG", false))
+      fprintf(stderr, "RADISH_BUFFER_TRANSFER_BATCH commands=%u bytes=%" PRIu64 "\n", count, bytes);
+   return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
+                                    initial_ring_start, count, false);
+}
+
 static bool
 rd_transfer_compute_supported(struct rd_device *device, enum rd_command_type type,
                                const struct rd_transfer *transfer)
@@ -2290,7 +2389,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    struct rd_device *device = container_of(queue->base.device, struct rd_device, vk);
    bool profile = debug_get_bool_option("RADISH_PROFILE", false);
    struct rd_submit_window *window = &device->submit_window;
-   bool deferred = !profile && debug_get_num_option("RADISH_BATCH_CHUNKS", 1) == 8;
+   bool deferred = !profile && debug_get_option_batch_chunks() == 8;
    bool async_requested = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC", false);
    bool small_copies = async_requested && !profile && !device->trace &&
       debug_get_bool_option("RADISH_GPU_IMAGE_COPY_SMALL", true);
@@ -2367,7 +2466,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             can_defer = deferred && !recorded->dispatch.indirect &&
                         rd_window_pipeline(device, dispatch);
          if (!can_defer) {
-            result = rd_window_drain(device, window, "cpu");
+            result = rd_window_drain(device, window,
+               recorded->type == RD_CMD_BARRIER ? "barrier" : "cpu");
             if (result != VK_SUCCESS)
                return rd_queue_fail(queue);
          }
@@ -2395,9 +2495,19 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
                                                 recorded->type == RD_CMD_IMAGE_CLEAR,
                                                 can_defer ? window : NULL);
          } else if (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) {
-            result = rd_execute_transfer(device, recorded->type, &recorded->transfer,
-                                         profile ? &submit_profile : NULL,
-                                         can_defer ? window : NULL);
+            unsigned count = deferred && !device->trace ?
+               rd_transfer_batch_count(recorded, util_dynarray_end(&command->commands)) : 0;
+            if (count > 1) {
+               result = rd_execute_transfer_batch(device, recorded, count, window);
+               recorded += count - 1;
+            } else {
+               result = rd_execute_transfer(device, recorded->type, &recorded->transfer,
+                                            profile ? &submit_profile : NULL,
+                                            can_defer ? window : NULL);
+            }
+         } else if (recorded->type == RD_CMD_BARRIER) {
+            __sync_synchronize();
+            result = VK_SUCCESS;
          } else if (recorded->type >= RD_CMD_EVENT_SET && recorded->type <= RD_CMD_EVENT_WAIT) {
             result = rd_execute_event(device, recorded->type, &recorded->event);
          } else if (recorded->type >= RD_CMD_QUERY_RESET && recorded->type <= RD_CMD_QUERY_COPY) {
