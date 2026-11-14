@@ -1965,13 +1965,15 @@ rd_execute_gpu_image_copy(struct rd_device *device, const struct rd_image_transf
 }
 
 static unsigned
-rd_image_copy_batch_count(const struct rd_command *first, const struct rd_command *end)
+rd_image_copy_batch_count(struct rd_device *device, const struct rd_command *first,
+                          const struct rd_command *end)
 {
    unsigned limit = CLAMP(debug_get_num_option("RADISH_GPU_IMAGE_COPY_BATCH", 8), 1, 8);
    struct fd_bo *bos[8];
    unsigned count = 0, bo_count = 0;
    for (const struct rd_command *command = first; command < end && count < limit; command++) {
-      if (command->type != RD_CMD_IMAGE_COPY)
+      if (command->type != RD_CMD_IMAGE_COPY ||
+          !rd_image_copy_gpu_supported(device, &command->image_transfer, true))
          break;
       const struct rd_image_transfer *copy = &command->image_transfer;
       struct fd_bo *used[] = { copy->src_buffer->memory->bo, copy->dst_image->memory->bo };
@@ -2383,8 +2385,9 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
                rd_query_account_dispatch(device, dispatch);
             if (execution.sampling_addresses)
                fd_bo_del(execution.sampling_addresses);
-         } else if (small_copies && recorded->type == RD_CMD_IMAGE_COPY) {
-            unsigned count = rd_image_copy_batch_count(recorded, util_dynarray_end(&command->commands));
+         } else if (small_copies && can_defer && recorded->type == RD_CMD_IMAGE_COPY) {
+            unsigned count = rd_image_copy_batch_count(device, recorded,
+                                                       util_dynarray_end(&command->commands));
             result = rd_execute_gpu_image_copy_batch(device, recorded, count, window);
             recorded += count - 1;
          } else if (recorded->type == RD_CMD_IMAGE_COPY || recorded->type == RD_CMD_IMAGE_CLEAR) {
