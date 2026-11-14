@@ -3086,7 +3086,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       seg->draw = draw;
       seg->first_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->first_offset = draw_ring->cur - draw_ring->start;
-      rd_gfx_draw(draw_ring, device, render, d, cull ? NULL : &program_cache, !viewport_reuse);
+      rd_gfx_draw(draw_ring, device, render, d, &program_cache, !viewport_reuse);
       seg->last_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->last_offset = draw_ring->cur - draw_ring->start;
       rd_gmem_draw_bounds(render, d, seg);
