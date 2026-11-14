@@ -1520,6 +1520,26 @@ rd_CmdCopyImage(VkCommandBuffer handle, VkImage src_handle, VkImageLayout src_la
    }
 }
 
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdCopyImage2(VkCommandBuffer handle, const VkCopyImageInfo2 *info)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageCopy2 *region = &info->pRegions[i];
+      VkImageCopy copy = {
+         .srcSubresource = region->srcSubresource,
+         .srcOffset = region->srcOffset,
+         .dstSubresource = region->dstSubresource,
+         .dstOffset = region->dstOffset,
+         .extent = region->extent,
+      };
+      rd_CmdCopyImage(handle, info->srcImage, info->srcImageLayout,
+                      info->dstImage, info->dstImageLayout, 1, &copy);
+      if (command->vk.record_result != VK_SUCCESS)
+         return;
+   }
+}
+
 static void
 rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buffer,
                        struct rd_image *image, VkImageLayout layout, bool to_image,
@@ -1630,6 +1650,48 @@ rd_CmdCopyImageToBuffer(VkCommandBuffer handle, VkImage src, VkImageLayout layou
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    rd_record_buffer_image(command, rd_buffer_from_handle(dst), rd_image_from_handle(src), layout, false, count, regions);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdCopyBufferToImage2(VkCommandBuffer handle, const VkCopyBufferToImageInfo2 *info)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkBufferImageCopy2 *region = &info->pRegions[i];
+      VkBufferImageCopy copy = {
+         .bufferOffset = region->bufferOffset,
+         .bufferRowLength = region->bufferRowLength,
+         .bufferImageHeight = region->bufferImageHeight,
+         .imageSubresource = region->imageSubresource,
+         .imageOffset = region->imageOffset,
+         .imageExtent = region->imageExtent,
+      };
+      rd_CmdCopyBufferToImage(handle, info->srcBuffer, info->dstImage,
+                              info->dstImageLayout, 1, &copy);
+      if (command->vk.record_result != VK_SUCCESS)
+         return;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdCopyImageToBuffer2(VkCommandBuffer handle, const VkCopyImageToBufferInfo2 *info)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkBufferImageCopy2 *region = &info->pRegions[i];
+      VkBufferImageCopy copy = {
+         .bufferOffset = region->bufferOffset,
+         .bufferRowLength = region->bufferRowLength,
+         .bufferImageHeight = region->bufferImageHeight,
+         .imageSubresource = region->imageSubresource,
+         .imageOffset = region->imageOffset,
+         .imageExtent = region->imageExtent,
+      };
+      rd_CmdCopyImageToBuffer(handle, info->srcImage, info->srcImageLayout,
+                              info->dstBuffer, 1, &copy);
+      if (command->vk.record_result != VK_SUCCESS)
+         return;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

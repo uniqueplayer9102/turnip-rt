@@ -33,6 +33,23 @@ rd_CmdCopyBuffer(VkCommandBuffer handle, VkBuffer src_handle, VkBuffer dst_handl
 }
 
 VKAPI_ATTR void VKAPI_CALL
+rd_CmdCopyBuffer2(VkCommandBuffer handle, const VkCopyBufferInfo2 *info)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkBufferCopy2 *region = &info->pRegions[i];
+      VkBufferCopy copy = {
+         .srcOffset = region->srcOffset,
+         .dstOffset = region->dstOffset,
+         .size = region->size,
+      };
+      rd_CmdCopyBuffer(handle, info->srcBuffer, info->dstBuffer, 1, &copy);
+      if (command->vk.record_result != VK_SUCCESS)
+         return;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
 rd_CmdFillBuffer(VkCommandBuffer handle, VkBuffer dst_handle, VkDeviceSize offset,
                   VkDeviceSize size, uint32_t value)
 {

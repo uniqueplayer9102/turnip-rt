@@ -189,6 +189,7 @@ EXT_physical_device_drm           KHR_storage_buffer_storage_class
 KHR_16bit_storage                 KHR_8bit_storage
 KHR_shader_float16_int8           KHR_relaxed_block_layout
 KHR_sampler_mirror_clamp_to_edge  EXT_host_query_reset
+KHR_copy_commands2
 ```
 
 `KHR_external_semaphore[_fd]` is only advertised when the render node supports

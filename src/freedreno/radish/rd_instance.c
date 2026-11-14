@@ -102,6 +102,7 @@ static const struct vk_device_extension_table rd_device_extensions = {
    .EXT_external_memory_dma_buf = true,
    .EXT_queue_family_foreign = true,
    .KHR_synchronization2 = true,
+   .KHR_copy_commands2 = true,
    .KHR_image_format_list = true,
    .EXT_image_drm_format_modifier = true,
    .KHR_storage_buffer_storage_class = true,
