@@ -3068,6 +3068,8 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    bool cull = debug_get_option_gmem_cull();
    bool viewport_reuse = cull && debug_get_option_gmem_viewport_reuse();
    struct rd_gfx_program_cache program_cache = {0};
+   const struct rd_gfx_pipeline *seen_pipelines[16];
+   unsigned seen_count = 0;
    uint64_t candidates = 0, skipped = 0, draw_ibs = 0;
    uint64_t viewport_updates = 0, viewport_reuses = 0, state_waits = 0;
    util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
@@ -3086,10 +3088,19 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       seg->draw = draw;
       seg->first_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->first_offset = draw_ring->cur - draw_ring->start;
-      rd_gfx_draw(draw_ring, device, render, d, cull ? NULL : &program_cache, !viewport_reuse);
+      rd_gfx_draw(draw_ring, device, render, d, &program_cache, !viewport_reuse);
       seg->last_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->last_offset = draw_ring->cur - draw_ring->start;
       rd_gmem_draw_bounds(render, d, seg);
+      const struct rd_gfx_pipeline *gfx = d->pipeline->gfx;
+      bool first_use = true;
+      for (unsigned j = 0; j < seen_count; j++)
+         if (seen_pipelines[j] == gfx) { first_use = false; break; }
+      if (first_use) {
+         seg->cullable = false;
+         if (seen_count < ARRAY_SIZE(seen_pipelines))
+            seen_pipelines[seen_count++] = gfx;
+      }
       nr_segs++;
    }
    if (result != VK_SUCCESS) {
