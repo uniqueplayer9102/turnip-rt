@@ -461,19 +461,20 @@ VKAPI_ATTR void VKAPI_CALL
 rd_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
-      if (!rd_image_barrier_valid(&info->pImageMemoryBarriers[i])) {
-         if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
+   if (info->imageMemoryBarrierCount &&
+       debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
+      for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+         if (!rd_image_barrier_valid(&info->pImageMemoryBarriers[i])) {
             const VkImageMemoryBarrier2 *bar = &info->pImageMemoryBarriers[i];
             const struct rd_image *img = rd_image_from_handle(bar->image);
-            fprintf(stderr, "radish: barrier refused: aspects %x/%x levels %u+%u/%u layers %u+%u/%u type %d\n",
+            fprintf(stderr, "radish: barrier range invalid (synchronization retained): aspects %x/%x levels %u+%u/%u layers %u+%u/%u type %d\n",
                     bar->subresourceRange.aspectMask, img ? vk_format_aspects(img->vk.format) : 0,
                     bar->subresourceRange.baseMipLevel, bar->subresourceRange.levelCount,
                     img ? img->vk.mip_levels : 0, bar->subresourceRange.baseArrayLayer,
                     bar->subresourceRange.layerCount, img ? img->vk.array_layers : 0,
-                    img ? img->vk.image_type : -1);
+                    img ? (int)img->vk.image_type : -1);
          }
-       }
+      }
    }
    /* inside a render pass (a subpass self-dependency): the next draw waits
     * for the attachment writes before it and reads them through textures */
