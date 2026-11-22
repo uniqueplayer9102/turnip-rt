@@ -114,6 +114,55 @@ fd_submit_append_bo(struct fd_submit_sp *submit, struct fd_bo *bo)
    return check_append_bo(submit, bo, false);
 }
 
+uint32_t
+fd_submit_sp_bo_access(const struct fd_submit_sp *submit, struct fd_bo *bo)
+{
+   if (suballoc_bo(bo))
+      bo = fd_bo_heap_block(bo);
+   struct hash_entry *entry = submit->bo_access ?
+      _mesa_hash_table_search(submit->bo_access, bo) : NULL;
+   uint32_t access = entry ? (uint32_t)(uintptr_t)entry->data : FD_RELOC_FLAGS_INIT;
+   return (bo->reloc_flags & ~(FD_RELOC_READ | FD_RELOC_WRITE)) | access;
+}
+
+void
+fd_submit_set_bo_access(struct fd_submit *base, struct fd_bo *bo, uint32_t access)
+{
+   struct fd_submit_sp *submit = to_fd_submit_sp(base);
+   if (submit->bo_access_failed)
+      return;
+   if (suballoc_bo(bo))
+      bo = fd_bo_heap_block(bo);
+   access &= FD_RELOC_READ | FD_RELOC_WRITE;
+   if (!access)
+      return;
+   if (!submit->bo_access)
+      submit->bo_access = _mesa_pointer_hash_table_create(NULL);
+   if (!submit->bo_access)
+      goto fail;
+   struct hash_entry *entry = _mesa_hash_table_search(submit->bo_access, bo);
+   if (entry)
+      access |= (uint32_t)(uintptr_t)entry->data;
+   if (!_mesa_hash_table_insert(submit->bo_access, bo, (void *)(uintptr_t)access))
+      goto fail;
+   return;
+fail:
+   _mesa_hash_table_destroy(submit->bo_access, NULL);
+   submit->bo_access = NULL;
+   submit->bo_access_failed = true;
+}
+
+uint32_t
+fd_submit_sp_append_bo_access(struct fd_submit_sp *submit, struct fd_bo *bo, uint32_t access)
+{
+   unsigned count = submit->nr_bos;
+   uint32_t index = fd_submit_append_bo(submit, bo);
+   if (index < count)
+      access |= fd_submit_sp_bo_access(submit, bo);
+   fd_submit_set_bo_access(&submit->base, bo, access);
+   return index;
+}
+
 static void
 fd_submit_suballoc_ring_bo(struct fd_submit *submit,
                            struct fd_ringbuffer_sp *fd_ring, uint32_t size)
@@ -436,6 +485,7 @@ fd_submit_sp_destroy(struct fd_submit *submit)
 
    _mesa_hash_table_destroy(fd_submit->bo_table, NULL);
    _mesa_hash_table_destroy(fd_submit->suballoc_bo_table, NULL);
+   _mesa_hash_table_destroy(fd_submit->bo_access, NULL);
 
    // TODO it would be nice to have a way to assert() if all
    // rb's haven't been free'd back to the slab, because that is

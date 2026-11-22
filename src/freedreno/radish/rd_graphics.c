@@ -35,6 +35,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(gmem, "RADISH_GMEM", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_cull, "RADISH_GMEM_CULL", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_viewport_reuse, "RADISH_GMEM_VIEWPORT_REUSE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_dump, "RADISH_GMEM_DUMP", false)
+DEBUG_GET_ONCE_BOOL_OPTION(async_depth_stencil, "RADISH_ASYNC_DEPTH_STENCIL", false)
+DEBUG_GET_ONCE_BOOL_OPTION(readonly_bo_tracking, "RADISH_READONLY_BO_TRACKING", false)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_stop, "RADISH_GMEM_STOP", -1)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_min_draws, "RADISH_GMEM_MIN_DRAWS", 4)
 DEBUG_GET_ONCE_BOOL_OPTION(descriptor_arena, "RADISH_DESCRIPTOR_ARENA", true)
@@ -2299,8 +2301,71 @@ rd_create_sample_counters(struct rd_device *device, unsigned count,
 }
 
 static VkResult rd_render_resolves(struct rd_device *device, const struct rd_render *render);
-static VkResult rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render);
+static VkResult rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render,
+                                         struct rd_submit_window *window);
 static bool rd_gmem_draw_needs_idle(const struct rd_draw *previous, const struct rd_draw *draw);
+
+static void
+rd_submit_classify_render(struct rd_device *device, struct fd_submit *submit,
+                           const struct rd_render *render, struct fd_bo *counters)
+{
+   if (!debug_get_option_readonly_bo_tracking() ||
+       fd_device_version(device->fd) < FD_VERSION_SOFTPIN)
+      return;
+   util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+      const struct rd_gfx_shader *shaders[] = {&draw->pipeline->gfx->vs, &draw->pipeline->gfx->fs};
+      for (unsigned stage = 0; stage < ARRAY_SIZE(shaders); stage++) {
+         const struct rd_pipeline *resources = shaders[stage]->res;
+         fd_submit_set_bo_access(submit, shaders[stage]->bo, FD_RELOC_READ);
+         if (resources->private_bo)
+            fd_submit_set_bo_access(submit, resources->private_bo, FD_RELOC_FLAGS_INIT);
+         for (unsigned i = 0; i < resources->resource_count; i++) {
+            if (!(resources->used_descriptors & (UINT64_C(1) << i)))
+               continue;
+            const struct rd_descriptor *descriptor = &draw->descriptors[stage][i];
+            struct fd_bo *bo = NULL;
+            if (descriptor->image_view) {
+               struct rd_image *image = container_of(descriptor->image_view->vk.image, struct rd_image, vk);
+               bo = image->memory ? image->memory->bo : NULL;
+            } else if (descriptor->buffer) {
+               bo = descriptor->buffer->memory ? descriptor->buffer->memory->bo : NULL;
+            } else if (descriptor->buffer_view) {
+               struct rd_buffer *buffer = container_of(descriptor->buffer_view->vk.buffer, struct rd_buffer, vk);
+               bo = buffer->memory ? buffer->memory->bo : NULL;
+            }
+            if (!bo)
+               continue;
+            uint32_t access = descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+               descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+               descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
+               descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ?
+               FD_RELOC_FLAGS_INIT : FD_RELOC_READ;
+            fd_submit_set_bo_access(submit, bo, access);
+         }
+      }
+   }
+   for (unsigned i = 0; i < render->color_count; i++) {
+      const struct rd_image_view *views[] = {render->color[i].view, render->color[i].resolve};
+      for (unsigned j = 0; j < ARRAY_SIZE(views); j++) {
+         if (!views[j])
+            continue;
+         struct rd_image *image = container_of(views[j]->vk.image, struct rd_image, vk);
+         if (image->memory)
+            fd_submit_set_bo_access(submit, image->memory->bo, FD_RELOC_FLAGS_INIT);
+      }
+   }
+   const struct rd_image_view *views[] = {render->depth.view, render->stencil.view};
+   for (unsigned i = 0; i < ARRAY_SIZE(views); i++) {
+      if (!views[i])
+         continue;
+      struct rd_image *image = container_of(views[i]->vk.image, struct rd_image, vk);
+      if (image->memory)
+         fd_submit_set_bo_access(submit, image->memory->bo, FD_RELOC_FLAGS_INIT);
+   }
+   fd_submit_set_bo_access(submit, device->control, FD_RELOC_FLAGS_INIT);
+   if (counters)
+      fd_submit_set_bo_access(submit, counters, FD_RELOC_FLAGS_INIT);
+}
 
 static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
@@ -2317,7 +2382,7 @@ rd_execute_render_view(struct rd_device *device, const struct rd_render *render,
                        struct rd_submit_window *window)
 {
    if (render->depth.view || render->stencil.view)
-      return rd_execute_render_tiled_ds(device, render);
+      return rd_execute_render_tiled_ds(device, render, window);
    if (rd_execute_render_gmem_supported(device, render))
       return rd_execute_render_gmem(device, render, window);
    return rd_execute_render_direct(device, render, window);
@@ -2649,6 +2714,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
    rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
    rd_flush(device, ring);
+   rd_submit_classify_render(device, submit, render, counters);
    result = counted ?
       rd_finish_submit(device, submit, ring, NULL, NULL) :
       rd_finish_window_submit(device, submit, ring, window, initial_ring_start, true);
@@ -3267,6 +3333,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       OUT_RING(ring, 0);
       OUT_RING(ring, 0);
       rd_flush(device, ring);
+      rd_submit_classify_render(device, submit, render, NULL);
       result = rd_finish_window_submit(device, submit, ring, window,
                                        initial_ring_start, true);
       if (result == VK_SUCCESS)
@@ -4135,8 +4202,8 @@ rd_copy_texel_fs(struct rd_device *device, unsigned variant)
 
 static VkResult
 rd_copy_texels(struct rd_device *device, struct rd_image *src, uint32_t src_level, uint32_t src_layer,
-               struct rd_image *dst, uint32_t dst_level, uint32_t dst_layer, VkRect2D area,
-               uint32_t write_mask)
+                struct rd_image *dst, uint32_t dst_level, uint32_t dst_layer, VkRect2D area,
+                uint32_t write_mask, struct rd_submit_window *window)
 {
    struct rd_pipeline *pipeline = rd_meta_pipeline(device, &device->copy_texel_pipeline,
       rd_copy_texel_fs, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
@@ -4164,14 +4231,17 @@ rd_copy_texels(struct rd_device *device, struct rd_image *src, uint32_t src_leve
    memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
    draw.descriptors[1] = &descriptor;
    util_dynarray_append(&render.draws, draw);
-   VkResult result = rd_execute_render_direct(device, &render, NULL);
+   VkResult result = rd_execute_render_direct(device, &render, window);
    util_dynarray_fini(&render.draws);
    return result;
 }
 
 static VkResult
-rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render)
+rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render,
+                           struct rd_submit_window *window)
 {
+   if (!debug_get_option_async_depth_stencil())
+      window = NULL;
    const struct rd_image_view *view = render->depth.view ? render->depth.view : render->stencil.view;
    struct rd_image *image = container_of(view->vk.image, struct rd_image, vk);
    if (!image->memory)
@@ -4212,7 +4282,7 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
    rd_ds_alias(&tiled_alias, &scratch.image, copy_format);
    VkResult result = VK_SUCCESS;
    if (load && area.extent.width && area.extent.height)
-      result = rd_copy_texels(device, &linear_alias, level, layer, &tiled_alias, 0, 0, area, 0xf);
+      result = rd_copy_texels(device, &linear_alias, level, layer, &tiled_alias, 0, 0, area, 0xf, window);
    if (result == VK_SUCCESS) {
       struct rd_image_view tiled_view;
       rd_internal_view(&tiled_view, &scratch.image, VK_IMAGE_VIEW_TYPE_2D, view->vk.aspects, 0, 0);
@@ -4259,19 +4329,19 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
             for (unsigned i = 0; i < segment.color_count; i++)
                segment.color[i].resolve = NULL;
          }
-         result = rd_execute_render_direct(device, &segment, NULL);
+         result = rd_execute_render_direct(device, &segment, window);
          util_dynarray_fini(&queries);
          if (result == VK_SUCCESS && !last && area.extent.width && area.extent.height)
             result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area,
-                                    has_depth && has_stencil && image->vk.samples == VK_SAMPLE_COUNT_1_BIT ?
-                                    (depth ? 0x7 : 0) | (stencil ? 0x8 : 0) : 0xf);
+                                     has_depth && has_stencil && image->vk.samples == VK_SAMPLE_COUNT_1_BIT ?
+                                     (depth ? 0x7 : 0) | (stencil ? 0x8 : 0) : 0xf, window);
          if (last)
             break;
          start = end;
       }
    }
    if (result == VK_SUCCESS && store_mask && area.extent.width && area.extent.height)
-      result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area, store_mask);
+      result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area, store_mask, window);
    fd_bo_del(scratch.memory.bo);
    return result;
 }

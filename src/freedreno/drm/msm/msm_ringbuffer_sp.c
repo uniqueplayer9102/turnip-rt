@@ -54,7 +54,9 @@ flush_submit_list(struct list_head *submit_list)
       for (unsigned i = 0; i < deferred_primary->u.nr_cmds; i++) {
          struct fd_bo *ring_bo = deferred_primary->u.cmds[i].ring_bo;
          cmds[cmd_idx].type = MSM_SUBMIT_CMD_BUF;
-         cmds[cmd_idx].submit_idx = fd_submit_append_bo(fd_submit, ring_bo);
+         cmds[cmd_idx].submit_idx = fd_submit->bo_access || to_fd_submit_sp(submit)->bo_access ?
+            fd_submit_sp_append_bo_access(fd_submit, ring_bo, FD_RELOC_FLAGS_INIT) :
+            fd_submit_append_bo(fd_submit, ring_bo);
          cmds[cmd_idx].submit_offset = submit_offset(ring_bo, deferred_primary->offset);
          cmds[cmd_idx].size = deferred_primary->u.cmds[i].size;
          cmds[cmd_idx].pad = 0;
@@ -77,7 +79,12 @@ flush_submit_list(struct list_head *submit_list)
           * submit being merged, we expect to hit the fast-path as we add it
           * to the current submit:
           */
-         fd_submit_append_bo(fd_submit, fd_deferred_submit->bos[i]);
+         struct fd_bo *bo = fd_deferred_submit->bos[i];
+         if (fd_submit->bo_access || fd_deferred_submit->bo_access)
+            fd_submit_sp_append_bo_access(fd_submit, bo,
+                                          fd_submit_sp_bo_access(fd_deferred_submit, bo));
+         else
+            fd_submit_append_bo(fd_submit, bo);
       }
 
       /* Now that the cmds/bos have been transfered over to the current submit,
@@ -117,7 +124,7 @@ flush_submit_list(struct list_head *submit_list)
    }
 
    for (unsigned i = 0; i < fd_submit->nr_bos; i++) {
-      submit_bos[i].flags = fd_submit->bos[i]->reloc_flags;
+      submit_bos[i].flags = fd_submit_sp_bo_access(fd_submit, fd_submit->bos[i]);
       submit_bos[i].handle = fd_submit->bos[i]->handle;
       submit_bos[i].presumed = 0;
    }

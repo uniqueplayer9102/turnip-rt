@@ -44,6 +44,8 @@ struct fd_submit_sp {
 
    /* maps fd_bo to idx in suballoc_bos table: */
    struct hash_table *suballoc_bo_table;
+   struct hash_table *bo_access;
+   bool bo_access_failed;
 
    struct slab_child_pool ring_pool;
 
@@ -121,6 +123,9 @@ FD_DEFINE_CAST(fd_ringbuffer, fd_ringbuffer_sp);
 
 void fd_pipe_sp_flush(struct fd_pipe *pipe, uint32_t fence);
 uint32_t fd_submit_append_bo(struct fd_submit_sp *submit, struct fd_bo *bo);
+uint32_t fd_submit_sp_bo_access(const struct fd_submit_sp *submit, struct fd_bo *bo);
+uint32_t fd_submit_sp_append_bo_access(struct fd_submit_sp *submit, struct fd_bo *bo,
+                                      uint32_t access);
 struct fd_submit *fd_submit_sp_new(struct fd_pipe *pipe,
                                    flush_submit_list_fn flush_submit_list);
 void fd_pipe_sp_ringpool_init(struct fd_pipe *pipe);

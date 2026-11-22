@@ -17,7 +17,7 @@ struct fd_pipe *
 fd_pipe_new2(struct fd_device *dev, enum fd_pipe_id id, uint32_t prio)
 {
    struct fd_pipe *pipe;
-   uint64_t val;
+   uint64_t val = 0;
 
    if (id > FD_PIPE_MAX) {
       ERROR_MSG("invalid pipe id: %d", id);
@@ -42,6 +42,7 @@ fd_pipe_new2(struct fd_device *dev, enum fd_pipe_id id, uint32_t prio)
    fd_pipe_get_param(pipe, FD_GPU_ID, &val);
    pipe->dev_id.gpu_id = val;
 
+   val = 0;
    fd_pipe_get_param(pipe, FD_CHIP_ID, &val);
    pipe->dev_id.chip_id = val;
 
@@ -49,7 +50,7 @@ fd_pipe_new2(struct fd_device *dev, enum fd_pipe_id id, uint32_t prio)
       ERROR_MSG("unsupported GPU id 0x%" PRIx32 " / chip id 0x%" PRIx64,
                 pipe->dev_id.gpu_id,
                 pipe->dev_id.chip_id);
-      return NULL;
+      goto fail;
    }
 
    pipe->gen = fd_dev_gen(&pipe->dev_id);
@@ -63,7 +64,11 @@ fd_pipe_new2(struct fd_device *dev, enum fd_pipe_id id, uint32_t prio)
    pipe->control_mem = fd_bo_new(dev, sizeof(*pipe->control),
                                  FD_BO_CACHED_COHERENT | _FD_BO_NOSYNC,
                                  "pipe-control");
+   if (!pipe->control_mem)
+      goto fail;
    pipe->control = fd_bo_map(pipe->control_mem);
+   if (!pipe->control)
+      goto fail;
 
    /* We could be getting a bo from the bo-cache, make sure the fence value
     * is not garbage:
@@ -72,6 +77,11 @@ fd_pipe_new2(struct fd_device *dev, enum fd_pipe_id id, uint32_t prio)
    pipe->control_mem->bo_reuse = NO_CACHE;
 
    return pipe;
+fail:
+   if (pipe->control_mem)
+      fd_bo_del(pipe->control_mem);
+   pipe->funcs->destroy(pipe);
+   return NULL;
 }
 
 struct fd_pipe *

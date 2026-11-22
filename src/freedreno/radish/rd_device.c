@@ -117,7 +117,9 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    device->queue_priority =
       info->pQueueCreateInfos[0].pQueuePriorities[0] >= 0.5f;
    device->fd = fd_device_ref(physical->fd);
-   device->pipe = fd_pipe_new(device->fd, FD_PIPE_3D);
+   uint32_t priority = fd_device_version(device->fd) >= FD_VERSION_SUBMIT_QUEUES ?
+      1 - device->queue_priority : 1;
+   device->pipe = fd_pipe_new2(device->fd, FD_PIPE_3D, priority);
    if (!device->pipe) {
       result = VK_ERROR_INITIALIZATION_FAILED;
       goto fail;

@@ -82,7 +82,8 @@ struct fd_ringbuffer *fd_submit_new_ringbuffer(struct fd_submit *submit,
  * if use_fence_fd is true the output fence will be dma_fence fd backed
  */
 struct fd_fence *fd_submit_flush(struct fd_submit *submit, int in_fence_fd,
-                                 bool use_fence_fd);
+                                  bool use_fence_fd);
+void fd_submit_set_bo_access(struct fd_submit *submit, struct fd_bo *bo, uint32_t access);
 
 struct fd_ringbuffer;
 struct fd_reloc;

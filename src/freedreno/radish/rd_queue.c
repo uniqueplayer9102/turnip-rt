@@ -33,6 +33,7 @@ DEBUG_GET_ONCE_NUM_OPTION(tiled_batch_chunks, "RADISH_TILED_BATCH_CHUNKS", 1)
 DEBUG_GET_ONCE_NUM_OPTION(tiled_groups_x, "RADISH_TILED_GROUPS_X", 1)
 DEBUG_GET_ONCE_BOOL_OPTION(window_wait_oldest, "RADISH_WINDOW_WAIT_OLDEST", true)
 DEBUG_GET_ONCE_BOOL_OPTION(async_render_fence, "RADISH_ASYNC_RENDER_FENCE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(submit_timing, "RADISH_SUBMIT_TIMING", false)
 
 struct rd_submit_profile {
    uint64_t chunks;
@@ -1074,7 +1075,9 @@ rd_window_footprint_render(struct fd_submit *submit, struct fd_ringbuffer *ring,
       (sp->max_bos + sp->max_suballoc_bos) * sizeof(struct fd_bo *) +
       rp->u.max_cmds * sizeof(struct fd_cmd_sp) +
       2 * sizeof(struct hash_table) +
-      (sp->bo_table->size + sp->suballoc_bo_table->size) * sizeof(struct hash_entry);
+       (sp->bo_table->size + sp->suballoc_bo_table->size) * sizeof(struct hash_entry);
+   if (sp->bo_access)
+      *metadata += sizeof(struct hash_table) + sp->bo_access->size * sizeof(struct hash_entry);
    return *metadata <= 1024 * 1024 && *references <= 512;
 }
 
@@ -1103,7 +1106,9 @@ rd_window_footprint(struct fd_submit *submit, struct fd_ringbuffer *ring,
       (sp->max_bos + sp->max_suballoc_bos) * sizeof(struct fd_bo *) +
       rp->u.max_cmds * sizeof(struct fd_cmd_sp) +
       2 * sizeof(struct hash_table) +
-      (sp->bo_table->size + sp->suballoc_bo_table->size) * sizeof(struct hash_entry);
+       (sp->bo_table->size + sp->suballoc_bo_table->size) * sizeof(struct hash_entry);
+   if (sp->bo_access)
+      *metadata += sizeof(struct hash_table) + sp->bo_access->size * sizeof(struct hash_entry);
    return *metadata <= 16384;
 }
 
@@ -2545,6 +2550,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          } else if (recorded->type >= RD_CMD_QUERY_RESET && recorded->type <= RD_CMD_QUERY_COPY) {
             result = rd_execute_query(device, recorded->type, &recorded->query);
          } else if (recorded->type == RD_CMD_RENDER) {
+            int64_t render_start = debug_get_option_submit_timing() ? os_time_get_nano() : 0;
             device->submit_out_fence = can_defer && async && submit->signal_count &&
                i == last_work_buffer && recorded == last_work &&
                rd_render_exports_fence(recorded->render) &&
@@ -2552,6 +2558,11 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             result = rd_execute_render(device, recorded->render,
                                        can_defer ? window : NULL);
             device->submit_out_fence = false;
+            if (debug_get_option_submit_timing())
+               fprintf(stderr, "RADISH_RENDER_TIMING ns=%" PRId64 " depth_stencil=%u async=%u result=%d\n",
+                       os_time_get_nano() - render_start,
+                       recorded->render->depth.view != NULL || recorded->render->stencil.view != NULL,
+                       async, result);
          } else if (recorded->type == RD_CMD_BLIT) {
             result = rd_execute_blit(device, &recorded->blit);
          } else {
