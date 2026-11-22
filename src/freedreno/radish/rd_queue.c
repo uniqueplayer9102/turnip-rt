@@ -2456,8 +2456,12 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             if (result != VK_SUCCESS)
                return rd_queue_fail(queue);
          }
+         /* barriers need no CPU drain: every GPU chunk ends with a cache
+          * flush and starts with UCHE invalidate + WFI, and same-pipe
+          * submits execute in order; CPU-side ops below still drain */
          bool can_defer = !profile &&
             (recorded->type == RD_CMD_RENDER ||
+             recorded->type == RD_CMD_BARRIER ||
              (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE &&
               rd_transfer_gpu_supported(recorded->type, &recorded->transfer)) ||
              (recorded->type == RD_CMD_IMAGE_COPY &&
