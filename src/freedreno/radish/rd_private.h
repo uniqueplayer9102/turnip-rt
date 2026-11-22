@@ -80,6 +80,7 @@ struct rd_device {
    uint64_t faults;
    struct rd_submit_window submit_window;
    int submit_in_fence_fd;
+   bool submit_out_fence;
    /* queried once, used by the opt-in color-only GMEM render path */
    uint32_t gmem_size;
    uint64_t gmem_base;

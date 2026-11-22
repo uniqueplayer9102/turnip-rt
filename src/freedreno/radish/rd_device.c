@@ -127,6 +127,9 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       goto fail;
    }
    vk_device_set_drm_fd(&device->vk, physical->render_fd);
+   if (device->vk.sync && physical->sync_type.import_sync_file &&
+       physical->sync_type.export_sync_file)
+      device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
    vk_device_enable_threaded_submit(&device->vk);
    list_inithead(&device->active_queries);
    result = vk_queue_init(&device->queue, &device->vk,

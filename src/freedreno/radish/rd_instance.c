@@ -179,6 +179,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       close(render_fd);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
+   fd_device_disable_explicit_sync_heuristic(fd);
    struct stat render_stat;
    if (fstat(render_fd, &render_stat) != 0) {
       fd_device_del(fd);

@@ -175,16 +175,16 @@ rd_InvalidateMappedMemoryRanges(VkDevice handle, uint32_t count,
    VK_FROM_HANDLE(rd_device, device, handle);
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(rd_memory, memory, ranges[i].memory);
+      if (!memory->cached)
+         continue;
+      if (!memory->map || ranges[i].offset >= memory->vk.size ||
+          (ranges[i].size != VK_WHOLE_SIZE && ranges[i].size > memory->vk.size - ranges[i].offset))
+         return VK_ERROR_MEMORY_MAP_FAILED;
       if (fd_bo_cpu_prep(memory->bo, device->pipe, FD_BO_PREP_READ))
          return VK_ERROR_DEVICE_LOST;
-      if (memory->cached) {
-         if (!memory->map || ranges[i].offset >= memory->vk.size ||
-             (ranges[i].size != VK_WHOLE_SIZE && ranges[i].size > memory->vk.size - ranges[i].offset))
-            return VK_ERROR_MEMORY_MAP_FAILED;
-         VkDeviceSize size = ranges[i].size == VK_WHOLE_SIZE ?
-            memory->vk.size - ranges[i].offset : ranges[i].size;
-         util_flush_inval_range((uint8_t *)memory->map + ranges[i].offset, size);
-      }
+      VkDeviceSize size = ranges[i].size == VK_WHOLE_SIZE ?
+         memory->vk.size - ranges[i].offset : ranges[i].size;
+      util_flush_inval_range((uint8_t *)memory->map + ranges[i].offset, size);
    }
    __sync_synchronize();
    return VK_SUCCESS;

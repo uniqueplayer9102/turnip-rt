@@ -421,6 +421,9 @@ static bool
 rd_image_parameters(VkFormat format, VkImageType type, VkImageTiling tiling,
                     VkImageUsageFlags2KHR usage, VkImageCreateFlags2KHR flags)
 {
+   if (tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+       (type != VK_IMAGE_TYPE_2D || (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)))
+      return false;
    if (rd_ycbcr_format_supported(format))
       return type == VK_IMAGE_TYPE_2D &&
          (tiling == VK_IMAGE_TILING_LINEAR || tiling == VK_IMAGE_TILING_OPTIMAL ||

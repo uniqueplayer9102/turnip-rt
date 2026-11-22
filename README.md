@@ -133,7 +133,7 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_ASYNC_QUEUE_SYNC` | `0` | pass sync-file fences to MSM instead of CPU-waiting each submit |
 | `RADISH_ASYNC_QUEUE_SYNC_DEBUG` | `0` | log async submit/skip decisions |
 | `RADISH_BATCH_CHUNKS` | `1` | compute chunks per submit; `8` enables deferred compute batching |
-| `RADISH_WINDOW_WAIT_OLDEST` | `0` | drain only the oldest submit-window slot instead of the whole window |
+| `RADISH_WINDOW_WAIT_OLDEST` | `1` | drain only the oldest submit-window slot instead of the whole window |
 | `RADISH_GROUPS` | `0` | plain workgroup batching override |
 | `RADISH_SHARED_GROUPS` | `1` | shared-memory workgroup batching |
 | `RADISH_BARRIER_GROUPS` | `0` | barrier workgroup batching override |
