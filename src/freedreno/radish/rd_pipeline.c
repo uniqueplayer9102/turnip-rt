@@ -419,7 +419,7 @@ saved_sampling_nir:
 
 /* Experiment: RADISH_WAVESIZE=double|any selects the hardware thread size
  * (default single). */
-static enum ir3_wavesize_option
+enum ir3_wavesize_option
 rd_real_wavesize(void)
 {
    const char *value = getenv("RADISH_WAVESIZE");
