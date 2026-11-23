@@ -1015,6 +1015,76 @@ rd_CmdDrawIndexed(VkCommandBuffer handle, uint32_t index_count, uint32_t instanc
    draw->first_instance = first_instance;
 }
 
+static struct rd_draw *
+rd_record_multi_draw(struct rd_command_buffer *command, struct rd_draw *state,
+                     bool *initialized)
+{
+   if (*initialized && command->render->descriptor_arena)
+      return rd_render_append_draw(command, command->render, state);
+   struct rd_draw *draw = rd_record_draw(command);
+   if (draw && !*initialized) {
+      *state = *draw;
+      state->barrier = false;
+      *initialized = true;
+   }
+   return draw;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDrawMultiEXT(VkCommandBuffer handle, uint32_t draw_count,
+                  const VkMultiDrawInfoEXT *vertex_info, uint32_t instance_count,
+                  uint32_t first_instance, uint32_t stride)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   if (!draw_count || !instance_count)
+      return;
+   struct rd_draw state;
+   bool initialized = false;
+   uint32_t i = 0;
+   vk_foreach_multi_draw(info, i, vertex_info, draw_count, stride) {
+      if (!info->vertexCount)
+         continue;
+      struct rd_draw *draw = rd_record_multi_draw(command, &state, &initialized);
+      if (!draw)
+         return;
+      draw->vertex_count = info->vertexCount;
+      draw->instance_count = instance_count;
+      draw->first_vertex = info->firstVertex;
+      draw->first_instance = first_instance;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDrawMultiIndexedEXT(VkCommandBuffer handle, uint32_t draw_count,
+                         const VkMultiDrawIndexedInfoEXT *index_info,
+                         uint32_t instance_count, uint32_t first_instance,
+                         uint32_t stride, const int32_t *vertex_offset)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   if (!draw_count || !instance_count)
+      return;
+   if (!command->index_buffer) {
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   struct rd_draw state;
+   bool initialized = false;
+   uint32_t i = 0;
+   vk_foreach_multi_draw_indexed(info, i, index_info, draw_count, stride) {
+      if (!info->indexCount)
+         continue;
+      struct rd_draw *draw = rd_record_multi_draw(command, &state, &initialized);
+      if (!draw)
+         return;
+      draw->indexed = true;
+      draw->vertex_count = info->indexCount;
+      draw->instance_count = instance_count;
+      draw->first_index = info->firstIndex;
+      draw->vertex_offset = vertex_offset ? *vertex_offset : info->vertexOffset;
+      draw->first_instance = first_instance;
+   }
+}
+
 static void
 rd_record_indirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
                    uint32_t count, uint32_t stride, bool indexed)

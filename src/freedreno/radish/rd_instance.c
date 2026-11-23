@@ -113,6 +113,7 @@ static const struct vk_device_extension_table rd_device_extensions = {
    .EXT_physical_device_drm = true,
    .KHR_sampler_mirror_clamp_to_edge = true,
    .EXT_host_query_reset = true,
+   .EXT_multi_draw = true,
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -250,6 +251,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxFragmentOutputAttachments = 4,
       .maxFragmentCombinedOutputResources = 4,
       .maxDrawIndirectCount = 1,
+      .maxMultiDrawCount = 4096,
       .maxDrawIndexedIndexValue = (1u << 24) - 1,
       .minTexelOffset = -8,
       .maxTexelOffset = 7,
@@ -329,11 +331,13 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    extensions.KHR_external_semaphore = sync_file;
    extensions.KHR_external_semaphore_fd = sync_file;
    extensions.KHR_timeline_semaphore = timeline;
+   extensions.EXT_multi_draw = rd_graphics_enabled();
    properties.maxTimelineSemaphoreValueDifference = timeline ? UINT64_MAX : 0;
    const struct vk_features features = { .pipelineStatisticsQuery = true, .robustBufferAccess = true,
       .samplerYcbcrConversion = true,
       .synchronization2 = true,
       .multiview = true, .occlusionQueryPrecise = true, .hostQueryReset = true,
+      .multiDraw = rd_graphics_enabled(),
       .textureCompressionETC2 = true,
       .storageBuffer16BitAccess = true, .storageBuffer8BitAccess = true, .shaderInt8 = true, .timelineSemaphore = timeline };
    VkResult result = vk_physical_device_init(&physical->vk, instance, &extensions,
