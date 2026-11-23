@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include "rd_format.h"
 #include "common/fd5_hw.h"
+#include "common/freedreno_common.h"
 #include "drm/freedreno_ringbuffer.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -30,16 +31,32 @@ void rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pi
 #include "vk_format.h"
 #include "vk_util.h"
 #include "util/u_debug.h"
+#include "util/os_time.h"
+#include "util/u_atomic.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(gmem, "RADISH_GMEM", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_cull, "RADISH_GMEM_CULL", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_viewport_reuse, "RADISH_GMEM_VIEWPORT_REUSE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_dump, "RADISH_GMEM_DUMP", false)
+DEBUG_GET_ONCE_BOOL_OPTION(gmem_damage_tiles, "RADISH_GMEM_DAMAGE_TILES", false)
 DEBUG_GET_ONCE_BOOL_OPTION(async_depth_stencil, "RADISH_ASYNC_DEPTH_STENCIL", false)
 DEBUG_GET_ONCE_BOOL_OPTION(readonly_bo_tracking, "RADISH_READONLY_BO_TRACKING", false)
+DEBUG_GET_ONCE_BOOL_OPTION(render_gpu_timing, "RADISH_RENDER_GPU_TIMING", false)
+DEBUG_GET_ONCE_BOOL_OPTION(render_gpu_detail, "RADISH_RENDER_GPU_DETAIL", false)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_stop, "RADISH_GMEM_STOP", -1)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_min_draws, "RADISH_GMEM_MIN_DRAWS", 4)
 DEBUG_GET_ONCE_BOOL_OPTION(descriptor_arena, "RADISH_DESCRIPTOR_ARENA", true)
+
+enum ir3_wavesize_option
+rd_fragment_wavesize(void)
+{
+   const char *value = getenv("RADISH_FS_WAVESIZE");
+   if (value && !strcmp(value, "double"))
+      return IR3_DOUBLE_ONLY;
+   if (value && !strcmp(value, "any"))
+      return IR3_SINGLE_OR_DOUBLE;
+   return IR3_SINGLE_ONLY;
+}
 
 /* The queue family has VK_QUEUE_GRAPHICS_BIT and graphics pipelines are
  * accepted unless RADISH_GRAPHICS=0. */
@@ -376,7 +393,7 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
        .nir_options.a5xx_raw_global_loads = true,
        .nir_options.a5xx_ssbo_size_consts = true,
       .api_wavesize = IR3_SINGLE_ONLY,
-      .real_wavesize = IR3_SINGLE_ONLY,
+      .real_wavesize = fragment ? rd_fragment_wavesize() : IR3_SINGLE_ONLY,
       .push_consts_type = IR3_PUSH_CONSTS_PER_STAGE,
       .push_consts_dwords = RD_GFX_BUFFER_SIZE_DWORD + RD_GFX_MAX_BUFFERS,
       .const_allocs = {
@@ -2437,6 +2454,81 @@ rd_submit_classify_render(struct rd_device *device, struct fd_submit *submit,
       fd_submit_set_bo_access(submit, counters, FD_RELOC_FLAGS_INIT);
 }
 
+static void
+rd_render_timestamp_emit(struct fd_ringbuffer *ring, struct fd_bo *bo, unsigned offset)
+{
+   OUT_PKT7(ring, CP_EVENT_WRITE, 4);
+   OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) | CP_EVENT_WRITE_0_TIMESTAMP);
+   OUT_RELOC(ring, bo, offset, 0, 0);
+   OUT_RING(ring, 0);
+}
+
+static struct fd_bo *
+rd_render_timer_prepare(struct rd_device *device, struct fd_ringbuffer *ring, int64_t *start,
+                        uint32_t format, uint32_t width, uint32_t height)
+{
+   static unsigned samples;
+   bool detail = debug_get_option_render_gpu_detail();
+   if ((!debug_get_option_render_gpu_timing() && !detail) ||
+       p_atomic_inc_return(&samples) > 512)
+      return NULL;
+   uint32_t bytes = detail ? align(32 + sizeof(struct rd_render_detail_header) +
+      RD_RENDER_DETAIL_MAX_SLOTS * sizeof(struct rd_render_detail_slot), 4096) : 4096;
+   struct fd_bo *bo = fd_bo_new(device->fd, bytes, 0, "radish-render-timing");
+   uint64_t *map = bo ? fd_bo_map(bo) : NULL;
+   if (!map) {
+      if (bo)
+         fd_bo_del(bo);
+      return NULL;
+   }
+   map[0] = map[2] = UINT64_MAX;
+   map[1] = UINT64_C(0x1964a5a55a5acafe);
+   map[3] = UINT64_C(0xe69b5a5aa5a53501);
+   map[4] = 0;
+   if (detail) {
+      struct rd_render_detail_header *header = (void *)((uint8_t *)map + 32);
+      *header = (struct rd_render_detail_header) {
+         .magic = RD_RENDER_DETAIL_MAGIC, .capacity = RD_RENDER_DETAIL_MAX_SLOTS,
+         .format = format, .width = width, .height = height,
+      };
+      struct rd_render_detail_slot *slots = (void *)(header + 1);
+      for (unsigned i = 0; i < header->capacity; i++)
+         slots[i] = (struct rd_render_detail_slot) { .start = UINT64_MAX, .stop = UINT64_MAX };
+   }
+   __sync_synchronize();
+   *start = os_time_get_nano();
+   rd_render_timestamp_emit(ring, bo, 0);
+   return bo;
+}
+
+static uint32_t
+rd_render_detail_begin(struct fd_ringbuffer *ring, struct fd_bo *bo,
+                       enum rd_render_detail_phase phase, uint32_t draw)
+{
+   if (!bo || !debug_get_option_render_gpu_detail())
+      return UINT32_MAX;
+   uint8_t *map = fd_bo_map(bo);
+   struct rd_render_detail_header *header = (void *)(map + 32);
+   if (header->count >= header->capacity) {
+      header->truncated++;
+      return UINT32_MAX;
+   }
+   uint32_t index = header->count++;
+   struct rd_render_detail_slot *slots = (void *)(header + 1);
+   slots[index].phase = phase;
+   slots[index].draw = draw;
+   rd_render_timestamp_emit(ring, bo, 32 + sizeof(*header) + index * sizeof(*slots));
+   return index;
+}
+
+static void
+rd_render_detail_end(struct fd_ringbuffer *ring, struct fd_bo *bo, uint32_t index)
+{
+   if (index != UINT32_MAX)
+      rd_render_timestamp_emit(ring, bo, 32 + sizeof(struct rd_render_detail_header) +
+         index * sizeof(struct rd_render_detail_slot) + sizeof(uint64_t));
+}
+
 static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
                          struct rd_submit_window *window);
@@ -2453,7 +2545,34 @@ rd_execute_render_view(struct rd_device *device, const struct rd_render *render,
 {
    if (render->depth.view || render->stencil.view)
       return rd_execute_render_tiled_ds(device, render, window);
-   if (rd_execute_render_gmem_supported(device, render))
+   bool gmem = rd_execute_render_gmem_supported(device, render);
+   if (debug_get_option_render_gpu_timing() || debug_get_option_render_gpu_detail()) {
+      unsigned inputs = 0, barriers = 0;
+      util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+         inputs += rd_draw_uses_input_attachment(draw);
+         barriers += draw->barrier;
+      }
+      fprintf(stderr, "RADISH_RENDER_SELECTION draws=%u format=%d inputs=%u barriers=%u samples=%u"
+              " gmem=%u min_draws=%" PRId64 "\n",
+              (unsigned)util_dynarray_num_elements(&render->draws, struct rd_draw),
+              render->color_count && render->color[0].view ? render->color[0].view->vk.format : 0,
+              inputs, barriers, (unsigned)render->samples, (unsigned)gmem, debug_get_option_gmem_min_draws());
+      if (debug_get_option_render_gpu_detail()) {
+         unsigned index = 0;
+         util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+            const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
+            fprintf(stderr, "RADISH_RENDER_DRAW_SHAPE index=%u clear=%u vertices=%u instances=%u"
+                    " fs_instructions=%u fs_full_regs=%d fs_half_regs=%d textures=%u buffers=%u"
+                    " blend=%u fs_double=%u viewport=%.0fx%.0f\n", index++,
+                    draw->pipeline == device->clear_pipeline, draw->vertex_count, draw->instance_count,
+                    gfx->fs.v->instrlen, gfx->fs.v->info.max_reg + 1, gfx->fs.v->info.max_half_reg + 1,
+                    gfx->fs.res->resource_usage.texture_count, gfx->fs.res->buffer_count,
+                    draw->cb.attachments[0].blend_enable, gfx->fs.v->info.double_threadsize,
+                    draw->viewport.width, draw->viewport.height);
+         }
+      }
+   }
+   if (gmem)
       return rd_execute_render_gmem(device, render, window);
    return rd_execute_render_direct(device, render, window);
 }
@@ -2712,6 +2831,10 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    if (debug_get_bool_option("RADISH_RENDER_QUERY_DEBUG", false))
       fprintf(stderr, "RADISH_RENDER_QUERY path=%s draws=%u counters=%u allocations=%u\n",
               queries ? "accounting" : "query-free", ndraws, counted, queries ? 3 : 0);
+   int64_t timer_start = 0;
+   struct fd_bo *timer_bo = rd_render_timer_prepare(device, ring, &timer_start,
+      render->color_count && render->color[0].view ? render->color[0].view->vk.format : 0,
+      width, height);
    for (unsigned i = 0; i < ndraws; i++) {
       const struct rd_draw *recorded = util_dynarray_element(&render->draws, struct rd_draw, i);
       const struct rd_draw *draw = recorded;
@@ -2764,14 +2887,19 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          memcmp(&previous->viewport, &draw->viewport, sizeof(draw->viewport));
       if (!emit_vp && rd_gmem_draw_needs_idle(previous, draw))
          OUT_WFI5(ring);
+      uint32_t detail = rd_render_detail_begin(ring, timer_bo,
+         draw->pipeline == device->clear_pipeline ? RD_RENDER_DETAIL_CLEAR : RD_RENDER_DETAIL_DRAW, i);
       previous = rd_gfx_draw(ring, device, render, draw, &program_cache, emit_vp) ?
          recorded : NULL;
+      rd_render_detail_end(ring, timer_bo, detail);
       if (queries && slots[i] >= 0)
          rd_sample_count(ring, device, counters, (slots[i] * 2 + 1) * 16);
    }
    if (result != VK_SUCCESS) {
       if (counters)
          fd_bo_del(counters);
+      if (timer_bo)
+         fd_bo_del(timer_bo);
       free(slots);
       free(resolved);
       free(coverage);
@@ -2784,10 +2912,24 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
    rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
    rd_flush(device, ring);
+   if (timer_bo)
+      rd_render_timestamp_emit(ring, timer_bo, 16);
    rd_submit_classify_render(device, submit, render, counters);
+   if (timer_bo && debug_get_option_readonly_bo_tracking() &&
+       fd_device_version(device->fd) >= FD_VERSION_SOFTPIN)
+      fd_submit_set_bo_access(submit, timer_bo, FD_RELOC_FLAGS_INIT);
+   device->render_timing_bo = timer_bo;
+   device->render_timing_start_ns = timer_start;
+   device->render_timing_gmem = false;
    result = counted ?
       rd_finish_submit(device, submit, ring, NULL, NULL) :
       rd_finish_window_submit(device, submit, ring, window, initial_ring_start, true);
+   device->render_timing_bo = NULL;
+   if (timer_bo) {
+      if (!window || counted)
+         rd_render_timing_report(device, timer_bo, timer_start, false, result);
+      fd_bo_del(timer_bo);
+   }
    if (result == VK_SUCCESS && queries) {
       const struct rd_render_query *op = util_dynarray_begin(&render->queries);
       const struct rd_render_query *op_end = util_dynarray_end(&render->queries);
@@ -3035,7 +3177,8 @@ rd_gmem_blit(struct fd_ringbuffer *ring, struct rd_device *device,
 
    OUT_PKT4(ring, REG_A5XX_RB_RESOLVE_CNTL_3, 5);
    /* 0x0 mem->gmem (restore), 0x4 gmem->mem without flag buffer (store) */
-   OUT_RING(ring, store ? 0x00000004 : 0x00000000);
+   OUT_RING(ring, store ? 0x00000004 |
+            COND(image->native_layout.tile_mode, A5XX_RB_RESOLVE_CNTL_3_TILED) : 0x00000000);
    if (store) {
       OUT_RELOC(ring, image->memory->bo,
                 image->memory_offset + level->offset +
@@ -3131,6 +3274,22 @@ rd_gmem_emit_draw_seg(struct fd_ringbuffer *ring, struct fd_ringbuffer *draw_rin
       ibs++;
    }
    return ibs;
+}
+
+static bool
+rd_gmem_tile_has_draws(const struct rd_gmem_draw_seg *segs, size_t count,
+                       uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+   int64_t maxx = (int64_t)x + width;
+   int64_t maxy = (int64_t)y + height;
+   for (size_t i = 0; i < count; i++) {
+      const struct rd_gmem_draw_seg *seg = &segs[i];
+      if (seg->maxx > seg->minx && seg->maxy > seg->miny &&
+          seg->maxx > x && seg->minx < maxx &&
+          seg->maxy > y && seg->miny < maxy)
+         return true;
+   }
+   return false;
 }
 
 static void
@@ -3292,7 +3451,21 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
 
    bool load = render->color[0].load == VK_ATTACHMENT_LOAD_OP_LOAD;
    bool store = render->color[0].store == VK_ATTACHMENT_STORE_OP_STORE;
+   bool damage_tiles = debug_get_option_gmem_damage_tiles() && load && store;
+   if (damage_tiles) {
+      for (size_t i = 0; i < nr_segs; i++) {
+         const struct rd_gfx_pipeline *gfx = segs[i].draw->pipeline->gfx;
+         if (gfx->vs.res->resource_count || !gfx->fs.v->has_no_side_effects) {
+            damage_tiles = false;
+            break;
+         }
+      }
+   }
+   uint32_t untouched_tiles = 0;
    const struct rd_draw *previous = NULL;
+   int64_t timer_start = 0;
+   struct fd_bo *timer_bo = stop_at > 0 ? NULL : rd_render_timer_prepare(device, ring,
+      &timer_start, view->vk.format, width, height);
 
    for (uint32_t ty = 0; ty < nbins_y && result == VK_SUCCESS; ty++) {
       for (uint32_t tx = 0; tx < nbins_x; tx++) {
@@ -3302,6 +3475,10 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
          uint32_t th = MIN2(l.bin_h, maxy - y1);
          if (tw == 0 || th == 0)
             continue;
+         if (damage_tiles && !rd_gmem_tile_has_draws(segs, nr_segs, x1, y1, tw, th)) {
+            untouched_tiles++;
+            continue;
+         }
 
          OUT_PKT4(ring, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
          OUT_RING(ring, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(x1) |
@@ -3327,7 +3504,9 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
                               A5XX_RB_CNTL_HEIGHT(l.bin_h) | A5XX_RB_CNTL_BYPASS);
             rd_gmem_emit_mrt(ring, device, render, &l, false);
             RD_GMEM_STAGE(restore_mrt)
+            uint32_t detail = rd_render_detail_begin(ring, timer_bo, RD_RENDER_DETAIL_LOAD, 0);
             rd_gmem_blit(ring, device, render, &l, false);
+            rd_render_detail_end(ring, timer_bo, detail);
          }
 
          RD_GMEM_STAGE(restore_done)
@@ -3368,15 +3547,22 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
                      previous = draw;
                   }
                }
+               uint32_t detail = rd_render_detail_begin(ring, timer_bo,
+                  seg->draw->pipeline == device->clear_pipeline ?
+                     RD_RENDER_DETAIL_CLEAR : RD_RENDER_DETAIL_DRAW, s);
                draw_ibs += rd_gmem_emit_draw_seg(ring, draw_ring, seg);
+               rd_render_detail_end(ring, timer_bo, detail);
             }
          } else {
             draw_ibs += fd_ringbuffer_cmd_count(draw_ring);
             rd_gmem_emit_draw_ib(ring, draw_ring);
          }
 
-         if (store)
+         if (store) {
+            uint32_t detail = rd_render_detail_begin(ring, timer_bo, RD_RENDER_DETAIL_STORE, 0);
             rd_gmem_blit(ring, device, render, &l, true);
+            rd_render_detail_end(ring, timer_bo, detail);
+         }
       }
    }
 
@@ -3388,6 +3574,8 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       fprintf(stderr, "radish gmem viewport: updates=%" PRIu64 " reuses=%" PRIu64
               " state_waits=%" PRIu64 " enabled=%u\n",
               viewport_updates, viewport_reuses, state_waits, viewport_reuse);
+      fprintf(stderr, "radish gmem damage: skipped_tiles=%u enabled=%u\n",
+              untouched_tiles, damage_tiles);
    }
    fd_ringbuffer_del(draw_ring);
    free(segs);
@@ -3403,15 +3591,28 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       OUT_RING(ring, 0);
       OUT_RING(ring, 0);
       rd_flush(device, ring);
+      if (timer_bo)
+         rd_render_timestamp_emit(ring, timer_bo, 16);
       rd_submit_classify_render(device, submit, render, NULL);
+      if (timer_bo && debug_get_option_readonly_bo_tracking() &&
+          fd_device_version(device->fd) >= FD_VERSION_SOFTPIN)
+         fd_submit_set_bo_access(submit, timer_bo, FD_RELOC_FLAGS_INIT);
+      device->render_timing_bo = timer_bo;
+      device->render_timing_start_ns = timer_start;
+      device->render_timing_gmem = true;
       result = rd_finish_window_submit(device, submit, ring, window,
                                        initial_ring_start, true);
+      device->render_timing_bo = NULL;
+      if (timer_bo && !window)
+         rd_render_timing_report(device, timer_bo, timer_start, true, result);
       if (result == VK_SUCCESS)
          result = rd_render_resolves(device, render);
    } else {
       fd_ringbuffer_del(ring);
       fd_submit_del(submit);
    }
+   if (timer_bo)
+      fd_bo_del(timer_bo);
    return result;
 }
 

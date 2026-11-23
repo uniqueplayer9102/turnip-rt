@@ -37,11 +37,32 @@
 struct fd_ringbuffer;
 struct fd_submit;
 
+#define RD_RENDER_DETAIL_MAGIC UINT64_C(0x726464657461696c)
+#define RD_RENDER_DETAIL_MAX_SLOTS 4096
+enum rd_render_detail_phase {
+   RD_RENDER_DETAIL_LOAD,
+   RD_RENDER_DETAIL_CLEAR,
+   RD_RENDER_DETAIL_DRAW,
+   RD_RENDER_DETAIL_STORE,
+   RD_RENDER_DETAIL_PHASE_COUNT,
+};
+struct rd_render_detail_header {
+   uint64_t magic;
+   uint32_t count, capacity, format, width, height, truncated;
+};
+struct rd_render_detail_slot {
+   uint64_t start, stop;
+   uint32_t phase, draw;
+};
+
 struct rd_pending_submit {
    struct fd_submit *submit;
    struct fd_ringbuffer *ring;
    struct fd_fence *fence;
    struct fd_bo *cs_backing;
+   struct fd_bo *timing_bo;
+   int64_t timing_start_ns;
+   bool timing_gmem;
    uint32_t chunks, cs_bytes, bo_refs;
    size_t metadata_bytes;
 };
@@ -81,6 +102,9 @@ struct rd_device {
    struct rd_submit_window submit_window;
    int submit_in_fence_fd;
    bool submit_out_fence;
+   struct fd_bo *render_timing_bo;
+   int64_t render_timing_start_ns;
+   bool render_timing_gmem;
    /* queried once, used by the opt-in color-only GMEM render path */
    uint32_t gmem_size;
    uint64_t gmem_base;
@@ -442,6 +466,8 @@ void rd_emit_image_constants(struct fd_ringbuffer *ring,
                              const struct rd_dispatch *dispatch);
 VkResult rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit);
 VkResult rd_queue_drain_pending(struct rd_device *device);
+void rd_render_timing_report(struct rd_device *device, struct fd_bo *bo,
+                              int64_t start_ns, bool gmem, VkResult result);
 VkResult rd_execute_gpu_image_copy(struct rd_device *device,
                                    const struct rd_image_transfer *transfer,
                                    struct rd_memory *src, struct rd_memory *dst,
@@ -465,6 +491,7 @@ void rd_query_account_dispatch(struct rd_device *device,
 extern "C" {
 #endif
 enum ir3_wavesize_option rd_real_wavesize(void);
+enum ir3_wavesize_option rd_fragment_wavesize(void);
 bool rd_pipeline_cache_restore(struct rd_device *device, struct rd_pipeline *pipeline,
    VkPipelineCache cache, const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
 void rd_pipeline_cache_store(struct rd_device *device, struct rd_pipeline *pipeline,

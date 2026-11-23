@@ -13,6 +13,7 @@
 #include "drm/freedreno_ringbuffer_sp.h"
 #include "vk_sync.h"
 #include "vk_pipeline.h"
+#include "drm-uapi/dma-buf.h"
 #include "util/libsync.h"
 #include "util/u_sync_provider.h"
 #include "util/u_math.h"
@@ -24,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 DEBUG_GET_ONCE_NUM_OPTION(shared_groups, "RADISH_SHARED_GROUPS", 1)
 DEBUG_GET_ONCE_NUM_OPTION(groups, "RADISH_GROUPS", 0)
@@ -34,6 +36,8 @@ DEBUG_GET_ONCE_NUM_OPTION(tiled_groups_x, "RADISH_TILED_GROUPS_X", 1)
 DEBUG_GET_ONCE_BOOL_OPTION(window_wait_oldest, "RADISH_WINDOW_WAIT_OLDEST", true)
 DEBUG_GET_ONCE_BOOL_OPTION(async_render_fence, "RADISH_ASYNC_RENDER_FENCE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(submit_timing, "RADISH_SUBMIT_TIMING", false)
+DEBUG_GET_ONCE_BOOL_OPTION(wait_timing, "RADISH_WAIT_TIMING", false)
+DEBUG_GET_ONCE_BOOL_OPTION(fence_debug, "RADISH_FENCE_DEBUG", false)
 
 struct rd_submit_profile {
    uint64_t chunks;
@@ -497,6 +501,143 @@ rd_flush_submit(struct rd_device *device, struct fd_submit *submit,
    return fence;
 }
 
+static void
+rd_fence_report(int fd, const char *phase, uint64_t submit_id)
+{
+#ifdef SYNC_IOC_FILE_INFO
+   struct sync_file_info info = {0};
+   if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0) {
+      fprintf(stderr, "RADISH_FENCE_DEBUG phase=%s submit=%" PRIu64 " query_errno=%d\n",
+              phase, submit_id, errno);
+      return;
+   }
+   struct sync_fence_info fences[64];
+   if (info.num_fences > ARRAY_SIZE(fences))
+      return;
+   info.sync_fence_info = (uintptr_t)fences;
+   if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0)
+      return;
+   fprintf(stderr, "RADISH_FENCE_DEBUG phase=%s submit=%" PRIu64 " name=%.*s status=%d count=%u"
+           " host_ns=%" PRId64 "\n", phase, submit_id, 32, info.name,
+           info.status, info.num_fences, os_time_get_nano());
+   for (uint32_t i = 0; i < MIN2(info.num_fences, ARRAY_SIZE(fences)); i++)
+      fprintf(stderr, "RADISH_FENCE_COMPONENT phase=%s submit=%" PRIu64 " index=%u driver=%.*s"
+              " timeline=%.*s status=%d timestamp_ns=%" PRIu64 "\n",
+              phase, submit_id, i, 32, fences[i].driver_name, 32, fences[i].obj_name,
+              fences[i].status, (uint64_t)fences[i].timestamp_ns);
+#endif
+}
+
+struct rd_debug_buffer_fence {
+   int fd;
+   uint32_t handle;
+};
+
+void
+rd_render_timing_report(struct rd_device *device, struct fd_bo *bo,
+                        int64_t start_ns, bool gmem, VkResult result)
+{
+   int64_t host_ns = os_time_get_nano() - start_ns;
+   uint64_t ticks[4] = {0};
+   bool valid = result == VK_SUCCESS &&
+      !fd_bo_cpu_prep(bo, device->pipe, FD_BO_PREP_READ | FD_BO_PREP_NOSYNC);
+   void *map = valid ? fd_bo_map(bo) : NULL;
+   valid &= map != NULL;
+   if (valid) {
+      __sync_synchronize();
+      memcpy(ticks, map, sizeof(ticks));
+      valid = ticks[1] == UINT64_C(0x1964a5a55a5acafe) &&
+         ticks[3] == UINT64_C(0xe69b5a5aa5a53501) &&
+         ticks[0] && ticks[0] != UINT64_MAX && ticks[2] != UINT64_MAX &&
+         ticks[2] > ticks[0] && ticks[2] - ticks[0] <= UINT64_C(96000000);
+   }
+   uint64_t gpu_ns = valid ? fd_ticks_to_ns(ticks[2] - ticks[0]) : 0;
+   valid &= gpu_ns <= (uint64_t)host_ns + 1000000;
+   fprintf(stderr, "RADISH_GPU_RENDER_TIMING valid=%u start_ticks=%" PRIu64
+           " stop_ticks=%" PRIu64 " gpu_ns=%" PRIu64 " host_ns=%" PRId64 " result=%d path=%s\n",
+           (unsigned)valid, ticks[0], ticks[2], valid ? gpu_ns : 0, host_ns, result,
+           gmem ? "gmem" : "direct");
+   if (valid && fd_bo_size(bo) >= 32 + sizeof(struct rd_render_detail_header)) {
+      struct rd_render_detail_header header;
+      memcpy(&header, (uint8_t *)map + 32, sizeof(header));
+      if (header.magic != RD_RENDER_DETAIL_MAGIC)
+         return;
+      uint64_t needed = 32 + sizeof(header) +
+         (uint64_t)header.capacity * sizeof(struct rd_render_detail_slot);
+      if (header.count > header.capacity || header.capacity > RD_RENDER_DETAIL_MAX_SLOTS ||
+          needed > fd_bo_size(bo))
+         return;
+      uint64_t phase_ticks[RD_RENDER_DETAIL_PHASE_COUNT] = {0};
+      uint32_t phase_samples[RD_RENDER_DETAIL_PHASE_COUNT] = {0};
+      uint64_t draw_ticks[64] = {0};
+      uint32_t draw_samples[64] = {0};
+      uint32_t invalid = 0;
+      const struct rd_render_detail_slot *slots = (void *)((uint8_t *)map + 32 + sizeof(header));
+      for (unsigned i = 0; i < header.count; i++) {
+         struct rd_render_detail_slot slot;
+         memcpy(&slot, &slots[i], sizeof(slot));
+         if (slot.phase >= RD_RENDER_DETAIL_PHASE_COUNT || slot.start < ticks[0] ||
+             slot.stop > ticks[2] || slot.stop < slot.start) {
+            invalid++;
+            continue;
+         }
+         phase_ticks[slot.phase] += slot.stop - slot.start;
+         phase_samples[slot.phase]++;
+         if ((slot.phase == RD_RENDER_DETAIL_CLEAR || slot.phase == RD_RENDER_DETAIL_DRAW) &&
+             slot.draw < ARRAY_SIZE(draw_ticks)) {
+            draw_ticks[slot.draw] += slot.stop - slot.start;
+            draw_samples[slot.draw]++;
+         }
+      }
+      const char *names[] = {"load", "clear", "draw", "store"};
+      for (unsigned phase = 0; phase < RD_RENDER_DETAIL_PHASE_COUNT; phase++)
+         if (phase_samples[phase])
+            fprintf(stderr, "RADISH_GPU_RENDER_PHASE format=%u size=%ux%u path=%s phase=%s"
+                    " gpu_ns=%" PRIu64 " samples=%u invalid=%u truncated=%u\n",
+                    header.format, header.width, header.height, gmem ? "gmem" : "direct",
+                    names[phase], fd_ticks_to_ns(phase_ticks[phase]), phase_samples[phase],
+                    invalid, header.truncated);
+      for (unsigned draw = 0; draw < ARRAY_SIZE(draw_ticks); draw++)
+         if (draw_samples[draw])
+            fprintf(stderr, "RADISH_GPU_RENDER_DRAW format=%u index=%u gpu_ns=%" PRIu64
+                    " samples=%u invalid=%u truncated=%u\n", header.format, draw,
+                    fd_ticks_to_ns(draw_ticks[draw]), draw_samples[draw], invalid, header.truncated);
+   }
+}
+
+static unsigned
+rd_snapshot_buffer_fences(struct rd_device *device, struct fd_submit *submit,
+                           struct rd_debug_buffer_fence fences[8])
+{
+   if (!debug_get_option_fence_debug() ||
+       fd_device_version(device->fd) < FD_VERSION_SOFTPIN)
+      return 0;
+   const struct fd_submit_sp *sp = to_fd_submit_sp(submit);
+   unsigned count = 0;
+   for (unsigned i = 0; i < sp->nr_bos && count < 8; i++) {
+      struct fd_bo *bo = sp->bos[i];
+      if (!(bo->alloc_flags & FD_BO_SHARED))
+         continue;
+      int fd = fd_bo_dmabuf(bo);
+      if (fd < 0)
+         continue;
+      struct dma_buf_export_sync_file info = { .flags = DMA_BUF_SYNC_RW, .fd = -1 };
+      int result = ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &info);
+      struct stat stat;
+      uint64_t inode = fstat(fd, &stat) == 0 ? stat.st_ino : 0;
+      close(fd);
+      if (result < 0)
+         continue;
+      fences[count++] = (struct rd_debug_buffer_fence) {info.fd, bo->handle};
+      fprintf(stderr, "RADISH_SHARED_BO_DEBUG submit=%" PRIu64 " handle=%u inode=%" PRIu64 "\n",
+              device->submit_count, bo->handle, inode);
+      char phase[64];
+      snprintf(phase, sizeof(phase), "bo-before-%u", bo->handle);
+      rd_fence_report(info.fd, phase, device->submit_count);
+   }
+   return count;
+}
+
 void
 rd_flush(struct rd_device *device, struct fd_ringbuffer *ring)
 {
@@ -522,21 +663,34 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
 {
    device->submit_count++;
    int64_t start = profile ? os_time_get_nano() : 0;
-   int64_t t0 = device->trace ? os_time_get_nano() : 0;
+   bool timing = debug_get_option_wait_timing();
+   int64_t t0 = device->trace || timing ? os_time_get_nano() : 0;
+   int debug_fd = debug_get_option_fence_debug() && device->submit_in_fence_fd >= 0 ?
+      os_dupfd_cloexec(device->submit_in_fence_fd) : -1;
+   if (debug_fd >= 0)
+      rd_fence_report(debug_fd, "input-before", device->submit_count);
+   else if (debug_get_option_fence_debug())
+      fprintf(stderr, "RADISH_FENCE_DEBUG phase=no-input submit=%" PRIu64 "\n", device->submit_count);
+   struct rd_debug_buffer_fence debug_buffers[8];
+   unsigned debug_buffer_count = rd_snapshot_buffer_fences(device, submit, debug_buffers);
    struct fd_fence *fence = rd_flush_submit(device, submit, false);
    VkResult result = VK_ERROR_DEVICE_LOST;
    if (fence) {
       fd_fence_flush(fence);
-      int64_t t1 = device->trace ? os_time_get_nano() : 0;
+      int64_t t1 = device->trace || timing ? os_time_get_nano() : 0;
       bool failed = fd_device_version(device->fd) >= FD_VERSION_SOFTPIN &&
                     fence->submit_error;
       int wait = failed ? fence->submit_error :
          fd_pipe_wait_timeout(device->pipe, fence, 5000000000ull);
+      int64_t t2 = device->trace || timing ? os_time_get_nano() : 0;
       if (device->trace) {
-         int64_t t2 = os_time_get_nano();
          device->trace->flush_ns += t1 - t0;
          device->trace->wait_ns += t2 - t1;
       }
+      if (timing)
+         fprintf(stderr, "RADISH_WAIT_TIMING type=submit id=%" PRIu64 " host_start_ns=%" PRId64
+                 " host_done_ns=%" PRId64 " flush_ns=%" PRId64 " wait_ns=%" PRId64 " result=%d\n",
+                 device->submit_count, t0, t2, t1 - t0, t2 - t1, wait);
       if (!wait) {
          uint64_t faults = 0;
          if (!fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) &&
@@ -551,6 +705,16 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
       profile->max_ns = MAX2(profile->max_ns, elapsed);
    }
    rd_gpu_elapsed_finish(device, sample, result, start, done);
+   if (debug_fd >= 0) {
+      rd_fence_report(debug_fd, "input-after", device->submit_count);
+      close(debug_fd);
+   }
+   for (unsigned i = 0; i < debug_buffer_count; i++) {
+      char phase[64];
+      snprintf(phase, sizeof(phase), "bo-after-%u", debug_buffers[i].handle);
+      rd_fence_report(debug_buffers[i].fd, phase, device->submit_count);
+      close(debug_buffers[i].fd);
+   }
    if (fence)
       fd_fence_del(fence);
    fd_ringbuffer_del(ring);
@@ -580,10 +744,16 @@ rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
       return VK_SUCCESS;
    struct fd_fence *last = window->pending[window->count - 1].fence;
    VkResult result = VK_ERROR_DEVICE_LOST;
-   int64_t t0 = device->trace ? os_time_get_nano() : 0;
+   bool timing = debug_get_option_wait_timing();
+   int64_t t0 = device->trace || timing ? os_time_get_nano() : 0;
    int wait = fd_pipe_wait_timeout(device->pipe, last, 5000000000ull);
+   int64_t done = device->trace || timing ? os_time_get_nano() : 0;
    if (device->trace)
-      device->trace->wait_ns += os_time_get_nano() - t0;
+      device->trace->wait_ns += done - t0;
+   if (timing)
+      fprintf(stderr, "RADISH_WAIT_TIMING type=drain reason=%s id=%" PRIu64 " slots=%u"
+              " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " wait_ns=%" PRId64 " result=%d\n",
+              reason, device->submit_count, window->count, t0, done, done - t0, wait);
    if (!wait) {
       uint64_t faults = 0;
       if (!fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) &&
@@ -592,6 +762,12 @@ rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
    }
    rd_window_report("DRAIN", reason, window, result);
    for (unsigned i = 0; i < window->count; i++) {
+      if (window->pending[i].timing_bo) {
+         rd_render_timing_report(device, window->pending[i].timing_bo,
+                                 window->pending[i].timing_start_ns,
+                                 window->pending[i].timing_gmem, result);
+         fd_bo_del(window->pending[i].timing_bo);
+      }
       fd_fence_del(window->pending[i].fence);
       fd_ringbuffer_del(window->pending[i].ring);
       fd_submit_del(window->pending[i].submit);
@@ -613,6 +789,11 @@ rd_window_reap(struct rd_device *device, struct rd_submit_window *window)
       if (wait) {
          result = VK_ERROR_DEVICE_LOST;
          break;
+      }
+      if (pending->timing_bo) {
+         rd_render_timing_report(device, pending->timing_bo, pending->timing_start_ns,
+                                 pending->timing_gmem, VK_SUCCESS);
+         fd_bo_del(pending->timing_bo);
       }
       fd_fence_del(pending->fence);
       fd_ringbuffer_del(pending->ring);
@@ -658,10 +839,16 @@ rd_window_reserve(struct rd_device *device, struct rd_submit_window *window)
       return result;
    if (!debug_get_option_window_wait_oldest())
       return rd_window_drain(device, window, "capacity-reserve");
-   int64_t start = device->trace ? os_time_get_nano() : 0;
+   bool timing = debug_get_option_wait_timing();
+   int64_t start = device->trace || timing ? os_time_get_nano() : 0;
    int wait = fd_pipe_wait_timeout(device->pipe, window->pending[0].fence, 5000000000ull);
+   int64_t done = device->trace || timing ? os_time_get_nano() : 0;
    if (device->trace)
-      device->trace->wait_ns += os_time_get_nano() - start;
+      device->trace->wait_ns += done - start;
+   if (timing)
+      fprintf(stderr, "RADISH_WAIT_TIMING type=capacity id=%" PRIu64 " slots=%u"
+              " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " wait_ns=%" PRId64 " result=%d\n",
+              device->submit_count, window->count, start, done, done - start, wait);
    result = wait ? VK_ERROR_DEVICE_LOST : rd_window_reap(device, window);
    rd_window_report("WAIT", "capacity-oldest", window, result);
    if (result == VK_SUCCESS && window->count >= ARRAY_SIZE(window->pending))
@@ -1173,6 +1360,10 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
       if (fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) ||
           faults != device->faults)
          result = VK_ERROR_DEVICE_LOST;
+      if (render && device->render_timing_bo)
+         rd_render_timing_report(device, device->render_timing_bo,
+                                 device->render_timing_start_ns,
+                                 device->render_timing_gmem, result);
       fd_fence_del(fence);
       fd_ringbuffer_del(ring);
       fd_submit_del(submit);
@@ -1181,6 +1372,9 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
    window->pending[window->count++] = (struct rd_pending_submit) {
       .submit = submit, .ring = ring, .fence = fence, .cs_backing = backing,
       .chunks = chunks, .cs_bytes = 32768, .bo_refs = references, .metadata_bytes = metadata,
+      .timing_bo = render && device->render_timing_bo ? fd_bo_ref(device->render_timing_bo) : NULL,
+      .timing_start_ns = device->render_timing_start_ns,
+      .timing_gmem = device->render_timing_gmem,
    };
    window->chunks += chunks;
    window->cs_bytes += 32768;

@@ -182,7 +182,34 @@ int main(int argc, char **argv)
       .pInputAssemblyState = &assembly, .pViewportState = &vpi, .pRasterizationState = &raster,
       .pMultisampleState = &ms, .pColorBlendState = &cb, .layout = layout, .renderPass = pass };
    VkPipeline pipeline;
-   CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpi, NULL, &pipeline));
+   VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+   if (getenv("RADISH_PROBE_PIPELINE_CACHE")) {
+      VkPipelineCacheCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+      CHECK(vkCreatePipelineCache(device, &pci, NULL, &pipeline_cache));
+      if (setenv("RADISH_FS_WAVESIZE", "single", 1)) return 2;
+   }
+   uint64_t pipeline_start = now();
+   CHECK(vkCreateGraphicsPipelines(device, pipeline_cache, 1, &gpi, NULL, &pipeline));
+   printf("PIPELINE_CREATE ms=%.4f\n", (now()-pipeline_start)/1e6);
+   if (pipeline_cache != VK_NULL_HANDLE) {
+      size_t previous = 0;
+      CHECK(vkGetPipelineCacheData(device, pipeline_cache, &previous, NULL));
+      const char *wavesizes[] = {"double", "any", "single", "invalid", "double", "any"};
+      for (unsigned i = 0; i < 6; i++) {
+         if (setenv("RADISH_FS_WAVESIZE", wavesizes[i], 1)) return 2;
+         vkDestroyPipeline(device, pipeline, NULL);
+         CHECK(vkCreateGraphicsPipelines(device, pipeline_cache, 1, &gpi, NULL, &pipeline));
+         size_t size = 0;
+         CHECK(vkGetPipelineCacheData(device, pipeline_cache, &size, NULL));
+         if ((i < 2 && size <= previous) || (i >= 2 && size != previous)) {
+            fprintf(stderr, "FS_CACHE_FAIL wavesize=%s size=%zu previous=%zu\n",
+                    wavesizes[i], size, previous); return 5;
+         }
+         previous = size;
+         printf("FS_CACHE wavesize=%s bytes=%zu PASS\n", wavesizes[i], size);
+      }
+      vkDestroyPipelineCache(device, pipeline_cache, NULL);
+   }
    VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = 0 };
    VkCommandPool pool;

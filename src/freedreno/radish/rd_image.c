@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "common/fd5_hw.h"
 #include "util/cache_ops.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "util/u_debug.h"
@@ -17,6 +18,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_clear_bulk, "RADISH_CPU_IMAGE_CLEAR_BULK", 
 DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_clear_debug, "RADISH_CPU_IMAGE_CLEAR_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_copy_bulk, "RADISH_CPU_IMAGE_COPY_BULK", true)
 DEBUG_GET_ONCE_BOOL_OPTION(cpu_image_copy_debug, "RADISH_CPU_IMAGE_COPY_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(tiled_fp16, "RADISH_TILED_FP16", false)
+DEBUG_GET_ONCE_BOOL_OPTION(tiled_fp16_debug, "RADISH_TILED_FP16_DEBUG", false)
 
 bool
 rd_ycbcr_format_supported(VkFormat format)
@@ -691,6 +694,22 @@ rd_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice handle,
 }
 
 static bool
+rd_image_tiled_fp16_supported(const struct vk_image *image)
+{
+   const VkImageUsageFlags2KHR allowed = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+   return debug_get_option_tiled_fp16() &&
+      image->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+      image->tiling == VK_IMAGE_TILING_OPTIMAL && image->image_type == VK_IMAGE_TYPE_2D &&
+      image->samples == VK_SAMPLE_COUNT_1_BIT && image->mip_levels == 1 &&
+      image->array_layers == 1 && image->extent.width >= FDL_LINEAR_FALLBACK_THRESHOLD &&
+      image->sharing_mode == VK_SHARING_MODE_EXCLUSIVE &&
+      !image->create_flags && !image->external_handle_types && !image->wsi_legacy_scanout &&
+      (image->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(image->usage & ~allowed);
+}
+
+static bool
 rd_image_layout(struct rd_image *image)
 {
    VkDeviceSize size = 0;
@@ -740,8 +759,14 @@ rd_image_layout(struct rd_image *image)
          .width0 = image->vk.extent.width, .height0 = image->vk.extent.height,
          .depth0 = image->vk.extent.depth, .mip_levels = image->vk.mip_levels,
          .array_size = image->vk.array_layers, .is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D,
+         .tile_mode = rd_image_tiled_fp16_supported(&image->vk) ? TILE5_3 : TILE5_LINEAR,
       };
       fdl5_layout_image(&image->native_layout, &parameters);
+      if (image->vk.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+          debug_get_option_tiled_fp16_debug())
+         fprintf(stderr, "RADISH_FP16_LAYOUT tile=%u size=%ux%u usage=0x%" PRIx64 "\n",
+                 image->native_layout.tile_mode, image->vk.extent.width, image->vk.extent.height,
+                 (uint64_t)image->vk.usage);
       image->native_layout.mip_levels = image->vk.mip_levels;
       if (!image->native_layout.size || image->native_layout.size > limit)
          return false;

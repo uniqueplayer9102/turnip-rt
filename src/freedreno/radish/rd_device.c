@@ -154,7 +154,9 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    if (device->gmem_size_valid && debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
       fprintf(stderr, "radish: gmem size=0x%x base=0x%" PRIx64 "\n",
               device->gmem_size, device->gmem_base);
-   const struct ir3_compiler_options options = { .disable_cache = true };
+   const struct ir3_compiler_options options = {
+      .disable_cache = !debug_get_bool_option("RADISH_SHADER_DISK_CACHE", false),
+   };
    device->compiler = ir3_compiler_create(device->fd, fd_pipe_dev_id(device->pipe),
                                          &device->info, &options);
    device->control = fd_bo_new(device->fd, 4096, 0, "radish-control");

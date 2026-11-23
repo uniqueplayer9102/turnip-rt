@@ -53,6 +53,10 @@ static bool rd_cache_key(rd_device *device, rd_pipeline *pipeline,
       uint32_t wavesize = rd_real_wavesize();
       _mesa_blake3_update(&ctx, &wavesize, sizeof(wavesize));
    }
+   if (stage->stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+      uint32_t wavesize = rd_fragment_wavesize();
+      _mesa_blake3_update(&ctx, &wavesize, sizeof(wavesize));
+   }
    uint8_t shader[BLAKE3_OUT_LEN];
    vk_pipeline_hash_shader_stage(flags, stage, nullptr, shader);
    _mesa_blake3_update(&ctx, shader, sizeof(shader));
