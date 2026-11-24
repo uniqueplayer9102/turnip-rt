@@ -50,6 +50,21 @@ static const struct debug_control trace_options[] = {
    {NULL, 0},
 };
 
+static void
+vk_instance_free_create_info(struct vk_instance *instance)
+{
+   list_for_each_entry_safe(struct vk_debug_utils_messenger, messenger,
+                            &instance->debug_utils.instance_callbacks, link) {
+      list_del(&messenger->link);
+      vk_object_base_finish(&messenger->base);
+      vk_free2(&instance->alloc, &messenger->alloc, messenger);
+   }
+   vk_free(&instance->alloc, (char *)instance->app_info.app_name);
+   vk_free(&instance->alloc, (char *)instance->app_info.engine_name);
+   instance->app_info.app_name = NULL;
+   instance->app_info.engine_name = NULL;
+}
+
 VkResult
 vk_instance_init(struct vk_instance *instance,
                  const struct vk_instance_extension_table *supported_extensions,
@@ -60,6 +75,7 @@ vk_instance_init(struct vk_instance *instance,
    memset(instance, 0, sizeof(*instance));
    vk_object_base_instance_init(instance, &instance->base, VK_OBJECT_TYPE_INSTANCE);
    instance->alloc = *alloc;
+   VkResult result;
 
    util_cpu_trace_init();
 
@@ -77,8 +93,10 @@ vk_instance_init(struct vk_instance *instance,
             vk_alloc2(alloc, alloc, sizeof(struct vk_debug_utils_messenger), 8,
                       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
 
-         if (!messenger)
-            return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+         if (!messenger) {
+            result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+            goto fail;
+         }
 
          vk_object_base_instance_init(instance, &messenger->base,
                                       VK_OBJECT_TYPE_DEBUG_UTILS_MESSENGER_EXT);
@@ -105,11 +123,19 @@ vk_instance_init(struct vk_instance *instance,
       instance->app_info.app_name =
          vk_strdup(&instance->alloc, app->pApplicationName,
                    VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+      if (app->pApplicationName && !instance->app_info.app_name) {
+         result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto fail;
+      }
       instance->app_info.app_version = app->applicationVersion;
 
       instance->app_info.engine_name =
          vk_strdup(&instance->alloc, app->pEngineName,
                    VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+      if (app->pEngineName && !instance->app_info.engine_name) {
+         result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto fail;
+      }
       instance->app_info.engine_version = app->engineVersion;
 
       instance->app_info.api_version = app->apiVersion;
@@ -143,8 +169,10 @@ vk_instance_init(struct vk_instance *instance,
     *    VK_ERROR_INCOMPATIBLE_DRIVER for any value of apiVersion."
     */
    if (VERSION_IS_1_0(instance_version) &&
-       !VERSION_IS_1_0(instance->app_info.api_version))
-      return VK_ERROR_INCOMPATIBLE_DRIVER;
+       !VERSION_IS_1_0(instance->app_info.api_version)) {
+      result = VK_ERROR_INCOMPATIBLE_DRIVER;
+      goto fail;
+   }
 
    instance->supported_extensions = supported_extensions;
 
@@ -156,21 +184,27 @@ vk_instance_init(struct vk_instance *instance,
             break;
       }
 
-      if (idx >= VK_INSTANCE_EXTENSION_COUNT)
-         return vk_errorf(instance, VK_ERROR_EXTENSION_NOT_PRESENT,
-                          "%s not supported",
-                          pCreateInfo->ppEnabledExtensionNames[i]);
+      if (idx >= VK_INSTANCE_EXTENSION_COUNT) {
+         result = vk_errorf(instance, VK_ERROR_EXTENSION_NOT_PRESENT,
+                            "%s not supported",
+                            pCreateInfo->ppEnabledExtensionNames[i]);
+         goto fail;
+      }
 
-      if (!supported_extensions->extensions[idx])
-         return vk_errorf(instance, VK_ERROR_EXTENSION_NOT_PRESENT,
-                          "%s not supported",
-                          pCreateInfo->ppEnabledExtensionNames[i]);
+      if (!supported_extensions->extensions[idx]) {
+         result = vk_errorf(instance, VK_ERROR_EXTENSION_NOT_PRESENT,
+                            "%s not supported",
+                            pCreateInfo->ppEnabledExtensionNames[i]);
+         goto fail;
+      }
 
 #ifdef ANDROID_STRICT
-      if (!vk_android_allowed_instance_extensions.extensions[idx])
-         return vk_errorf(instance, VK_ERROR_EXTENSION_NOT_PRESENT,
-                          "%s not supported",
-                          pCreateInfo->ppEnabledExtensionNames[i]);
+      if (!vk_android_allowed_instance_extensions.extensions[idx]) {
+         result = vk_errorf(instance, VK_ERROR_EXTENSION_NOT_PRESENT,
+                            "%s not supported",
+                            pCreateInfo->ppEnabledExtensionNames[i]);
+         goto fail;
+      }
 #endif
 
       instance->enabled_extensions.extensions[idx] = true;
@@ -182,14 +216,17 @@ vk_instance_init(struct vk_instance *instance,
    vk_instance_dispatch_table_from_entrypoints(
       &instance->dispatch_table, &vk_common_instance_entrypoints, false);
 
-   if (mtx_init(&instance->debug_report.callbacks_mutex, mtx_plain) != 0)
-      return vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+   if (mtx_init(&instance->debug_report.callbacks_mutex, mtx_plain) != 0) {
+      result = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+      goto fail;
+   }
 
    list_inithead(&instance->debug_report.callbacks);
 
    if (mtx_init(&instance->debug_utils.callbacks_mutex, mtx_plain) != 0) {
       mtx_destroy(&instance->debug_report.callbacks_mutex);
-      return vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+      result = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+      goto fail;
    }
 
    list_inithead(&instance->debug_utils.callbacks);
@@ -199,7 +236,8 @@ vk_instance_init(struct vk_instance *instance,
    if (mtx_init(&instance->physical_devices.mutex, mtx_plain) != 0) {
       mtx_destroy(&instance->debug_report.callbacks_mutex);
       mtx_destroy(&instance->debug_utils.callbacks_mutex);
-      return vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+      result = vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+      goto fail;
    }
 
    instance->trace_mode = parse_debug_string(os_get_option("MESA_VK_TRACE"), trace_options);
@@ -218,6 +256,10 @@ vk_instance_init(struct vk_instance *instance,
 #endif
 
    return VK_SUCCESS;
+fail:
+   vk_instance_free_create_info(instance);
+   vk_object_base_finish(&instance->base);
+   return result;
 }
 
 static void
@@ -251,20 +293,10 @@ vk_instance_finish(struct vk_instance *instance)
          vk_free2(&instance->alloc, &messenger->alloc, messenger);
       }
    }
-   if (unlikely(!list_is_empty(&instance->debug_utils.instance_callbacks))) {
-      list_for_each_entry_safe(struct vk_debug_utils_messenger, messenger,
-                               &instance->debug_utils.instance_callbacks,
-                               link) {
-         list_del(&messenger->link);
-         vk_object_base_finish(&messenger->base);
-         vk_free2(&instance->alloc, &messenger->alloc, messenger);
-      }
-   }
+   vk_instance_free_create_info(instance);
    mtx_destroy(&instance->debug_report.callbacks_mutex);
    mtx_destroy(&instance->debug_utils.callbacks_mutex);
    mtx_destroy(&instance->physical_devices.mutex);
-   vk_free(&instance->alloc, (char *)instance->app_info.app_name);
-   vk_free(&instance->alloc, (char *)instance->app_info.engine_name);
    vk_object_base_finish(&instance->base);
 }
 

@@ -297,6 +297,7 @@ struct rd_draw {
    bool rasterizer_discard;
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
+   VkDeviceSize vertex_sizes[32];
    uint32_t push[RD_MAX_PUSH_CONSTANTS_DWORDS];
    /* descriptors of each stage's resources, copied when recorded */
    struct rd_descriptor *descriptors[2];
@@ -314,6 +315,7 @@ struct rd_render_query {
    uint32_t query;
    bool end;
    uint32_t draw_index; /* takes effect before this draw of the render */
+   bool zero;
 };
 /* One dynamic-rendering instance: its attachments and its draws. */
 struct rd_render {
@@ -395,6 +397,7 @@ struct rd_command_buffer {
    } bind[2];
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
+   VkDeviceSize vertex_sizes[32];
    struct rd_buffer *index_buffer;
    VkDeviceSize index_offset;
    VkIndexType index_type;

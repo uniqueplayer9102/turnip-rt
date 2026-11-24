@@ -1,0 +1,64 @@
+import argparse
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import tempfile
+
+
+def extract(source, name, cpp=False):
+    prefix = r'^static bool ' if cpp else r'^(?:static )?(?:void|bool|uint32_t|uint64_t|VkResult)\n'
+    match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
+    assert match, name
+    return source[match.start():source.index('\n}', match.end()) + 3] + '\n'
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--driver-source', type=Path)
+    parser.add_argument('--cc', default='cc')
+    parser.add_argument('--cxx', default='c++')
+    parser.add_argument('--include', type=Path)
+    args = parser.parse_args()
+    tests = Path(__file__).resolve().parent
+    driver = args.driver_source or tests.parent / 'radish'
+    graphics = (driver / 'rd_graphics.c').read_text()
+    trace = (driver / 'rd_trace.c').read_text()
+    resources = (driver / 'rd_resources.c').read_text()
+    cache = (driver / 'rd_pipeline_cache.cpp').read_text()
+    direct = extract(graphics, 'rd_execute_render_direct')
+    assert re.search(r'result\s*=\s*queries\s*\?\s*rd_finish_submit\(', direct)
+    assert direct.index('result = queries ?') < direct.index('if (result == VK_SUCCESS && queries)')
+    assert 'q.zero |= i != 0;' in graphics
+    assert '.pipelineStatisticsQuery = false' in (driver / 'rd_instance.c').read_text()
+    assert 'util_dynarray_append(' not in graphics
+    with tempfile.TemporaryDirectory(prefix='radish-correctness-unit-') as directory:
+        directory = Path(directory)
+        (directory / 'trace_defs_under_test.h').write_text(
+            (driver / 'rd_trace.h').read_text().replace('#include "util/u_dynarray.h"\n', ''))
+        names = ('rd_render_append_query', 'rd_render_append_meta_draw', 'rd_primitive_count',
+                 'rd_restart_counts', 'rd_vertex_fetch_size', 'rd_render_query_op',
+                 'rd_render_needs_query_accounting', 'rd_account_draw')
+        (directory / 'graphics_under_test.h').write_text(''.join(extract(graphics, name) for name in names))
+        names = ('rd_trace_accumulate', 'rd_trace_submit_begin', 'rd_trace_submit_end',
+                 'rd_trace_needs_resolve', 'rd_trace_command_begin', 'rd_trace_command_end',
+                 'rd_trace_resolve')
+        (directory / 'trace_under_test.h').write_text(''.join(extract(trace, name) for name in names))
+        color = resources[resources.index('struct rd_border_color {'):resources.index('\n_Static_assert')]
+        (directory / 'border_under_test.h').write_text(color + extract(resources, 'rd_init_border_colors'))
+        (directory / 'cache_under_test.h').write_text(extract(cache, 'resource_metadata_valid', True) +
+                                                    extract(cache, 'variant_resources_valid', True))
+        includes = ['-I', str(directory)]
+        if args.include:
+            includes += ['-I', str(args.include)]
+        for compiler, source, standard in ((args.cc, 'radish_correctness_unit_test.c', '-std=gnu11'),
+                                            (args.cxx, 'radish_cache_metadata_test.cpp', '-std=c++17')):
+            binary = directory / Path(source).stem
+            subprocess.run([*shlex.split(compiler), standard, '-Wall', '-Wextra', '-Werror', '-O2',
+                            *includes, '-o', str(binary), str(tests / source)], check=True)
+            subprocess.run([str(binary)], check=True, timeout=15)
+    print('QUERY_POLICY PASS: accounting waits for completion; ordinary renders remain deferred; unsupported statistics are not advertised')
+
+
+if __name__ == '__main__':
+    main()

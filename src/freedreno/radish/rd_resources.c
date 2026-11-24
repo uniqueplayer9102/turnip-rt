@@ -42,7 +42,7 @@ rd_init_border_colors(struct rd_device *device)
    if (!map) {
       fd_bo_del(device->border_colors);
       device->border_colors = NULL;
-      return VK_ERROR_MEMORY_MAP_FAILED;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    uint64_t address = fd_bo_get_iova(device->border_colors);
    device->border_colors_offset = align64(address, 8192) - address;

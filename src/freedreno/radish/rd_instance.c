@@ -333,7 +333,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    extensions.KHR_timeline_semaphore = timeline;
    extensions.EXT_multi_draw = rd_graphics_enabled();
    properties.maxTimelineSemaphoreValueDifference = timeline ? UINT64_MAX : 0;
-   const struct vk_features features = { .pipelineStatisticsQuery = true, .robustBufferAccess = true,
+   const struct vk_features features = { .pipelineStatisticsQuery = false, .robustBufferAccess = true,
       .samplerYcbcrConversion = true,
       .synchronization2 = true,
       .multiview = true, .occlusionQueryPrecise = true, .hostQueryReset = true,

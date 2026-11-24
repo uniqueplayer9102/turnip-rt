@@ -2,6 +2,7 @@
 #include "rd_private.h"
 #include "vk_pipeline.h"
 #include "vk_pipeline_cache.h"
+#include "vk_format.h"
 #include "compiler/nir/nir_serialize.h"
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_nir.h"
@@ -113,7 +114,163 @@ static vk_pipeline_cache_object *deserialize(vk_pipeline_cache *cache,
 
 
 
-static bool variant_bounds(rd_device *device, const void *data, size_t size,
+static bool resource_metadata_valid(const rd_pipeline *saved,
+                                    const vk_pipeline_layout *layout,
+                                    VkShaderStageFlagBits stage)
+{
+   const uint32_t count = saved->resource_count;
+   const rd_nir_resource_usage *usage = &saved->resource_usage;
+   if (!layout || layout->set_count > RD_MAX_SETS || count > RD_MAX_ACTIVE_RESOURCES ||
+       saved->descriptor_count != count || saved->buffer_count > 32 ||
+       usage->texture_count > 16 || usage->sampler_count > 16 || usage->image_count > 16 ||
+       saved->buffer_count + usage->image_count > 32 ||
+       saved->sampling_mask || saved->sampling_buffer ||
+       (stage != VK_SHADER_STAGE_COMPUTE_BIT && saved->buffer_count > 16))
+      return false;
+   const uint64_t descriptors = count == 64 ? UINT64_MAX : (UINT64_C(1) << count) - 1;
+   if ((saved->used_descriptors | usage->descriptors) & ~descriptors ||
+       usage->textures & ~((1u << usage->texture_count) - 1) ||
+       usage->samplers & ~((1u << usage->sampler_count) - 1) ||
+       usage->images & ~((1u << usage->image_count) - 1))
+      return false;
+   const size_t boolean_offsets[] = {
+      offsetof(rd_pipeline, linear_subgroups), offsetof(rd_pipeline, packed_1d_barrier),
+      offsetof(rd_pipeline, linear_barriers), offsetof(rd_pipeline, batch_local_memory),
+   };
+   for (size_t offset : boolean_offsets)
+      if (reinterpret_cast<const uint8_t *>(saved)[offset] > 1)
+         return false;
+   uint32_t buffers = 0;
+   uint32_t buffer_slots = 0, texture_slots = 0, sampler_slots = 0, image_slots = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      const rd_nir_resource_binding *resource = &saved->resources[i];
+      if (resource->descriptor_set >= layout->set_count ||
+          !layout->set_layouts[resource->descriptor_set] || resource->descriptor_slot != i ||
+          !resource->plane_count || resource->plane_count > 3)
+         return false;
+      const rd_set_layout *set = container_of(layout->set_layouts[resource->descriptor_set], rd_set_layout, vk);
+      if (resource->logical_slot >= set->descriptor_count || resource->logical_slot >= RD_MAX_BINDINGS)
+         return false;
+      const rd_binding *binding = nullptr;
+      for (uint32_t j = 0; j < set->binding_count; j++)
+         if (set->bindings[j].binding == resource->binding)
+            binding = &set->bindings[j];
+      if (!binding || binding->type != resource->type ||
+          resource->array_element >= binding->count ||
+          resource->logical_slot != uint64_t(binding->slot) + resource->array_element ||
+          !(binding->stages & stage))
+         return false;
+      uint32_t planes = 1;
+      if (binding->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+          binding->immutable_offset != UINT32_MAX) {
+         if (binding->immutable_offset >= set->immutable_count ||
+             resource->array_element >= set->immutable_count - binding->immutable_offset)
+            return false;
+         const vk_sampler_state *sampler = &set->immutable_sampler_states[binding->immutable_offset + resource->array_element];
+         if (sampler->has_ycbcr_conversion)
+            planes = vk_format_get_plane_count(sampler->ycbcr_conversion.format);
+      }
+      if (resource->plane_count != planes)
+         return false;
+      bool buffer = false, texture = false, sampler = false, image = false;
+      switch (resource->type) {
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: buffer = true; break;
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: texture = sampler = true; break;
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: texture = true; break;
+      case VK_DESCRIPTOR_TYPE_SAMPLER: sampler = true; break;
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: image = true; break;
+      default: return false;
+      }
+      if (buffer) {
+         uint32_t slot = resource->buffer_slot;
+         if (slot >= saved->buffer_count || saved->buffer_descriptors[slot] != i ||
+             (buffer_slots & (1u << slot)))
+            return false;
+         buffer_slots |= 1u << slot;
+         buffers++;
+      } else if (resource->buffer_slot != UINT32_MAX) {
+         return false;
+      }
+      if (texture) {
+         uint32_t slot = resource->texture_slot;
+         if (slot >= 16 || planes > 16 - slot)
+            return false;
+         for (uint32_t p = 0; p < planes; p++) {
+            if (saved->texture_descriptors[slot + p] != i || saved->texture_planes[slot + p] != p ||
+                (texture_slots & (1u << (slot + p))))
+               return false;
+            texture_slots |= 1u << (slot + p);
+         }
+      } else if (resource->texture_slot != UINT32_MAX) {
+         return false;
+      }
+      if (sampler) {
+         uint32_t slot = resource->sampler_slot;
+         if (slot >= 16 || planes > 16 - slot)
+            return false;
+         for (uint32_t p = 0; p < planes; p++) {
+            if (saved->sampler_descriptors[slot + p] != i || (sampler_slots & (1u << (slot + p))))
+               return false;
+            sampler_slots |= 1u << (slot + p);
+         }
+      } else if (resource->sampler_slot != UINT32_MAX) {
+         return false;
+      }
+      if (image) {
+         uint32_t slot = resource->image_slot;
+         if (slot >= 16 || saved->image_descriptors[slot] != i || (image_slots & (1u << slot)))
+            return false;
+         image_slots |= 1u << slot;
+      } else if (resource->image_slot != UINT32_MAX) {
+         return false;
+      }
+   }
+   return buffers == saved->buffer_count && !(usage->textures & ~texture_slots) &&
+          !(usage->samplers & ~sampler_slots) && !(usage->images & ~image_slots);
+}
+
+static bool variant_resources_valid(const rd_pipeline *saved, const ir3_shader_variant *variant,
+                                    const struct ir3_const_state *state)
+{
+   const ir3_ibo_mapping *mapping = &variant->image_mapping;
+   if (variant->inputs_count > ARRAY_SIZE(variant->inputs) ||
+       variant->outputs_count > ARRAY_SIZE(variant->outputs) ||
+       mapping->num_tex > ARRAY_SIZE(mapping->tex_to_image) ||
+       mapping->tex_base > 32 || mapping->num_tex > 32 - mapping->tex_base ||
+       variant->num_ssbos > 32 || saved->resource_usage.image_count > 32 - variant->num_ssbos)
+      return false;
+   for (uint32_t i = 0; i < mapping->num_tex; i++) {
+      uint32_t resource = mapping->tex_to_image[i];
+      if (resource & UAV_SSBO) {
+         if ((resource & ~UAV_SSBO) >= saved->buffer_count)
+            return false;
+      } else if (resource >= saved->resource_usage.image_count) {
+         return false;
+      }
+   }
+   if (!state)
+      return true;
+   if (state->image_dims.count > 128 || state->image_dims.mask & ~0xffffu ||
+       state->ubo_state.num_enabled > ARRAY_SIZE(state->ubo_state.range))
+      return false;
+   for (uint32_t i = 0; i < 16; i++)
+      if ((state->image_dims.mask & (1u << i)) &&
+          (i >= saved->resource_usage.image_count || state->image_dims.off[i] > 128 - 6))
+         return false;
+   for (uint32_t i = 0; i < IR3_MAX_SHADER_BUFFERS; i++)
+      if ((state->ssbo_size_mask & (1u << i)) &&
+          (i >= saved->buffer_count || state->ssbo_size_offset[i] >= 128))
+         return false;
+   return true;
+}
+
+static bool variant_bounds(rd_device *device, const rd_pipeline *saved, const void *data, size_t size,
                            VkShaderStageFlagBits stage)
 {
    blob_reader in;
@@ -139,8 +296,11 @@ static bool variant_bounds(rd_device *device, const void *data, size_t size,
       if (in.overrun || !v.info.size || v.info.size > size_t(in.end - in.current))
          return false;
       blob_skip_bytes(&in, v.info.size);
+      struct ir3_const_state state = {};
       if (!i)
-         blob_skip_bytes(&in, sizeof(struct ir3_const_state));
+         blob_copy_bytes(&in, &state, sizeof(state));
+      if (in.overrun || !variant_resources_valid(saved, &v, i ? nullptr : &state))
+         return false;
       if (!device->compiler->info->props.load_shader_consts_via_preamble) {
          uint32_t count = blob_read_uint32(&in);
          if (in.overrun || count > size_t(in.end - in.current) / sizeof(uint32_t))
@@ -173,12 +333,10 @@ rd_pipeline_cache_restore(rd_device *device, rd_pipeline *pipeline,
    blob_copy_bytes(&in, &options, sizeof(options));
    uint32_t native_size = blob_read_uint32(&in);
    uint32_t nir_size = blob_read_uint32(&in);
-   bool valid = !in.overrun && saved.resource_count <= RD_MAX_ACTIVE_RESOURCES &&
-      saved.descriptor_count == saved.resource_count && saved.buffer_count <= 32 &&
-      saved.resource_usage.texture_count <= 16 && saved.resource_usage.sampler_count <= 16 &&
-      saved.resource_usage.image_count <= 16 && saved.compile_flags == flags &&
+   bool valid = !in.overrun && resource_metadata_valid(&saved, pipeline->layout, stage->stage) &&
+       saved.compile_flags == flags &&
       uint64_t(native_size) + nir_size == uint64_t(in.end - in.current) &&
-      variant_bounds(device, in.current, native_size, stage->stage);
+       variant_bounds(device, &saved, in.current, native_size, stage->stage);
    if (stage->stage != VK_SHADER_STAGE_COMPUTE_BIT)
       valid = valid && !nir_size && saved.buffer_count <= 16;
    const ir3_shader_variant *variant = nullptr;

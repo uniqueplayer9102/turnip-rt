@@ -700,13 +700,14 @@ rd_CmdBindVertexBuffers2(VkCommandBuffer handle, uint32_t first, uint32_t count,
                          const VkDeviceSize *sizes, const VkDeviceSize *strides)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   if (first + count > 32 || strides) {
+   if (first > 32 || count > 32 - first || strides) {
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    for (uint32_t i = 0; i < count; i++) {
       command->vertex_buffers[first + i] = rd_buffer_from_handle(buffers[i]);
       command->vertex_offsets[first + i] = offsets[i];
+      command->vertex_sizes[first + i] = sizes ? sizes[i] : VK_WHOLE_SIZE;
    }
 }
 
@@ -870,6 +871,26 @@ rd_clone_descriptors(struct rd_command_buffer *command, struct rd_render *render
    return true;
 }
 
+static bool
+rd_render_append_query(struct util_dynarray *queries, const struct rd_render_query *query)
+{
+   struct rd_render_query *copy = util_dynarray_grow(queries, struct rd_render_query, 1);
+   if (!copy)
+      return false;
+   *copy = *query;
+   return true;
+}
+
+static bool
+rd_render_append_meta_draw(struct util_dynarray *draws, const struct rd_draw *draw)
+{
+   struct rd_draw *copy = util_dynarray_grow(draws, struct rd_draw, 1);
+   if (!copy)
+      return false;
+   *copy = *draw;
+   return true;
+}
+
 bool
 rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src)
 {
@@ -912,7 +933,10 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
    util_dynarray_foreach(&src->queries, struct rd_render_query, query) {
       struct rd_render_query copy = *query;
       copy.draw_index += base;
-      util_dynarray_append(&dst->queries, copy);
+      if (!rd_render_append_query(&dst->queries, &copy)) {
+         rd_set_error(&primary->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return false;
+      }
    }
    dst->trailing_barrier |= src->trailing_barrier;
    dst->load_clear_pending |= src->load_clear_pending;
@@ -934,9 +958,12 @@ rd_render_query(struct rd_command_buffer *command, struct rd_query_pool *pool,
    }
    if (!command->render)
       return false;
-   struct rd_render_query op = { pool, query, end,
-      util_dynarray_num_elements(&command->render->draws, struct rd_draw) };
-   util_dynarray_append(&command->render->queries, op);
+   struct rd_render_query op = {
+      .pool = pool, .query = query, .end = end,
+      .draw_index = util_dynarray_num_elements(&command->render->draws, struct rd_draw),
+   };
+   if (!rd_render_append_query(&command->render->queries, &op))
+      rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
    return true;
 }
 
@@ -979,6 +1006,7 @@ rd_record_draw(struct rd_command_buffer *command)
    };
    memcpy(draw.vertex_buffers, command->vertex_buffers, sizeof(draw.vertex_buffers));
    memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
+   memcpy(draw.vertex_sizes, command->vertex_sizes, sizeof(draw.vertex_sizes));
    memcpy(draw.push, command->gfx_push, sizeof(draw.push));
    if (!rd_copy_stage_descriptors(command, command->render, pipeline->gfx->vs.res, &draw.descriptors[0]) ||
        !rd_copy_stage_descriptors(command, command->render, pipeline->gfx->fs.res, &draw.descriptors[1])) {
@@ -1860,6 +1888,21 @@ rd_gfx_consts(struct fd_ringbuffer *ring, struct rd_device *device,
    }
 }
 
+static uint32_t
+rd_vertex_fetch_size(VkDeviceSize buffer_size, VkDeviceSize binding_offset,
+                     uint32_t attribute_offset, VkDeviceSize binding_size)
+{
+   if (binding_offset > buffer_size || attribute_offset > buffer_size - binding_offset)
+      return 0;
+   VkDeviceSize size = buffer_size - binding_offset - attribute_offset;
+   if (binding_size != VK_WHOLE_SIZE) {
+      if (attribute_offset >= binding_size)
+         return 0;
+      size = MIN2(size, binding_size - attribute_offset);
+   }
+   return MIN2(size, UINT32_MAX);
+}
+
 static void
 rd_gfx_vertex_buffers(struct fd_ringbuffer *ring, struct rd_device *device,
                       const struct rd_gfx_pipeline *gfx, const struct rd_draw *draw)
@@ -1882,7 +1925,8 @@ rd_gfx_vertex_buffers(struct fd_ringbuffer *ring, struct rd_device *device,
       uint32_t size = 0;
       OUT_PKT4(ring, REG_A5XX_VFD_FETCH(j), 4);
       if (buffer && buffer->memory && offset < buffer->vk.size) {
-         size = MIN2(buffer->vk.size - offset, UINT32_MAX);
+          size = rd_vertex_fetch_size(buffer->vk.size, draw->vertex_offsets[attr->binding],
+                                      attr->offset, draw->vertex_sizes[attr->binding]);
          OUT_RELOC(ring, buffer->memory->bo, buffer->offset + offset, 0, 0);
       } else {
          OUT_RELOC(ring, device->control, 0, 0, 0);
@@ -2283,7 +2327,7 @@ rd_render_query_op(struct rd_device *device, const struct rd_render_query *op)
    if (!op->end) {
       memset(slot->values, 0, sizeof(slot->values));
       slot->available = false;
-      if (stats && !slot->active) {
+      if (stats && !op->zero && !slot->active) {
          slot->active = true;
          list_addtail(&slot->active_link, &device->active_queries);
       }
@@ -2318,8 +2362,68 @@ rd_primitive_count(VkPrimitiveTopology topology, uint32_t n, uint32_t patch)
 }
 
 static void
+rd_restart_counts(VkPrimitiveTopology topology, uint32_t patch, const uint8_t *indices,
+                  uint32_t count, uint32_t index_size, uint64_t *vertices, uint64_t *primitives)
+{
+   uint32_t segment = 0;
+   uint32_t restart = index_size == 2 ? UINT16_MAX : UINT32_MAX;
+   *vertices = *primitives = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      uint32_t index;
+      if (index_size == 2) {
+         uint16_t value;
+         memcpy(&value, indices + (size_t)i * 2, sizeof(value));
+         index = value;
+      } else {
+         memcpy(&index, indices + (size_t)i * 4, sizeof(index));
+      }
+      if (index == restart) {
+         *primitives += rd_primitive_count(topology, segment, patch);
+         segment = 0;
+      } else {
+         (*vertices)++;
+         segment++;
+      }
+   }
+   *primitives += rd_primitive_count(topology, segment, patch);
+}
+
+static VkResult
+rd_draw_counts(struct rd_device *device, const struct rd_draw *draw,
+               uint64_t *vertices, uint64_t *primitives)
+{
+   const struct vk_dynamic_graphics_state *dyn = &draw->pipeline->gfx->dynamic;
+   *vertices = draw->vertex_count;
+   *primitives = rd_primitive_count(dyn->ia.primitive_topology, draw->vertex_count,
+                                    dyn->ts.patch_control_points);
+   if (draw->indexed && dyn->ia.primitive_restart_enable) {
+      const struct rd_buffer *buffer = draw->index_buffer;
+      uint32_t index_size = draw->index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+      uint64_t first = (uint64_t)draw->first_index * index_size;
+      uint64_t bytes = (uint64_t)draw->vertex_count * index_size;
+      if (!buffer || !buffer->memory || !buffer->memory->bo ||
+          (draw->index_type != VK_INDEX_TYPE_UINT16 && draw->index_type != VK_INDEX_TYPE_UINT32) ||
+          draw->index_offset > buffer->vk.size || first > buffer->vk.size - draw->index_offset ||
+          bytes > buffer->vk.size - draw->index_offset - first)
+         return VK_ERROR_UNKNOWN;
+      if (fd_bo_cpu_prep(buffer->memory->bo, device->pipe, FD_BO_PREP_READ))
+         return VK_ERROR_DEVICE_LOST;
+      const uint8_t *map = fd_bo_map(buffer->memory->bo);
+      if (!map)
+         return VK_ERROR_MEMORY_MAP_FAILED;
+      __sync_synchronize();
+      rd_restart_counts(dyn->ia.primitive_topology, dyn->ts.patch_control_points,
+         map + buffer->offset + draw->index_offset + first, draw->vertex_count,
+         index_size, vertices, primitives);
+   }
+   *vertices *= draw->instance_count;
+   *primitives *= draw->instance_count;
+   return VK_SUCCESS;
+}
+
+static VkResult
 rd_account_draw(struct rd_device *device, const struct rd_draw *draw, uint64_t samples,
-                uint64_t fragments)
+                 uint64_t fragments)
 {
    if (draw->occlusion_pool) {
       mtx_lock(&draw->occlusion_pool->mutex);
@@ -2327,11 +2431,11 @@ rd_account_draw(struct rd_device *device, const struct rd_draw *draw, uint64_t s
       mtx_unlock(&draw->occlusion_pool->mutex);
    }
    if (list_is_empty(&device->active_queries))
-      return;
-   const struct vk_dynamic_graphics_state *dyn = &draw->pipeline->gfx->dynamic;
-   uint64_t vertices = (uint64_t)draw->vertex_count * draw->instance_count;
-   uint64_t primitives = rd_primitive_count(dyn->ia.primitive_topology, draw->vertex_count,
-                                            dyn->ts.patch_control_points) * draw->instance_count;
+      return VK_SUCCESS;
+   uint64_t vertices, primitives;
+   VkResult result = rd_draw_counts(device, draw, &vertices, &primitives);
+   if (result != VK_SUCCESS)
+      return result;
    list_for_each_entry(struct rd_query_slot, slot, &device->active_queries, active_link) {
       struct rd_query_pool *pool = slot->pool;
       mtx_lock(&pool->mutex);
@@ -2343,6 +2447,7 @@ rd_account_draw(struct rd_device *device, const struct rd_draw *draw, uint64_t s
       slot->values[7] += fragments;  /* fragment shader invocations */
       mtx_unlock(&pool->mutex);
    }
+   return VK_SUCCESS;
 }
 
 static bool
@@ -2634,11 +2739,14 @@ rd_execute_render_layers(struct rd_device *device, const struct rd_render *rende
          if (keep) {
             struct rd_draw draw = *d;
             draw.barrier |= barrier;
-            util_dynarray_append(&draws, draw);
+            if (!rd_render_append_meta_draw(&draws, &draw)) {
+               result = VK_ERROR_OUT_OF_HOST_MEMORY;
+               break;
+            }
             barrier = false;
          }
       }
-      if (layer == 0) {
+       if (result == VK_SUCCESS && layer == 0) {
          const struct rd_draw *source = util_dynarray_begin(&render->draws);
          unsigned source_index = 0, kept_index = 0;
          util_dynarray_foreach(&render->queries, struct rd_render_query, q) {
@@ -2647,12 +2755,16 @@ rd_execute_render_layers(struct rd_device *device, const struct rd_render *rende
                   kept_index++;
             struct rd_render_query query = *q;
             query.draw_index = kept_index;
-            util_dynarray_append(&queries, query);
+             if (!rd_render_append_query(&queries, &query)) {
+                result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                break;
+             }
          }
       }
       copy.draws = draws;
       copy.queries = queries;
-      result = rd_execute_render_view(device, &copy, window);
+       if (result == VK_SUCCESS)
+          result = rd_execute_render_view(device, &copy, window);
       util_dynarray_fini(&draws);
       util_dynarray_fini(&queries);
    }
@@ -2706,13 +2818,20 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render,
          if (op->end ? !last : !first)
             continue;
          for (unsigned i = 0; i < util_bitcount(render->view_mask); i++) {
-            struct rd_render_query q = { op->pool, op->query + i, op->end, op->draw_index };
-            if (q.query < q.pool->vk.query_count)
-               util_dynarray_append(&queries, q);
+            struct rd_render_query q = *op;
+            q.query += i;
+            q.zero |= i != 0;
+            if (q.query < q.pool->vk.query_count && !rd_render_append_query(&queries, &q)) {
+               result = VK_ERROR_OUT_OF_HOST_MEMORY;
+               break;
+            }
          }
+         if (result != VK_SUCCESS)
+            break;
       }
       copy.queries = queries;
-      result = rd_execute_render_view(device, &copy, window);
+      if (result == VK_SUCCESS)
+         result = rd_execute_render_view(device, &copy, window);
       util_dynarray_fini(&queries);
       if (result != VK_SUCCESS)
          break;
@@ -2921,12 +3040,12 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    device->render_timing_bo = timer_bo;
    device->render_timing_start_ns = timer_start;
    device->render_timing_gmem = false;
-   result = counted ?
+   result = queries ?
       rd_finish_submit(device, submit, ring, NULL, NULL) :
       rd_finish_window_submit(device, submit, ring, window, initial_ring_start, true);
    device->render_timing_bo = NULL;
    if (timer_bo) {
-      if (!window || counted)
+      if (!window || queries)
          rd_render_timing_report(device, timer_bo, timer_start, false, result);
       fd_bo_del(timer_bo);
    }
@@ -2949,10 +3068,13 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
                     resolved[i].instance_count, samples, fragments,
                     slots[i] >= 0 ? values[slots[i] * 4] : 0, slots[i] >= 0 ? values[slots[i] * 4 + 1] : 0,
                     slots[i] >= 0 ? values[slots[i] * 4 + 2] : 0, slots[i] >= 0 ? values[slots[i] * 4 + 3] : 0);
-         rd_account_draw(device, &resolved[i], samples, fragments);
-      }
-      for (; op < op_end; op++)
-         rd_render_query_op(device, op);
+         result = rd_account_draw(device, &resolved[i], samples, fragments);
+         if (result != VK_SUCCESS)
+            break;
+       }
+      if (result == VK_SUCCESS)
+         for (; op < op_end; op++)
+            rd_render_query_op(device, op);
    }
    if (counters)
       fd_bo_del(counters);
@@ -3995,8 +4117,8 @@ rd_resolve_view(struct rd_device *device, struct rd_image_view *src, struct rd_i
    draw.push[0] = dx;
    draw.push[1] = dy;
    draw.descriptors[1] = &descriptor;
-   util_dynarray_append(&render.draws, draw);
-   VkResult result = rd_execute_render(device, &render, NULL);
+   VkResult result = rd_render_append_meta_draw(&render.draws, &draw) ?
+      rd_execute_render(device, &render, NULL) : VK_ERROR_OUT_OF_HOST_MEMORY;
    util_dynarray_fini(&render.draws);
    return result;
 }
@@ -4158,8 +4280,8 @@ rd_blit_layer(struct rd_device *device, const struct rd_blit *blit, struct rd_pi
    memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
    memcpy(&draw.push[9], &src_w, sizeof(src_w));
    draw.descriptors[1] = &descriptor;
-   util_dynarray_append(&render.draws, draw);
-   VkResult result = rd_execute_render(device, &render, NULL);
+   VkResult result = rd_render_append_meta_draw(&render.draws, &draw) ?
+      rd_execute_render(device, &render, NULL) : VK_ERROR_OUT_OF_HOST_MEMORY;
    util_dynarray_fini(&render.draws);
    return result;
 }
@@ -4252,8 +4374,8 @@ rd_execute_clear_ds(struct rd_device *device, const struct rd_blit *blit)
          VkClearValue value = { .depthStencil = blit->clear };
          struct rd_draw draw;
          rd_clear_draw(pipeline, area, -1, blit->aspects, value, &draw);
-         util_dynarray_append(&render.draws, draw);
-         VkResult result = rd_execute_render(device, &render, NULL);
+          VkResult result = rd_render_append_meta_draw(&render.draws, &draw) ?
+             rd_execute_render(device, &render, NULL) : VK_ERROR_OUT_OF_HOST_MEMORY;
          util_dynarray_fini(&render.draws);
          if (result != VK_SUCCESS)
             return result;
@@ -4501,8 +4623,8 @@ rd_copy_texels(struct rd_device *device, struct rd_image *src, uint32_t src_leve
    float rect_ndc[4] = { -1, -1, 1, 1 };
    memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
    draw.descriptors[1] = &descriptor;
-   util_dynarray_append(&render.draws, draw);
-   VkResult result = rd_execute_render_direct(device, &render, window);
+   VkResult result = rd_render_append_meta_draw(&render.draws, &draw) ?
+      rd_execute_render_direct(device, &render, window) : VK_ERROR_OUT_OF_HOST_MEMORY;
    util_dynarray_fini(&render.draws);
    return result;
 }
@@ -4587,7 +4709,10 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
                continue;
             struct rd_render_query q = *op;
             q.draw_index -= start;
-            util_dynarray_append(&queries, q);
+             if (!rd_render_append_query(&queries, &q)) {
+                result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                break;
+             }
          }
          segment.queries = queries;
          if (start) {
@@ -4600,7 +4725,8 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
             for (unsigned i = 0; i < segment.color_count; i++)
                segment.color[i].resolve = NULL;
          }
-         result = rd_execute_render_direct(device, &segment, window);
+          if (result == VK_SUCCESS)
+             result = rd_execute_render_direct(device, &segment, window);
          util_dynarray_fini(&queries);
          if (result == VK_SUCCESS && !last && area.extent.width && area.extent.height)
             result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area,

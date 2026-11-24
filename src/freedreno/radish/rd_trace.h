@@ -19,6 +19,7 @@ struct rd_trace_record {
    uint64_t seq;            /* dispatch sequence number (dispatches only) */
    int64_t host_start_ns, host_ns, flush_ns, wait_ns;
    uint64_t submits, chunks, bytes;
+   uint64_t gpu_ticks, gpu_first, gpu_last, invalid, slot_total;
    uint32_t slot_first, slot_count;
    uint32_t type, grid[3], local[3], instrlen, max_reg, max_half_reg;
    uint32_t barrier, shared_size;
@@ -31,6 +32,7 @@ struct rd_trace {
    uint64_t *map;
    uint32_t next_slot, open_slot, pending_slots;
    bool open;
+   bool command_active;
    /* running host counters, sampled at command boundaries */
    int64_t flush_ns, wait_ns;
    uint64_t dispatch_seq, chunks;
