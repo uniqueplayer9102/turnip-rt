@@ -293,8 +293,6 @@ rd_image_required_blit_src(VkFormat format)
    case VK_FORMAT_R32G32B32A32_SFLOAT:
    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
-   case VK_FORMAT_D16_UNORM:
-   case VK_FORMAT_D32_SFLOAT:
       return true;
    default:
       return false;

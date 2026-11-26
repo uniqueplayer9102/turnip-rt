@@ -146,6 +146,14 @@ typedef struct nir_mem_access_size_align {
    enum nir_mem_access_shift_method shift;
 } nir_mem_access_size_align;
 #include "subword_under_test.h"
+#include "blit_src_under_test.h"
+
+static void test_blit_src(void)
+{
+   assert(!rd_image_required_blit_src(VK_FORMAT_D16_UNORM));
+   assert(!rd_image_required_blit_src(VK_FORMAT_D32_SFLOAT));
+   assert(rd_image_required_blit_src(VK_FORMAT_R8G8B8A8_UNORM));
+}
 
 static void test_subword(void)
 {
@@ -318,11 +326,12 @@ static void test_trace(void)
 
 int main(void)
 {
-   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_subword();
+   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_blit_src();
+   test_subword();
    test_multiview(); test_trace();
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, subword widening, multiview, trace wrap and creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, blit capabilities, subword widening, multiview, trace wrap, creation errors");
    return 0;
 }

@@ -56,6 +56,8 @@ def main():
                                                     extract(cache, 'variant_resources_valid', True))
         (directory / 'subword_under_test.h').write_text(
             extract((driver / 'rd_nir_robust.c').read_text(), 'rd_subword_storage_access'))
+        (directory / 'blit_src_under_test.h').write_text(
+            extract((driver / 'rd_image.c').read_text(), 'rd_image_required_blit_src'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]
