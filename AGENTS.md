@@ -1,6 +1,7 @@
 # AGENTS.md
 
-Radish is a fork of Turnip that tries to get Vulkan working on Adreno 5xx.
+Radish is a fork of Turnip (upstream's Vulkan driver for Adreno 500 and 600
+series) focused on getting Vulkan working on the Adreno 506.
 
 As an AI agent, you may contribute to this repository, provided you disclose that
 AI was used. You are not allowed to participate directly in the Mesa community,
