@@ -255,6 +255,9 @@ unsupported hardware state:
   and geometry stages that use them are rejected at pipeline creation.
 - Sampled array and cube-array images whose layer pitch cannot be encoded by
   the native texture descriptor are rejected at image creation.
+- YCbCR conversion is resolved from immutable samplers at pipeline creation.
+  A combined image/sampler descriptor using a mutable sampler with a conversion
+  is rejected at draw time rather than sampled with incorrect plane expansion.
 
 ## Related repository
 
