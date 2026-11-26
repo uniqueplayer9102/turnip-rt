@@ -46,7 +46,8 @@ struct rd_pipeline {
 };
 struct ir3_ibo_mapping { uint32_t num_tex, tex_base; uint8_t tex_to_image[32]; };
 struct ir3_shader_variant {
-   uint32_t inputs_count, outputs_count, inputs[64], outputs[64], num_ssbos;
+   struct { uint8_t slot, regid, compmask, inloc; } inputs[64], outputs[64];
+   uint32_t inputs_count, outputs_count, num_ssbos;
    ir3_ibo_mapping image_mapping;
 };
 struct ir3_const_state {
@@ -136,24 +137,34 @@ int main()
    setup(good, set, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
    ir3_shader_variant variant = {}; variant.num_ssbos = 1;
    ir3_const_state state = {};
-   assert(variant_resources_valid(&good, &variant, &state));
+   assert(variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_COMPUTE_BIT));
    variant.image_mapping.num_tex = 1;
    variant.image_mapping.tex_to_image[0] = UAV_SSBO;
-   assert(variant_resources_valid(&good, &variant, &state));
+   assert(variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_COMPUTE_BIT));
    variant.image_mapping.tex_to_image[0] = UAV_SSBO | 1;
-   assert(!variant_resources_valid(&good, &variant, &state));
+   assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_COMPUTE_BIT));
    variant.image_mapping.tex_to_image[0] = 0;
-   assert(!variant_resources_valid(&good, &variant, &state));
+   assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_COMPUTE_BIT));
    variant.image_mapping.num_tex = 0;
-   variant.inputs_count = 65; assert(!variant_resources_valid(&good, &variant, &state));
+   variant.inputs_count = 65; assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_FRAGMENT_BIT));
+   variant.inputs_count = 1;
+   variant.inputs[0] = {0, 0, 0xf, 124};
+   assert(variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_FRAGMENT_BIT));
+   variant.inputs[0].inloc = 125;
+   assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_FRAGMENT_BIT));
+   variant.inputs[0] = {0, 0, 0x1, 255};
+   assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_FRAGMENT_BIT));
+   variant.inputs[0] = {0, 0, 0, 124};
+   assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_FRAGMENT_BIT));
    variant.inputs_count = 0;
-   variant.outputs_count = 65; assert(!variant_resources_valid(&good, &variant, &state));
+   assert(variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_FRAGMENT_BIT));
+   variant.outputs_count = 65; assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_FRAGMENT_BIT));
    variant.outputs_count = 0;
-   state.ubo_state.num_enabled = 9; assert(!variant_resources_valid(&good, &variant, &state));
+   state.ubo_state.num_enabled = 9; assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_COMPUTE_BIT));
    state = {}; state.image_dims.count = 129;
-   assert(!variant_resources_valid(&good, &variant, &state));
+   assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_COMPUTE_BIT));
    state = {}; state.ssbo_size_mask = 1; state.ssbo_size_offset[0] = 128;
-   assert(!variant_resources_valid(&good, &variant, &state));
+   assert(!variant_resources_valid(&good, &variant, &state, VK_SHADER_STAGE_COMPUTE_BIT));
 
    good = {}; set = {};
    set.binding_count = set.descriptor_count = 64;

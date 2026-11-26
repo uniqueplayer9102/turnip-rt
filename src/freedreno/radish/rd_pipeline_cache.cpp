@@ -236,7 +236,8 @@ static bool resource_metadata_valid(const rd_pipeline *saved,
 }
 
 static bool variant_resources_valid(const rd_pipeline *saved, const ir3_shader_variant *variant,
-                                    const struct ir3_const_state *state)
+                                    const struct ir3_const_state *state,
+                                    VkShaderStageFlagBits stage)
 {
    const ir3_ibo_mapping *mapping = &variant->image_mapping;
    if (variant->inputs_count > ARRAY_SIZE(variant->inputs) ||
@@ -245,6 +246,17 @@ static bool variant_resources_valid(const rd_pipeline *saved, const ir3_shader_v
        mapping->tex_base > 32 || mapping->num_tex > 32 - mapping->tex_base ||
        variant->num_ssbos > 32 || saved->resource_usage.image_count > 32 - variant->num_ssbos)
       return false;
+   if (stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+      for (unsigned i = 0; i < variant->inputs_count; i++) {
+         unsigned compmask = variant->inputs[i].compmask;
+         unsigned last = 0;
+         for (unsigned b = 0; b < 4; b++)
+            if (compmask & (1u << b))
+               last = b + 1;
+         if (!last || variant->inputs[i].inloc > 128 - last)
+            return false;
+      }
+   }
    for (uint32_t i = 0; i < mapping->num_tex; i++) {
       uint32_t resource = mapping->tex_to_image[i];
       if (resource & UAV_SSBO) {
@@ -299,7 +311,7 @@ static bool variant_bounds(rd_device *device, const rd_pipeline *saved, const vo
       struct ir3_const_state state = {};
       if (!i)
          blob_copy_bytes(&in, &state, sizeof(state));
-      if (in.overrun || !variant_resources_valid(saved, &v, i ? nullptr : &state))
+      if (in.overrun || !variant_resources_valid(saved, &v, i ? nullptr : &state, stage))
          return false;
       if (!device->compiler->info->props.load_shader_consts_via_preamble) {
          uint32_t count = blob_read_uint32(&in);
