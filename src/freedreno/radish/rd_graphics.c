@@ -357,10 +357,13 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    bool lowered = rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
                                                  &shader->res->resource_usage);
    bool buffers = lowered && rd_lower_stage_buffers(nir, shader->res);
-   bool robust = buffers && (!device->vk.enabled_features.robustBufferAccess ||
+   bool widened = buffers && (nir->info.stage == MESA_SHADER_FRAGMENT ||
+                              rd_nir_lower_subword_storage(nir));
+   bool robust = widened && (!device->vk.enabled_features.robustBufferAccess ||
                              rd_nir_lower_robust_buffers(nir));
    bool fragment = nir->info.stage == MESA_SHADER_FRAGMENT;
-   if (!lowered || !buffers || !robust || (!fragment && shader->res->resource_usage.image_count) ||
+   if (!lowered || !buffers || !widened || !robust ||
+       (!fragment && shader->res->resource_usage.image_count) ||
        shader->res->buffer_count > RD_GFX_MAX_BUFFERS) {
       if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
          fprintf(stderr, "radish: %s shader refused: resources %d buffers %d images %u buffer count %u\n",
