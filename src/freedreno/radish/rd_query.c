@@ -257,13 +257,21 @@ rd_CmdEndQuery(VkCommandBuffer handle, VkQueryPool pool_handle, uint32_t query)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
-   if (pool && pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION) {
+   if (!pool) {
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (!rd_query_range(pool, query, 1)) {
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION) {
       command->occlusion_pool = NULL;
       if (!rd_render_query(command, pool, query, true))
          rd_record_query(command, RD_CMD_QUERY_END, pool, query, 1);
       return;
    }
-   if (!pool || pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+   if (pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS) {
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }

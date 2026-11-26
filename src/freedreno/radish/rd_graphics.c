@@ -447,6 +447,35 @@ rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline)
 
 
 
+static bool
+rd_vertex_input_valid(const VkPipelineVertexInputStateCreateInfo *vi)
+{
+   if (!vi)
+      return true;
+   if (vi->vertexBindingDescriptionCount > MESA_VK_MAX_VERTEX_BINDINGS ||
+       vi->vertexAttributeDescriptionCount > MESA_VK_MAX_VERTEX_ATTRIBUTES ||
+       (vi->vertexBindingDescriptionCount && !vi->pVertexBindingDescriptions) ||
+       (vi->vertexAttributeDescriptionCount && !vi->pVertexAttributeDescriptions))
+      return false;
+   uint32_t declared = 0;
+   for (uint32_t i = 0; i < vi->vertexBindingDescriptionCount; i++) {
+      const VkVertexInputBindingDescription *binding = &vi->pVertexBindingDescriptions[i];
+      if (binding->binding >= MESA_VK_MAX_VERTEX_BINDINGS ||
+          binding->stride > MESA_VK_MAX_VERTEX_BINDING_STRIDE ||
+          binding->inputRate > VK_VERTEX_INPUT_RATE_INSTANCE)
+         return false;
+      declared |= 1u << binding->binding;
+   }
+   for (uint32_t i = 0; i < vi->vertexAttributeDescriptionCount; i++) {
+      const VkVertexInputAttributeDescription *attribute = &vi->pVertexAttributeDescriptions[i];
+      if (attribute->location >= MESA_VK_MAX_VERTEX_ATTRIBUTES ||
+          attribute->binding >= MESA_VK_MAX_VERTEX_BINDINGS ||
+          !(declared & (1u << attribute->binding)))
+         return false;
+   }
+   return true;
+}
+
 static VkResult
 rd_create_graphics_pipeline(struct rd_device *device, VkPipelineCache cache,
                             const VkGraphicsPipelineCreateInfo *info,
@@ -462,6 +491,8 @@ rd_create_graphics_pipeline(struct rd_device *device, VkPipelineCache cache,
                                            VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    pipeline->gfx = gfx;
    VkResult result = gfx ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (result == VK_SUCCESS && !rd_vertex_input_valid(info->pVertexInputState))
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
    if (result == VK_SUCCESS)
       result = vk_graphics_pipeline_state_fill(&device->vk, &gfx->state, info, NULL, NULL, 0,
                                                &gfx->all, NULL, 0, NULL);

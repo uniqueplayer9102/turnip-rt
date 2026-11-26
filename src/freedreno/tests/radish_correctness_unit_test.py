@@ -45,6 +45,8 @@ def main():
     assert re.search(r'if \(draw->rasterizer_discard\)\s*\n\s*nr = 0;', graphics)
     assert re.search(r'rd_CmdWaitEvents2\([\s\S]{0,600}?if \(command->render\)', event)
     assert re.search(r'rd_CmdWriteTimestamp2\([\s\S]{0,600}?if \(command->render\)', query)
+    assert 'rd_query_range(pool, query, 1)' in query[query.index('rd_CmdEndQuery('):][:400]
+    assert 'rd_vertex_input_valid(info->pVertexInputState)' in graphics
     assert 'compute_deferred' not in queue
     assert 'rd_compute_can_defer(async, deferred,' in queue
     assert 'device->publish_signal_fence' in queue
@@ -80,6 +82,10 @@ def main():
         (directory / 'sync_policy_under_test.h').write_text(''.join(
             extract(queue, name) for name in ('rd_compute_can_defer', 'rd_publish_signal_fences',
                                               'rd_render_exports_fence')))
+        (directory / 'vertex_input_under_test.h').write_text(
+            extract(graphics, 'rd_vertex_input_valid'))
+        (directory / 'query_range_under_test.h').write_text(
+            extract(query, 'rd_query_range'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]

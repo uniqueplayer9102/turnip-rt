@@ -60,7 +60,7 @@ struct rd_query_slot {
    bool available, active;
 };
 struct rd_query_pool {
-   struct { VkQueryType query_type; } vk;
+   struct { VkQueryType query_type; uint32_t query_count; } vk;
    mtx_t mutex;
    cnd_t condition;
    struct rd_query_slot slots[8];
@@ -168,6 +168,54 @@ struct vk_sync { enum vk_sync_flags flags; };
 struct vk_sync_wait { struct vk_sync *sync; };
 #include "sync_waits_under_test.h"
 #include "sync_policy_under_test.h"
+
+#define MESA_VK_MAX_VERTEX_BINDINGS 32
+#define MESA_VK_MAX_VERTEX_ATTRIBUTES 32
+#define MESA_VK_MAX_VERTEX_BINDING_STRIDE UINT16_MAX
+#include "vertex_input_under_test.h"
+#include "query_range_under_test.h"
+
+static void test_query_range(void)
+{
+   struct rd_query_pool pool = { .vk.query_count = 4 };
+   assert(rd_query_range(&pool, 0, 1));
+   assert(rd_query_range(&pool, 3, 1));
+   assert(!rd_query_range(&pool, 4, 1));
+   assert(!rd_query_range(&pool, 3, 2));
+   assert(!rd_query_range(NULL, 0, 1));
+}
+
+static void test_vertex_input(void)
+{
+   assert(rd_vertex_input_valid(NULL));
+   VkVertexInputBindingDescription binding = {
+      .binding = 0, .stride = 16, .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+   };
+   VkVertexInputAttributeDescription attribute = {
+      .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0,
+   };
+   VkPipelineVertexInputStateCreateInfo vi = {
+      .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &binding,
+      .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attribute,
+   };
+   assert(rd_vertex_input_valid(&vi));
+   binding.binding = 32;
+   assert(!rd_vertex_input_valid(&vi));
+   binding.binding = 0;
+   attribute.binding = 32;
+   assert(!rd_vertex_input_valid(&vi));
+   attribute.binding = 1;
+   assert(!rd_vertex_input_valid(&vi));
+   attribute.binding = 0;
+   attribute.location = 32;
+   assert(!rd_vertex_input_valid(&vi));
+   attribute.location = 0;
+   binding.stride = UINT16_MAX + 1;
+   assert(!rd_vertex_input_valid(&vi));
+   binding.stride = 16;
+   binding.inputRate = 2;
+   assert(!rd_vertex_input_valid(&vi));
+}
 
 static void test_fence_export(void)
 {
@@ -420,7 +468,7 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
-   test_fence_export(); test_sync_policy(); test_sync_waits();
+   test_query_range(); test_vertex_input(); test_fence_export(); test_sync_policy(); test_sync_waits();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -428,6 +476,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy and waits, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy and waits, query range, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }
