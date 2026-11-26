@@ -2050,6 +2050,8 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
          nr = i + 1;
       }
    }
+   if (draw->rasterizer_discard)
+      nr = 0;
    OUT_PKT4(ring, REG_A5XX_RB_RENDER_COMPONENTS, 1);
    OUT_RING(ring, components);
    /* depth and stencil (VkCompareOp and VkStencilOp map 1:1) */

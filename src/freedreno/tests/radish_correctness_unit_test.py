@@ -38,6 +38,7 @@ def main():
        'rd_nir_lower_robust_buffers(nir)')
     assert graphics.index('rd_nir_lower_subword_storage(nir)') < graphics.index(
        'rd_nir_lower_robust_buffers(nir)')
+    assert re.search(r'if \(draw->rasterizer_discard\)\s*\n\s*nr = 0;', graphics)
     with tempfile.TemporaryDirectory(prefix='radish-correctness-unit-') as directory:
         directory = Path(directory)
         (directory / 'trace_defs_under_test.h').write_text(
