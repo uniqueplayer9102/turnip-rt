@@ -151,6 +151,28 @@ typedef struct nir_mem_access_size_align {
 struct vk_device_extension_table { bool KHR_swapchain, KHR_incremental_present; };
 #include "device_extensions_under_test.h"
 
+struct rd_image_level { VkDeviceSize array_pitch; };
+struct rd_image {
+   struct { uint32_t array_layers; VkImageUsageFlags usage; } vk;
+   struct rd_image_level levels[1];
+};
+#include "image_pitch_under_test.h"
+
+static void test_image_pitch(void)
+{
+   struct rd_image image = {0};
+   image.levels[0].array_pitch = 128ull << 20;
+   assert(rd_image_sampled_pitch_supported(&image));
+   image.vk.array_layers = 2;
+   assert(rd_image_sampled_pitch_supported(&image));
+   image.vk.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+   assert(!rd_image_sampled_pitch_supported(&image));
+   image.levels[0].array_pitch = 4096;
+   assert(rd_image_sampled_pitch_supported(&image));
+   image.levels[0].array_pitch = 4097;
+   assert(!rd_image_sampled_pitch_supported(&image));
+}
+
 static void test_device_extensions(void)
 {
    struct vk_device_extension_table extensions = {true, true};
@@ -338,13 +360,14 @@ static void test_trace(void)
 
 int main(void)
 {
-   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_device_extensions();
+   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
+   test_device_extensions();
    test_blit_src();
    test_subword();
    test_multiview(); test_trace();
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, device extensions, blit capabilities, subword widening, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, multiview, trace wrap, creation errors");
    return 0;
 }

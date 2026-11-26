@@ -831,6 +831,14 @@ rd_gtk_rgb_import(const VkImageCreateInfo *info,
       debug_get_bool_option("RADISH_GTK_YCBCR_COMPAT", false);
 }
 
+static bool
+rd_image_sampled_pitch_supported(const struct rd_image *image)
+{
+   return image->vk.array_layers <= 1 ||
+          !(image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+          rd_texture_array_pitch_fits(image->levels[0].array_pitch);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
                const VkAllocationCallbacks *allocator, VkImage *out)
@@ -924,9 +932,7 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
       vk_image_destroy(&device->vk, allocator, &image->vk);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
-   if (vk_format_is_compressed(image->vk.format) && image->vk.array_layers > 1 &&
-       (image->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
-       !rd_texture_array_pitch_fits(image->levels[0].array_pitch)) {
+   if (!rd_image_sampled_pitch_supported(image)) {
       vk_image_destroy(&device->vk, allocator, &image->vk);
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }

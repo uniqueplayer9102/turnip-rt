@@ -64,6 +64,8 @@ def main():
             extract((driver / 'rd_image.c').read_text(), 'rd_image_required_blit_src'))
         (directory / 'device_extensions_under_test.h').write_text(
             extract(instance, 'rd_device_extensions_for_mode'))
+        (directory / 'image_pitch_under_test.h').write_text(
+            extract((driver / 'rd_image.c').read_text(), 'rd_image_sampled_pitch_supported'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]
