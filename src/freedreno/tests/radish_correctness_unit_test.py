@@ -27,6 +27,7 @@ def main():
     resources = (driver / 'rd_resources.c').read_text()
     cache = (driver / 'rd_pipeline_cache.cpp').read_text()
     instance = (driver / 'rd_instance.c').read_text()
+    queue = (driver / 'rd_queue.c').read_text()
     event = (driver / 'rd_event.c').read_text()
     query = (driver / 'rd_query.c').read_text()
     sync_header = (driver.parent.parent / 'vulkan' / 'runtime' / 'vk_sync.h').read_text()
@@ -44,6 +45,9 @@ def main():
     assert re.search(r'if \(draw->rasterizer_discard\)\s*\n\s*nr = 0;', graphics)
     assert re.search(r'rd_CmdWaitEvents2\([\s\S]{0,600}?if \(command->render\)', event)
     assert re.search(r'rd_CmdWriteTimestamp2\([\s\S]{0,600}?if \(command->render\)', query)
+    assert 'compute_deferred' not in queue
+    assert 'rd_compute_can_defer(async, deferred,' in queue
+    assert 'device->publish_signal_fence' in queue
     with tempfile.TemporaryDirectory(prefix='radish-correctness-unit-') as directory:
         directory = Path(directory)
         (directory / 'trace_defs_under_test.h').write_text(
@@ -73,6 +77,8 @@ def main():
             extract((driver / 'rd_image.c').read_text(), 'rd_image_sampled_pitch_supported'))
         (directory / 'sync_waits_under_test.h').write_text(
             extract(sync_header, 'vk_sync_waits_have_timeline'))
+        (directory / 'sync_policy_under_test.h').write_text(''.join(
+            extract(queue, name) for name in ('rd_compute_can_defer', 'rd_publish_signal_fences')))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]

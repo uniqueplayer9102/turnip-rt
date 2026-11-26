@@ -103,6 +103,7 @@ struct rd_device {
    struct rd_submit_window submit_window;
    int submit_in_fence_fd;
    bool submit_out_fence;
+   bool publish_signal_fence;
    struct fd_bo *render_timing_bo;
    int64_t render_timing_start_ns;
    bool render_timing_gmem;

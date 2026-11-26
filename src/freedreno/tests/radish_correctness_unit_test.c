@@ -162,6 +162,22 @@ enum vk_sync_flags { VK_SYNC_IS_TIMELINE = 1 };
 struct vk_sync { enum vk_sync_flags flags; };
 struct vk_sync_wait { struct vk_sync *sync; };
 #include "sync_waits_under_test.h"
+#include "sync_policy_under_test.h"
+
+static void test_sync_policy(void)
+{
+   assert(rd_compute_can_defer(true, false, false, true));
+   assert(!rd_compute_can_defer(true, false, true, true));
+   assert(!rd_compute_can_defer(true, false, false, false));
+   assert(rd_compute_can_defer(false, true, false, true));
+   assert(!rd_compute_can_defer(false, false, false, true));
+   assert(rd_publish_signal_fences(true, false, false, true, 1));
+   assert(!rd_publish_signal_fences(false, false, false, true, 1));
+   assert(!rd_publish_signal_fences(true, true, false, true, 1));
+   assert(!rd_publish_signal_fences(true, false, true, true, 1));
+   assert(!rd_publish_signal_fences(true, false, false, false, 1));
+   assert(!rd_publish_signal_fences(true, false, false, true, 0));
+}
 
 static void test_sync_waits(void)
 {
@@ -376,7 +392,7 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
-   test_sync_waits();
+   test_sync_policy(); test_sync_waits();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -384,6 +400,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, mixed sync waits, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, sync policy and waits, multiview, trace wrap, creation errors");
    return 0;
 }

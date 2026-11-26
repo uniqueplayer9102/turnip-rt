@@ -911,12 +911,24 @@ static VkResult rd_resolve_dispatch(const struct rd_dispatch_record *record,
                                    struct rd_dispatch *dispatch);
 
 static bool
+rd_compute_can_defer(bool async, bool deferred, bool indirect, bool pipeline_ok)
+{
+   return (async || deferred) && !indirect && pipeline_ok;
+}
+
+static bool
+rd_publish_signal_fences(bool opt_in, bool profile, bool trace, bool softpin,
+                         uint32_t signal_count)
+{
+   return opt_in && !profile && !trace && softpin && signal_count > 0;
+}
+
+static bool
 rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit *submit,
                                 bool small_copies, const struct rd_command **last_work,
                                 uint32_t *last_work_buffer)
 {
    bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
-   bool compute_deferred = debug_get_option_batch_chunks() == 8;
    bool supported = true;
    if (vk_queue_submit_has_bind(submit))
       return false;
@@ -929,7 +941,7 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
             continue;
          *last_work = recorded;
          *last_work_buffer = i;
-         if (recorded->type == RD_CMD_DISPATCH && compute_deferred) {
+         if (recorded->type == RD_CMD_DISPATCH) {
             struct rd_dispatch execution;
             if (rd_resolve_dispatch(&recorded->dispatch, &execution) == VK_SUCCESS &&
                 rd_window_pipeline(device, &execution))
@@ -1319,7 +1331,8 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
    }
    device->submit_count++;
    int64_t t0 = device->trace ? os_time_get_nano() : 0;
-   struct fd_fence *fence = rd_flush_submit(device, submit, render && device->submit_out_fence);
+   struct fd_fence *fence = rd_flush_submit(device, submit,
+      (render && device->submit_out_fence) || device->publish_signal_fence);
    if (fence)
       fd_fence_flush(fence);
    if (device->trace)
@@ -2611,6 +2624,7 @@ VkResult
 rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct rd_device *device = container_of(queue->base.device, struct rd_device, vk);
+   device->publish_signal_fence = false;
    bool profile = debug_get_bool_option("RADISH_PROFILE", false);
    struct rd_submit_window *window = &device->submit_window;
    bool deferred = !profile && debug_get_option_batch_chunks() == 8;
@@ -2625,6 +2639,11 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    bool syncs_supported = async_requested && rd_async_syncs_supported(device, submit);
    bool async = async_requested && !profile && !device->trace && commands_supported &&
       syncs_supported && device->submit_in_fence_fd < 0;
+   bool softpin = fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) == 506 &&
+                  fd_device_version(device->fd) >= FD_VERSION_SOFTPIN;
+   device->publish_signal_fence = !async &&
+      rd_publish_signal_fences(async_requested, profile, device->trace != NULL,
+                               softpin, submit->signal_count);
    bool async_debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
    if (async_requested && async_debug && !async)
       fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP profile=%u trace=%u commands=%u syncs=%u pending-fd=%u waits=%u signals=%u\n",
@@ -2694,8 +2713,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
              (recorded->type == RD_CMD_IMAGE_COPY &&
               rd_image_copy_gpu_supported(device, &recorded->image_transfer, small_copies)));
          if (recorded->type == RD_CMD_DISPATCH)
-            can_defer = deferred && !recorded->dispatch.indirect &&
-                        rd_window_pipeline(device, dispatch);
+            can_defer = rd_compute_can_defer(async, deferred,
+               recorded->dispatch.indirect, rd_window_pipeline(device, dispatch));
          if (!can_defer) {
             result = rd_window_drain(device, window,
                recorded->type == RD_CMD_BARRIER ? "barrier" : "cpu");
@@ -2831,11 +2850,15 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          result = vk_sync_signal_many(&device->vk, submit->signal_count,
                                       submit->signals);
       }
+   } else if (device->publish_signal_fence && window->count) {
+      result = rd_signal_submit_fence(device, window,
+                                     submit->signal_count, submit->signals);
    } else {
       result = rd_window_drain(device, window, "final");
       if (result == VK_SUCCESS)
          result = vk_sync_signal_many(&device->vk, submit->signal_count,
                                       submit->signals);
    }
+   device->publish_signal_fence = false;
    return result == VK_SUCCESS ? VK_SUCCESS : rd_queue_fail(queue);
 }
