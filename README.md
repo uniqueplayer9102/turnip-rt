@@ -63,7 +63,7 @@ through freedreno's `fd_pipe`/`fd_device` layer. It is selected with the
 
 ```sh
 meson setup build -Dvulkan-drivers=radish -Dplatforms=wayland
-ninja -C build/ src/freedreno/radish/libvulkan_radish.so
+ninja -C build/ src/freedreno/radish/libvulkan_radish.so src/freedreno/radish/radish_icd.json
 ```
 
 The resulting library installs as `libvulkan_radish.so` and is selected through
@@ -202,8 +202,9 @@ Push constants go to 256 bytes (Vulkan's minimum is 128), sized through
 
 ## Hardware
 
-Portable across Adreno 5xx; validated on the Adreno 506 (MSM8953) of the Xiaomi
-Redmi 5 Plus (`vince`), driving a 1080x2160 DSI panel under Phoc/Phosh.
+Validated on the Adreno 506 (MSM8953) of the Xiaomi Redmi 5 Plus (`vince`),
+driving a 1080x2160 DSI panel under Phoc/Phosh. Other Adreno 5xx parts are not
+currently supported: device selection accepts only GPU ID 506.
 
 A5xx caps that shape the render path:
 

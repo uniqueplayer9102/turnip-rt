@@ -76,3 +76,18 @@ test('check-xml-includes',
   args : files('tests/check_xml_includes.py'),
   suite : ['freedreno'],
 )
+
+if with_radish_vk
+  test('radish-correctness_unit',
+    prog_python,
+    args : [files('tests/radish_correctness_unit_test.py'), '--include', meson.project_source_root() / 'include'],
+    suite : ['freedreno', 'radish'],
+  )
+  foreach name : ['fp16_layout', 'gmem_damage']
+    test('radish-' + name,
+      prog_python,
+      args : files('tests/radish_' + name + '_test.py'),
+      suite : ['freedreno', 'radish'],
+    )
+  endforeach
+endif
