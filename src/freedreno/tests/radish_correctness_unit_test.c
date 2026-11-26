@@ -148,6 +148,18 @@ typedef struct nir_mem_access_size_align {
 #include "subword_under_test.h"
 #include "blit_src_under_test.h"
 
+struct vk_device_extension_table { bool KHR_swapchain, KHR_incremental_present; };
+#include "device_extensions_under_test.h"
+
+static void test_device_extensions(void)
+{
+   struct vk_device_extension_table extensions = {true, true};
+   rd_device_extensions_for_mode(&extensions, true);
+   assert(extensions.KHR_swapchain && extensions.KHR_incremental_present);
+   rd_device_extensions_for_mode(&extensions, false);
+   assert(!extensions.KHR_swapchain && !extensions.KHR_incremental_present);
+}
+
 static void test_blit_src(void)
 {
    assert(!rd_image_required_blit_src(VK_FORMAT_D16_UNORM));
@@ -326,12 +338,13 @@ static void test_trace(void)
 
 int main(void)
 {
-   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_blit_src();
+   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_device_extensions();
+   test_blit_src();
    test_subword();
    test_multiview(); test_trace();
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, blit capabilities, subword widening, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, device extensions, blit capabilities, subword widening, multiview, trace wrap, creation errors");
    return 0;
 }

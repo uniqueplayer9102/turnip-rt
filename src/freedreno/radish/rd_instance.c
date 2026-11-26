@@ -116,6 +116,15 @@ static const struct vk_device_extension_table rd_device_extensions = {
    .EXT_multi_draw = true,
 };
 
+static void
+rd_device_extensions_for_mode(struct vk_device_extension_table *extensions, bool graphics)
+{
+   if (!graphics) {
+      extensions->KHR_swapchain = false;
+      extensions->KHR_incremental_present = false;
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 rd_EnumerateInstanceVersion(uint32_t *version)
 {
@@ -328,6 +337,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       physical->sync_type.get_value && physical->sync_type.signal &&
       physical->sync_type.wait_many;
    struct vk_device_extension_table extensions = rd_device_extensions;
+   rd_device_extensions_for_mode(&extensions, rd_graphics_enabled());
    extensions.KHR_external_semaphore = sync_file;
    extensions.KHR_external_semaphore_fd = sync_file;
    extensions.KHR_timeline_semaphore = timeline;

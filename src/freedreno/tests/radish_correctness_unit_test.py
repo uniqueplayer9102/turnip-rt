@@ -26,11 +26,12 @@ def main():
     trace = (driver / 'rd_trace.c').read_text()
     resources = (driver / 'rd_resources.c').read_text()
     cache = (driver / 'rd_pipeline_cache.cpp').read_text()
+    instance = (driver / 'rd_instance.c').read_text()
     direct = extract(graphics, 'rd_execute_render_direct')
     assert re.search(r'result\s*=\s*queries\s*\?\s*rd_finish_submit\(', direct)
     assert direct.index('result = queries ?') < direct.index('if (result == VK_SUCCESS && queries)')
     assert 'q.zero |= i != 0;' in graphics
-    assert '.pipelineStatisticsQuery = false' in (driver / 'rd_instance.c').read_text()
+    assert '.pipelineStatisticsQuery = false' in instance
     assert 'util_dynarray_append(' not in graphics
     pipeline = (driver / 'rd_pipeline.c').read_text()
     assert pipeline.index('rd_nir_lower_subword_storage(nir)') < pipeline.index(
@@ -58,6 +59,8 @@ def main():
             extract((driver / 'rd_nir_robust.c').read_text(), 'rd_subword_storage_access'))
         (directory / 'blit_src_under_test.h').write_text(
             extract((driver / 'rd_image.c').read_text(), 'rd_image_required_blit_src'))
+        (directory / 'device_extensions_under_test.h').write_text(
+            extract(instance, 'rd_device_extensions_for_mode'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]
