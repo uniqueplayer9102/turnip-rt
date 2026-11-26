@@ -286,7 +286,7 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
                          uint64_t abs_timeout_ns)
 {
    if ((wait_flags & VK_SYNC_WAIT_PENDING) &&
-       !(waits[0].sync->type->features & VK_SYNC_FEATURE_TIMELINE)) {
+       !vk_sync_waits_have_timeline(wait_count, waits)) {
       /* Sadly, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE was never implemented
        * for drivers that don't support timelines.  Instead, we have to spin
        * on DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE until it succeeds.

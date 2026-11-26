@@ -334,6 +334,15 @@ struct vk_sync_wait {
    uint64_t wait_value;
 };
 
+static inline bool
+vk_sync_waits_have_timeline(uint32_t count, const struct vk_sync_wait *waits)
+{
+   for (uint32_t i = 0; i < count; i++)
+      if (waits[i].sync->flags & VK_SYNC_IS_TIMELINE)
+         return true;
+   return false;
+}
+
 /* See VkSemaphoreSubmitInfo */
 struct vk_sync_signal {
    struct vk_sync *sync;

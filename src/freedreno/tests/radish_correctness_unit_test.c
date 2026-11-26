@@ -158,6 +158,21 @@ struct rd_image {
 };
 #include "image_pitch_under_test.h"
 
+enum vk_sync_flags { VK_SYNC_IS_TIMELINE = 1 };
+struct vk_sync { enum vk_sync_flags flags; };
+struct vk_sync_wait { struct vk_sync *sync; };
+#include "sync_waits_under_test.h"
+
+static void test_sync_waits(void)
+{
+   struct vk_sync binary = {0}, timeline = {VK_SYNC_IS_TIMELINE};
+   struct vk_sync_wait binary_first[] = {{&binary}, {&timeline}};
+   struct vk_sync_wait timeline_first[] = {{&timeline}, {&binary}};
+   assert(vk_sync_waits_have_timeline(2, binary_first));
+   assert(vk_sync_waits_have_timeline(2, timeline_first));
+   assert(!vk_sync_waits_have_timeline(1, binary_first));
+}
+
 static void test_image_pitch(void)
 {
    struct rd_image image = {0};
@@ -361,6 +376,7 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
+   test_sync_waits();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -368,6 +384,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, mixed sync waits, multiview, trace wrap, creation errors");
    return 0;
 }

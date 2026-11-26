@@ -27,6 +27,7 @@ def main():
     resources = (driver / 'rd_resources.c').read_text()
     cache = (driver / 'rd_pipeline_cache.cpp').read_text()
     instance = (driver / 'rd_instance.c').read_text()
+    sync_header = (driver.parent.parent / 'vulkan' / 'runtime' / 'vk_sync.h').read_text()
     direct = extract(graphics, 'rd_execute_render_direct')
     assert re.search(r'result\s*=\s*queries\s*\?\s*rd_finish_submit\(', direct)
     assert direct.index('result = queries ?') < direct.index('if (result == VK_SUCCESS && queries)')
@@ -66,6 +67,8 @@ def main():
             extract(instance, 'rd_device_extensions_for_mode'))
         (directory / 'image_pitch_under_test.h').write_text(
             extract((driver / 'rd_image.c').read_text(), 'rd_image_sampled_pitch_supported'))
+        (directory / 'sync_waits_under_test.h').write_text(
+            extract(sync_header, 'vk_sync_waits_have_timeline'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]
