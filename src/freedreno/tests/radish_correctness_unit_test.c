@@ -137,6 +137,29 @@ struct rd_resource {
 };
 #include "texture_pitch_under_test.h"
 
+typedef unsigned nir_intrinsic_op;
+enum gl_access_qualifier { RD_ACCESS_NONE = 0 };
+enum nir_mem_access_shift_method { nir_mem_access_shift_method_scalar };
+typedef struct nir_mem_access_size_align {
+   uint8_t num_components, bit_size;
+   uint16_t align;
+   enum nir_mem_access_shift_method shift;
+} nir_mem_access_size_align;
+#include "subword_under_test.h"
+
+static void test_subword(void)
+{
+   struct nir_mem_access_size_align r8 =
+      rd_subword_storage_access(0, 1, 8, 1, 0, false, RD_ACCESS_NONE, NULL);
+   assert(r8.num_components == 1 && r8.bit_size == 32 && r8.align == 4);
+   struct nir_mem_access_size_align r16 =
+      rd_subword_storage_access(0, 2, 16, 2, 0, false, RD_ACCESS_NONE, NULL);
+   assert(r16.num_components == 1 && r16.bit_size == 32 && r16.align == 4);
+   struct nir_mem_access_size_align r32 =
+      rd_subword_storage_access(0, 4, 32, 4, 0, false, RD_ACCESS_NONE, NULL);
+   assert(r32.num_components == 1 && r32.bit_size == 32 && r32.align == 1);
+}
+
 static void test_growth(void)
 {
    struct util_dynarray queries = {0}, draws = {0};
@@ -295,10 +318,11 @@ static void test_trace(void)
 
 int main(void)
 {
-   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_multiview(); test_trace();
+   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_subword();
+   test_multiview(); test_trace();
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, multiview, trace wrap and creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, subword widening, multiview, trace wrap and creation errors");
    return 0;
 }

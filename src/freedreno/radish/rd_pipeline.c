@@ -370,11 +370,11 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
       !pipeline->packed_1d_barrier &&
       ((pipeline->logical_local_size[0] & 1) || (pipeline->logical_local_size[1] & 1) ||
        pipeline->logical_local_size[2] != 1);
-   if (device->vk.enabled_features.robustBufferAccess && !rd_nir_lower_robust_buffers(nir)) {
+   if (!rd_nir_lower_subword_storage(nir)) {
       ralloc_free(nir);
       return rd_pipeline_unsupported(__LINE__);
    }
-   if (!rd_nir_lower_subword_storage(nir)) {
+   if (device->vk.enabled_features.robustBufferAccess && !rd_nir_lower_robust_buffers(nir)) {
       ralloc_free(nir);
       return rd_pipeline_unsupported(__LINE__);
    }

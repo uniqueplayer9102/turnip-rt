@@ -7,7 +7,7 @@ import tempfile
 
 
 def extract(source, name, cpp=False):
-    prefix = r'^static bool ' if cpp else r'^(?:static (?:inline )?)?(?:void|bool|uint32_t|uint64_t|VkResult)\n'
+    prefix = r'^static bool ' if cpp else r'^(?:static (?:inline )?)?(?:void|bool|uint32_t|uint64_t|VkResult|nir_mem_access_size_align)\n'
     match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
     return source[match.start():source.index('\n}', match.end()) + 3] + '\n'
@@ -32,6 +32,9 @@ def main():
     assert 'q.zero |= i != 0;' in graphics
     assert '.pipelineStatisticsQuery = false' in (driver / 'rd_instance.c').read_text()
     assert 'util_dynarray_append(' not in graphics
+    pipeline = (driver / 'rd_pipeline.c').read_text()
+    assert pipeline.index('rd_nir_lower_subword_storage(nir)') < pipeline.index(
+       'rd_nir_lower_robust_buffers(nir)')
     with tempfile.TemporaryDirectory(prefix='radish-correctness-unit-') as directory:
         directory = Path(directory)
         (directory / 'trace_defs_under_test.h').write_text(
@@ -51,6 +54,8 @@ def main():
             extract(resources, 'rd_resource_texture_pitch'))
         (directory / 'cache_under_test.h').write_text(extract(cache, 'resource_metadata_valid', True) +
                                                     extract(cache, 'variant_resources_valid', True))
+        (directory / 'subword_under_test.h').write_text(
+            extract((driver / 'rd_nir_robust.c').read_text(), 'rd_subword_storage_access'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]
