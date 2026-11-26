@@ -60,7 +60,8 @@ struct rd_pending_submit {
    struct fd_submit *submit;
    struct fd_ringbuffer *ring;
    struct fd_fence *fence;
-   struct fd_bo *cs_backing;
+   struct fd_bo *cs_backings[4];
+   unsigned cs_backing_count;
    struct fd_bo *timing_bo;
    int64_t timing_start_ns;
    bool timing_gmem;

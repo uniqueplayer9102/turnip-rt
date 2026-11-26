@@ -104,6 +104,8 @@ def main():
         (directory / 'copy_side_under_test.h').write_text(''.join(
             extract(image_src, name) for name in ('rd_image_transfer_memory',
                                                   'rd_image_copy_side')))
+        (directory / 'ring_backings_under_test.h').write_text(
+            extract(queue, 'rd_ring_backings'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]

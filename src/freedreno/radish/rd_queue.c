@@ -838,11 +838,14 @@ rd_window_reap(struct rd_device *device, struct rd_submit_window *window)
          window->cs_bytes += pending->cs_bytes;
          window->bo_refs += pending->bo_refs;
          window->metadata_bytes += pending->metadata_bytes;
-         bool seen = !pending->cs_backing;
-         for (unsigned j = 0; j < i && !seen; j++)
-            seen = window->pending[j].cs_backing == pending->cs_backing;
-         if (!seen)
-            window->backing_bytes += pending->cs_backing->size;
+         for (unsigned k = 0; k < pending->cs_backing_count; k++) {
+            bool seen = false;
+            for (unsigned j = 0; j < i && !seen; j++)
+               for (unsigned m = 0; m < window->pending[j].cs_backing_count; m++)
+                  seen |= window->pending[j].cs_backings[m] == pending->cs_backings[k];
+            if (!seen)
+               window->backing_bytes += pending->cs_backings[k]->size;
+         }
       }
    } else {
       memset(window, 0, sizeof(*window));
@@ -1296,6 +1299,32 @@ rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch)
    return true;
 }
 
+static bool
+rd_ring_backings(struct fd_ringbuffer *ring, struct fd_bo **bos, unsigned max,
+                 unsigned *count, uint64_t *bytes)
+{
+   const struct fd_ringbuffer_sp *rp = to_fd_ringbuffer_sp(ring);
+   *count = 0;
+   *bytes = 0;
+   for (unsigned i = 0; i <= rp->u.nr_cmds; i++) {
+      bool finalized = i < rp->u.nr_cmds;
+      struct fd_bo *bo = finalized ? rp->u.cmds[i].ring_bo : rp->ring_bo;
+      uint64_t size = finalized ? rp->u.cmds[i].size :
+         (uint64_t)((char *)ring->cur - (char *)ring->start);
+      struct fd_bo *backing = bo->handle ? bo : fd_bo_heap_block(bo);
+      bool seen = false;
+      for (unsigned j = 0; j < *count; j++)
+         seen |= bos[j] == backing;
+      if (!seen) {
+         if (*count == max)
+            return false;
+         bos[(*count)++] = backing;
+      }
+      *bytes += size;
+   }
+   return true;
+}
+
 /* Renders need only bounded GPU-side memory, not the compact single
  * suballocated ring compute chunks use. A Phoc frame render emits a long
  * single command stream over its full 1080x2160 sysmem surface, so the
@@ -1406,12 +1435,22 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
       rd_window_footprint_render(submit, ring, &backing, &references, &metadata) :
       rd_window_footprint(submit, ring, initial_start,
                           &backing, &references, &metadata);
-   bool known_backing = false;
-   for (unsigned i = 0; i < window->count; i++)
-      known_backing |= window->pending[i].cs_backing == backing;
-   const uint64_t backing_bytes = window->backing_bytes +
-      (bounded && !known_backing ? backing->size : 0);
-   if (!bounded || backing_bytes > 4 * 1024 * 1024) {
+   struct fd_bo *backings[4];
+   unsigned backing_count = 0;
+   uint64_t cs_bytes = 0;
+   bool segments = bounded &&
+      rd_ring_backings(ring, backings, ARRAY_SIZE(backings), &backing_count, &cs_bytes);
+   uint64_t new_backing_bytes = 0;
+   for (unsigned i = 0; segments && i < backing_count; i++) {
+      bool seen = false;
+      for (unsigned j = 0; j < window->count && !seen; j++)
+         for (unsigned k = 0; k < window->pending[j].cs_backing_count; k++)
+            seen |= window->pending[j].cs_backings[k] == backings[i];
+      if (!seen)
+         new_backing_bytes += backings[i]->size;
+   }
+   const uint64_t backing_bytes = (uint64_t)window->backing_bytes + new_backing_bytes;
+   if (!segments || backing_bytes > 4 * 1024 * 1024) {
       VkResult before = rd_window_drain(device, window, "fallback");
       bool diag = debug_get_option_submit_diag();
       int64_t w0 = device->trace || diag ? os_time_get_nano() : 0;
@@ -1435,15 +1474,19 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
       fd_submit_del(submit);
       return before == VK_SUCCESS ? result : before;
    }
-   window->pending[window->count++] = (struct rd_pending_submit) {
-      .submit = submit, .ring = ring, .fence = fence, .cs_backing = backing,
-      .chunks = chunks, .cs_bytes = 32768, .bo_refs = references, .metadata_bytes = metadata,
+   struct rd_pending_submit *pending = &window->pending[window->count++];
+   *pending = (struct rd_pending_submit) {
+      .submit = submit, .ring = ring, .fence = fence,
+      .chunks = chunks, .cs_bytes = cs_bytes, .bo_refs = references,
+      .metadata_bytes = metadata,
       .timing_bo = render && device->render_timing_bo ? fd_bo_ref(device->render_timing_bo) : NULL,
       .timing_start_ns = device->render_timing_start_ns,
       .timing_gmem = device->render_timing_gmem,
    };
+   pending->cs_backing_count = backing_count;
+   memcpy(pending->cs_backings, backings, backing_count * sizeof(*backings));
    window->chunks += chunks;
-   window->cs_bytes += 32768;
+   window->cs_bytes += cs_bytes;
    window->bo_refs += references;
    window->metadata_bytes += metadata;
    window->backing_bytes = backing_bytes;

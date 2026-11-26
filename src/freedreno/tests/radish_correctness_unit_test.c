@@ -48,8 +48,8 @@ static void util_dynarray_clear(struct util_dynarray *array) { array->size = 0; 
    for (type *v = (type *)(a)->data; v < (type *)((char *)(a)->data + (a)->size); v++)
 
 #include "trace_defs_under_test.h"
-struct fd_bo { uint64_t *map; };
-struct fd_ringbuffer { unsigned unused; };
+struct fd_bo { uint64_t *map; uint64_t handle, size; };
+struct fd_ringbuffer { unsigned unused; uint32_t *start, *cur, *end; uint32_t size; };
 struct fd_submit { unsigned unused; };
 struct rd_submit_window { unsigned unused; };
 struct rd_query_pool;
@@ -224,6 +224,41 @@ static void test_copy_side(void)
    transfer.src_image = &image;
    image.native_layout.tile_mode = 1;
    assert(!rd_image_copy_side(&transfer, true, &mem, &offset, &size));
+}
+
+struct fd_cmd_sp { struct fd_bo *ring_bo; unsigned size; };
+struct fd_ringbuffer_sp {
+   struct fd_ringbuffer base;
+   struct { unsigned short nr_cmds, max_cmds; struct fd_cmd_sp *cmds; } u;
+   struct fd_bo *ring_bo;
+};
+#define to_fd_ringbuffer_sp(r) ((struct fd_ringbuffer_sp *)(r))
+#define fd_bo_heap_block(bo) (bo)
+#include "ring_backings_under_test.h"
+
+static void test_ring_backings(void)
+{
+   struct fd_bo bo = { .handle = 1, .size = 4096 };
+   struct fd_cmd_sp cmds[4] = {
+      {&bo, 512}, {&bo, 256}, {&bo, 128}, {&bo, 64},
+   };
+   uint32_t words[256];
+   struct fd_ringbuffer_sp ring = {
+      .base = { .start = words, .cur = words + 64, .size = 1024 },
+      .u = { .nr_cmds = 1, .cmds = cmds },
+      .ring_bo = &bo,
+   };
+   struct fd_bo *bos[4];
+   unsigned count = 0;
+   uint64_t bytes = 0;
+   assert(rd_ring_backings(&ring.base, bos, 4, &count, &bytes));
+   assert(count == 1 && bytes == 768);
+   ring.u.nr_cmds = 4;
+   assert(rd_ring_backings(&ring.base, bos, 4, &count, &bytes));
+   assert(count == 1 && bytes == 1216);
+   struct fd_bo other = { .handle = 2, .size = 8192 };
+   cmds[1].ring_bo = &other;
+   assert(!rd_ring_backings(&ring.base, bos, 1, &count, &bytes));
 }
 
 #include "descriptor_span_under_test.h"
@@ -580,7 +615,8 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
-   test_copy_side(); test_render_query_before_work(); test_drain_index();
+   test_ring_backings(); test_copy_side();
+   test_render_query_before_work(); test_drain_index();
    test_descriptor_span();
    test_query_range(); test_vertex_input();
    test_fence_export(); test_sync_policy(); test_sync_waits();
@@ -591,6 +627,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, empty-render queries, waits, query range, copy direction, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, empty-render queries, waits, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }
