@@ -129,6 +129,14 @@ static VkResult rd_draw_counts(struct rd_device *device, const struct rd_draw *d
 #include "trace_under_test.h"
 #include "border_under_test.h"
 
+enum a5xx_tex_type { A5XX_TEX_1D, A5XX_TEX_2D, A5XX_TEX_CUBE, A5XX_TEX_3D };
+struct rd_resource {
+   enum a5xx_tex_type type;
+   uint32_t depth, array_pitch;
+   bool image_size_only;
+};
+#include "texture_pitch_under_test.h"
+
 static void test_growth(void)
 {
    struct util_dynarray queries = {0}, draws = {0};
@@ -181,6 +189,25 @@ static void test_vertex_bounds(void)
    assert(rd_vertex_fetch_size(256, UINT64_MAX, 8, 24) == 0);
    assert(rd_vertex_fetch_size(256, 255, UINT32_MAX, 24) == 0);
    assert(rd_vertex_fetch_size(UINT64_MAX, 0, 0, VK_WHOLE_SIZE) == UINT32_MAX);
+}
+
+static void test_texture_pitch(void)
+{
+   assert(rd_texture_array_pitch_fits(0));
+   assert(rd_texture_array_pitch_fits(4096));
+   assert(rd_texture_array_pitch_fits(67104768));
+   assert(!rd_texture_array_pitch_fits(67100673));
+   assert(!rd_texture_array_pitch_fits(67108864));
+   assert(!rd_texture_array_pitch_fits(UINT64_C(1) << 32));
+
+   struct rd_resource resource = { .type = A5XX_TEX_2D, .depth = 2, .array_pitch = 67108864 };
+   assert(!rd_texture_array_pitch_fits(rd_resource_texture_pitch(&resource)));
+   resource.depth = 1;
+   assert(rd_resource_texture_pitch(&resource) == 0);
+   resource.type = A5XX_TEX_CUBE;
+   assert(!rd_texture_array_pitch_fits(rd_resource_texture_pitch(&resource)));
+   resource.image_size_only = true;
+   assert(rd_resource_texture_pitch(&resource) == 0);
 }
 
 static void test_multiview(void)
@@ -268,10 +295,10 @@ static void test_trace(void)
 
 int main(void)
 {
-   test_growth(); test_restart(); test_vertex_bounds(); test_multiview(); test_trace();
+   test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_multiview(); test_trace();
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, multiview, trace wrap and creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture pitch, multiview, trace wrap and creation errors");
    return 0;
 }

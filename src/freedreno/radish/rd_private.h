@@ -457,7 +457,7 @@ bool rd_render_execute(struct rd_command_buffer *primary, const struct rd_render
 void rd_render_barrier(struct rd_command_buffer *command);
 void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
-bool rd_descriptor_ready(const struct rd_descriptor *descriptor);
+bool rd_descriptor_ready(const struct rd_descriptor *descriptor, bool require_native_pitch);
 bool rd_descriptor_apply_dynamic_offset(struct rd_descriptor *descriptor,
                                         uint32_t offset);
 void rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,

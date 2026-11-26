@@ -10,6 +10,12 @@
 #define RD_IMAGE_MAX_LEVELS 14
 #define RD_IMAGE_MAX_SIZE (UINT32_MAX - 4095ull)
 
+static inline bool
+rd_texture_array_pitch_fits(VkDeviceSize pitch)
+{
+   return pitch <= (0x3fffull << 12) && !(pitch & 0xfffull);
+}
+
 struct rd_device;
 struct rd_memory;
 struct rd_buffer;

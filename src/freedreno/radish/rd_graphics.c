@@ -785,7 +785,7 @@ rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *r
          rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return false;
       }
-      if (!rd_descriptor_ready(&copy[i])) {
+      if (!rd_descriptor_ready(&copy[i], true)) {
          rd_render_free_descriptors(command, render, copy);
          rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return false;
@@ -4098,7 +4098,10 @@ rd_resolve_view(struct rd_device *device, struct rd_image_view *src, struct rd_i
    struct rd_pipeline *pipeline = rd_resolve_pipeline(device, variant);
    if (!pipeline)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   struct rd_descriptor descriptor = { .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .image_view = src };
+   struct rd_image_view src_layer = *src;
+   src_layer.vk.view_type = VK_IMAGE_VIEW_TYPE_2D;
+   src_layer.vk.layer_count = 1;
+   struct rd_descriptor descriptor = { .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .image_view = &src_layer };
    struct rd_render render = {
       .area = area, .layers = 1, .color_count = 1, .samples = 1,
       .color[0] = { .view = dst, .load = VK_ATTACHMENT_LOAD_OP_LOAD,

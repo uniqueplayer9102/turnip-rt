@@ -32,12 +32,14 @@ rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
       if (plane >= vk_format_get_plane_count(image->vk.format))
          return VK_ERROR_UNKNOWN;
       const struct rd_image_level *first_level = rd_image_plane_level(image, plane, view->base_mip_level);
+      bool native_pitch = (array && view->layer_count == 1) ||
+         rd_texture_array_pitch_fits(first_level->array_pitch);
       if (vk_format_is_compressed(image->vk.format)) {
-         if (first_level->array_pitch > (0x3fffull << 12))
+         if (!native_pitch)
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
          continue;
       }
-      if (!force && ((array && view->layer_count == 1) || first_level->array_pitch <= (0x3fffull << 12)))
+      if (!force && native_pitch)
          continue;
       if (!image->memory || view->level_count > RD_IMAGE_MAX_LEVELS)
          return VK_ERROR_UNKNOWN;

@@ -7,7 +7,7 @@ import tempfile
 
 
 def extract(source, name, cpp=False):
-    prefix = r'^static bool ' if cpp else r'^(?:static )?(?:void|bool|uint32_t|uint64_t|VkResult)\n'
+    prefix = r'^static bool ' if cpp else r'^(?:static (?:inline )?)?(?:void|bool|uint32_t|uint64_t|VkResult)\n'
     match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
     return source[match.start():source.index('\n}', match.end()) + 3] + '\n'
@@ -46,6 +46,9 @@ def main():
         (directory / 'trace_under_test.h').write_text(''.join(extract(trace, name) for name in names))
         color = resources[resources.index('struct rd_border_color {'):resources.index('\n_Static_assert')]
         (directory / 'border_under_test.h').write_text(color + extract(resources, 'rd_init_border_colors'))
+        (directory / 'texture_pitch_under_test.h').write_text(
+            extract((driver / 'rd_image.h').read_text(), 'rd_texture_array_pitch_fits') +
+            extract(resources, 'rd_resource_texture_pitch'))
         (directory / 'cache_under_test.h').write_text(extract(cache, 'resource_metadata_valid', True) +
                                                     extract(cache, 'variant_resources_valid', True))
         includes = ['-I', str(directory)]

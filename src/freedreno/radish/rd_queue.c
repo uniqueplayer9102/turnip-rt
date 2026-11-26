@@ -1724,7 +1724,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
    for (unsigned i = 0; i < dispatch->pipeline->descriptor_count; i++) {
       const struct rd_descriptor *desc = &dispatch->descriptors[i];
       if ((dispatch->pipeline->used_descriptors & (UINT64_C(1) << i)) &&
-          !rd_descriptor_ready(desc))
+          !rd_descriptor_ready(desc, false))
          return VK_ERROR_UNKNOWN;
    }
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;

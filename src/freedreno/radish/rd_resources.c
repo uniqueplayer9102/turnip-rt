@@ -368,8 +368,25 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
    return out->format != TFMT5_NONE;
 }
 
+static uint32_t
+rd_resource_texture_pitch(const struct rd_resource *resource)
+{
+   return resource->image_size_only ||
+      ((resource->type == A5XX_TEX_1D || resource->type == A5XX_TEX_2D) && resource->depth == 1) ?
+      0 : resource->array_pitch;
+}
+
+static bool
+rd_descriptor_plane_ready(const struct rd_descriptor *descriptor, uint32_t plane,
+                           bool require_native_pitch)
+{
+   struct rd_resource resource;
+   return rd_make_resource(descriptor, &resource, plane) &&
+          (!require_native_pitch || rd_texture_array_pitch_fits(rd_resource_texture_pitch(&resource)));
+}
+
 bool
-rd_descriptor_ready(const struct rd_descriptor *descriptor)
+rd_descriptor_ready(const struct rd_descriptor *descriptor, bool require_native_pitch)
 {
    switch (descriptor->type) {
    case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -383,13 +400,12 @@ rd_descriptor_ready(const struct rd_descriptor *descriptor)
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
-      struct rd_resource resource;
-      if (!rd_make_resource(descriptor, &resource, 0))
+      if (!rd_descriptor_plane_ready(descriptor, 0, require_native_pitch))
          return false;
       if (descriptor->image_view && descriptor->image_view->ycbcr) {
          uint32_t count = vk_format_get_plane_count(descriptor->image_view->vk.format);
          for (uint32_t plane = 1; plane < count; plane++)
-            if (!rd_make_resource(descriptor, &resource, plane))
+            if (!rd_descriptor_plane_ready(descriptor, plane, require_native_pitch))
                return false;
       }
       return true;
@@ -430,9 +446,8 @@ rd_emit_resource_texture_sb(struct fd_ringbuffer *ring, uint32_t slot,
    OUT_RING(ring, COND(resource->buffer, A5XX_TEX_CONST_2_BUFFER) |
       A5XX_TEX_CONST_2_TYPE(resource->type) | A5XX_TEX_CONST_2_PITCHALIGN(resource->pitchalign) |
       A5XX_TEX_CONST_2_PITCH(resource->row_pitch));
-   uint32_t texture_pitch = resource->image_size_only ||
-      ((resource->type == A5XX_TEX_1D || resource->type == A5XX_TEX_2D) && resource->depth == 1) ?
-      0 : resource->array_pitch;
+   uint32_t texture_pitch = rd_resource_texture_pitch(resource);
+   assert(rd_texture_array_pitch_fits(texture_pitch));
    OUT_RING(ring, A5XX_TEX_CONST_3_ARRAY_PITCH(texture_pitch) |
       (resource->type == A5XX_TEX_3D ? A5XX_TEX_CONST_3_MIN_LAYERSZ(MIN2(resource->min_layer_size, 0xf000u)) : 0));
    OUT_RELOC(ring, resource->bo, resource->offset,
