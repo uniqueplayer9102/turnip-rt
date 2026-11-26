@@ -77,7 +77,12 @@ struct rd_draw {
    struct rd_query_pool *occlusion_pool;
    uint32_t occlusion_query;
 };
-struct rd_render { struct util_dynarray draws, queries; };
+struct rd_render_attachment { void *resolve, *view; };
+struct rd_render {
+   struct util_dynarray draws, queries;
+   uint32_t view_mask, layers, color_count;
+   struct rd_render_attachment color[8], depth, stencil;
+};
 struct rd_device {
    struct rd_trace *trace;
    uint64_t submit_count;
@@ -163,6 +168,29 @@ struct vk_sync { enum vk_sync_flags flags; };
 struct vk_sync_wait { struct vk_sync *sync; };
 #include "sync_waits_under_test.h"
 #include "sync_policy_under_test.h"
+
+static void test_fence_export(void)
+{
+   struct rd_render render = { .layers = 1 };
+   assert(rd_render_exports_fence(&render));
+   render.view_mask = 1;
+   assert(!rd_render_exports_fence(&render));
+   render.view_mask = 0;
+   render.layers = 2;
+   assert(!rd_render_exports_fence(&render));
+   render.layers = 1;
+   render.depth.view = (void *)1;
+   assert(!rd_render_exports_fence(&render));
+   render.depth.view = NULL;
+   render.stencil.view = (void *)1;
+   assert(!rd_render_exports_fence(&render));
+   render.stencil.view = NULL;
+   render.color_count = 2;
+   render.color[1].resolve = (void *)1;
+   assert(!rd_render_exports_fence(&render));
+   render.color[1].resolve = NULL;
+   assert(rd_render_exports_fence(&render));
+}
 
 static void test_sync_policy(void)
 {
@@ -392,7 +420,7 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
-   test_sync_policy(); test_sync_waits();
+   test_fence_export(); test_sync_policy(); test_sync_waits();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -400,6 +428,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, sync policy and waits, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy and waits, multiview, trace wrap, creation errors");
    return 0;
 }

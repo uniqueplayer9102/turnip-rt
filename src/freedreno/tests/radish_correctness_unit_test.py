@@ -78,7 +78,8 @@ def main():
         (directory / 'sync_waits_under_test.h').write_text(
             extract(sync_header, 'vk_sync_waits_have_timeline'))
         (directory / 'sync_policy_under_test.h').write_text(''.join(
-            extract(queue, name) for name in ('rd_compute_can_defer', 'rd_publish_signal_fences')))
+            extract(queue, name) for name in ('rd_compute_can_defer', 'rd_publish_signal_fences',
+                                              'rd_render_exports_fence')))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]
