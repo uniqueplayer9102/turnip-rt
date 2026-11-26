@@ -3331,7 +3331,8 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
 
    struct wsi_wl_surface *wsi_wl_surface = chain->wsi_wl_surface;
    bool mode_fifo = chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR;
-   if (mode_fifo && !chain->fifo && getenv("RADISH_WSI_FIFO_NO_THROTTLE"))
+   const char *no_throttle = getenv("RADISH_WSI_FIFO_NO_THROTTLE");
+   if (mode_fifo && !chain->fifo && no_throttle && strcmp(no_throttle, "0"))
       mode_fifo = false;
 
    if (chain->buffer_type == WSI_WL_BUFFER_SHM_MEMCPY) {
