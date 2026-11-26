@@ -45,7 +45,8 @@ rd_sample_format(const struct rd_sampling_view *view)
    return view->format == VK_FORMAT_D16_UNORM ? PIPE_FORMAT_R16_UNORM :
       view->format == VK_FORMAT_D32_SFLOAT ? PIPE_FORMAT_R32_FLOAT :
       view->format == VK_FORMAT_X8_D24_UNORM_PACK32 ? PIPE_FORMAT_R32_FLOAT :
-      view->format == VK_FORMAT_S8_UINT ? PIPE_FORMAT_R8_UINT : vk_format_to_pipe_format(view->format);
+      view->format == VK_FORMAT_S8_UINT ? PIPE_FORMAT_R8_UINT :
+      util_format_linear(vk_format_to_pipe_format(view->format));
 }
 
 static nir_def *
