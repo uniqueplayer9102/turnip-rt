@@ -29,6 +29,7 @@ def main():
     instance = (driver / 'rd_instance.c').read_text()
     queue = (driver / 'rd_queue.c').read_text()
     descriptor = (driver / 'rd_descriptor.c').read_text()
+    device_src = (driver / 'rd_device.c').read_text()
     event = (driver / 'rd_event.c').read_text()
     query = (driver / 'rd_query.c').read_text()
     sync_header = (driver.parent.parent / 'vulkan' / 'runtime' / 'vk_sync.h').read_text()
@@ -50,6 +51,9 @@ def main():
     assert 'rd_vertex_input_valid(info->pVertexInputState)' in graphics
     assert descriptor.count('rd_descriptor_span_valid(') >= 4
     assert 'RADISH_SUBMIT_DIAG' in queue
+    assert 'RADISH_SUBMIT_DIAG_EVERY' in queue
+    assert 'emit_ns' in queue and 'kernel_ns' in queue and 'wait_ns' in queue
+    assert 'RADISH_PENDING_BLOCKING_WAIT' in device_src
     assert 'compute_deferred' not in queue
     assert 'rd_compute_can_defer(async, deferred,' in queue
     assert 'device->publish_signal_fence' in queue

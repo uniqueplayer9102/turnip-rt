@@ -24,8 +24,10 @@ rd_sync_wait_many(struct vk_device *device, uint32_t count,
       container_of(device->physical, struct rd_physical_device, vk);
    if (!physical->sync_wait_many)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   const bool poll_pending = count && (flags & VK_SYNC_WAIT_PENDING) &&
+   bool poll_pending = count && (flags & VK_SYNC_WAIT_PENDING) &&
       !vk_sync_waits_have_timeline(count, waits);
+   if (poll_pending && debug_get_bool_option("RADISH_PENDING_BLOCKING_WAIT", false))
+      poll_pending = false;
    for (;;) {
       if (vk_device_is_lost_no_report(device)) {
          rd_wake_device_waiters(device);

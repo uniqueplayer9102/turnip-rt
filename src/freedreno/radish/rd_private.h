@@ -95,6 +95,8 @@ enum rd_drain_reason {
 };
 
 struct rd_submit_diag {
+   uint64_t id;
+   uint64_t emit_ns, kernel_ns, wait_ns;
    uint32_t drain_count[RD_DRAIN_COUNT];
    uint64_t drain_ns[RD_DRAIN_COUNT];
    uint32_t markers;
@@ -114,6 +116,7 @@ struct rd_device {
    uint32_t border_colors_offset;
    uint32_t seqno;
    uint64_t submit_count;
+   uint64_t vk_submit_id;
    uint64_t faults;
    struct rd_submit_window submit_window;
    int submit_in_fence_fd;
