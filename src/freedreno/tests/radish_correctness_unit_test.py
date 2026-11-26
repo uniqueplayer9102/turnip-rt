@@ -7,7 +7,7 @@ import tempfile
 
 
 def extract(source, name, cpp=False):
-    prefix = r'^static bool ' if cpp else r'^(?:static (?:inline )?)?(?:void|bool|uint32_t|uint64_t|VkResult|nir_mem_access_size_align)\n'
+    prefix = r'^static bool ' if cpp else r'^(?:static (?:inline )?)?(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|nir_mem_access_size_align)\n'
     match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
     return source[match.start():source.index('\n}', match.end()) + 3] + '\n'
@@ -28,6 +28,7 @@ def main():
     cache = (driver / 'rd_pipeline_cache.cpp').read_text()
     instance = (driver / 'rd_instance.c').read_text()
     queue = (driver / 'rd_queue.c').read_text()
+    descriptor = (driver / 'rd_descriptor.c').read_text()
     event = (driver / 'rd_event.c').read_text()
     query = (driver / 'rd_query.c').read_text()
     sync_header = (driver.parent.parent / 'vulkan' / 'runtime' / 'vk_sync.h').read_text()
@@ -47,6 +48,8 @@ def main():
     assert re.search(r'rd_CmdWriteTimestamp2\([\s\S]{0,600}?if \(command->render\)', query)
     assert 'rd_query_range(pool, query, 1)' in query[query.index('rd_CmdEndQuery('):][:400]
     assert 'rd_vertex_input_valid(info->pVertexInputState)' in graphics
+    assert descriptor.count('rd_descriptor_span_valid(') >= 4
+    assert 'RADISH_SUBMIT_DIAG' in queue
     assert 'compute_deferred' not in queue
     assert 'rd_compute_can_defer(async, deferred,' in queue
     assert 'device->publish_signal_fence' in queue
@@ -86,6 +89,10 @@ def main():
             extract(graphics, 'rd_vertex_input_valid'))
         (directory / 'query_range_under_test.h').write_text(
             extract(query, 'rd_query_range'))
+        (directory / 'descriptor_span_under_test.h').write_text(
+            extract(descriptor, 'rd_descriptor_span_valid'))
+        (directory / 'drain_index_under_test.h').write_text(
+            extract(queue, 'rd_drain_index'))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]

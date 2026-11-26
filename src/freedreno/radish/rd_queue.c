@@ -38,6 +38,20 @@ DEBUG_GET_ONCE_BOOL_OPTION(async_render_fence, "RADISH_ASYNC_RENDER_FENCE", true
 DEBUG_GET_ONCE_BOOL_OPTION(submit_timing, "RADISH_SUBMIT_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(wait_timing, "RADISH_WAIT_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(fence_debug, "RADISH_FENCE_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(submit_diag, "RADISH_SUBMIT_DIAG", false)
+
+static const char *rd_drain_names[RD_DRAIN_COUNT] = {
+   "cpu", "final", "capacity", "signal", "fallback", "error", "trace", "other",
+};
+
+static unsigned
+rd_drain_index(const char *reason)
+{
+   for (unsigned i = 0; i < RD_DRAIN_COUNT; i++)
+      if (!strcmp(reason, rd_drain_names[i]))
+         return i;
+   return RD_DRAIN_OTHER;
+}
 
 struct rd_submit_profile {
    uint64_t chunks;
@@ -745,9 +759,15 @@ rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
    struct fd_fence *last = window->pending[window->count - 1].fence;
    VkResult result = VK_ERROR_DEVICE_LOST;
    bool timing = debug_get_option_wait_timing();
-   int64_t t0 = device->trace || timing ? os_time_get_nano() : 0;
+   bool diag = debug_get_option_submit_diag();
+   int64_t t0 = device->trace || timing || diag ? os_time_get_nano() : 0;
    int wait = fd_pipe_wait_timeout(device->pipe, last, 5000000000ull);
-   int64_t done = device->trace || timing ? os_time_get_nano() : 0;
+   int64_t done = device->trace || timing || diag ? os_time_get_nano() : 0;
+   if (diag) {
+      unsigned index = rd_drain_index(reason);
+      device->diag.drain_count[index]++;
+      device->diag.drain_ns[index] += done - t0;
+   }
    if (device->trace)
       device->trace->wait_ns += done - t0;
    if (timing)
@@ -2625,6 +2645,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct rd_device *device = container_of(queue->base.device, struct rd_device, vk);
    device->publish_signal_fence = false;
+   if (debug_get_option_submit_diag())
+      memset(&device->diag, 0, sizeof(device->diag));
    bool profile = debug_get_bool_option("RADISH_PROFILE", false);
    struct rd_submit_window *window = &device->submit_window;
    bool deferred = !profile && debug_get_option_batch_chunks() == 8;
@@ -2837,27 +2859,49 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
       }
    }
    rd_trace_resolve(device, queue_start);
+   bool diag = debug_get_option_submit_diag();
    if (async) {
       if (device->submit_in_fence_fd < 0 && submit->signal_count && window->count &&
           window->pending[window->count - 1].fence->use_fence_fd) {
          result = rd_signal_submit_fence(device, window,
                                         submit->signal_count, submit->signals);
+         if (diag && result == VK_SUCCESS)
+            device->diag.fence_imported = true;
       } else if (device->submit_in_fence_fd >= 0 ||
           (submit->signal_count && window->count)) {
          result = rd_submit_sync_marker(device, window,
                                         submit->signal_count, submit->signals);
+         if (diag)
+            device->diag.markers++;
       } else if (submit->signal_count) {
          result = vk_sync_signal_many(&device->vk, submit->signal_count,
                                       submit->signals);
+         if (diag)
+            device->diag.cpu_signalled = true;
       }
    } else if (device->publish_signal_fence && window->count) {
       result = rd_signal_submit_fence(device, window,
                                      submit->signal_count, submit->signals);
+      if (diag && result == VK_SUCCESS)
+         device->diag.fence_imported = true;
    } else {
       result = rd_window_drain(device, window, "final");
       if (result == VK_SUCCESS)
          result = vk_sync_signal_many(&device->vk, submit->signal_count,
                                       submit->signals);
+      if (diag)
+         device->diag.cpu_signalled = true;
+   }
+   if (diag) {
+      fprintf(stderr, "RADISH_SUBMIT_DIAG seq=%" PRIu64 " async=%u waits=%u signals=%u"
+              " marker=%u imported=%u cpu_signal=%u",
+              device->submit_count, async != 0, submit->wait_count, submit->signal_count,
+              device->diag.markers, device->diag.fence_imported, device->diag.cpu_signalled);
+      for (unsigned i = 0; i < RD_DRAIN_COUNT; i++)
+         if (device->diag.drain_count[i])
+            fprintf(stderr, " %s=%u/%" PRIu64 "ns", rd_drain_names[i],
+                    device->diag.drain_count[i], device->diag.drain_ns[i]);
+      fprintf(stderr, "\n");
    }
    device->publish_signal_fence = false;
    return result == VK_SUCCESS ? VK_SUCCESS : rd_queue_fail(queue);

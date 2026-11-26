@@ -187,6 +187,27 @@ rd_find_binding(struct rd_set_layout *layout, uint32_t binding)
    return NULL;
 }
 
+static bool
+rd_descriptor_span_valid(const struct rd_set_layout *layout, uint32_t first,
+                          VkDescriptorType type, uint32_t count)
+{
+   if (first > layout->descriptor_count || count > layout->descriptor_count - first)
+      return false;
+   for (uint32_t slot = first; slot < first + count; slot++) {
+      const struct rd_binding *binding = NULL;
+      for (uint32_t i = 0; i < layout->binding_count; i++) {
+         const struct rd_binding *candidate = &layout->bindings[i];
+         if (slot >= candidate->slot && slot - candidate->slot < candidate->count) {
+            binding = candidate;
+            break;
+         }
+      }
+      if (!binding || binding->type != type)
+         return false;
+   }
+   return true;
+}
+
 static const struct vk_sampler_state *
 rd_immutable_sampler(const struct rd_set_layout *layout, uint32_t slot)
 {
@@ -404,8 +425,8 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
       const struct rd_binding *binding = rd_find_binding(set->layout, writes[i].dstBinding);
       if (!binding || writes[i].descriptorType != binding->type ||
           writes[i].dstArrayElement > set->layout->descriptor_count - binding->slot ||
-          writes[i].descriptorCount > set->layout->descriptor_count -
-             binding->slot - writes[i].dstArrayElement)
+          !rd_descriptor_span_valid(set->layout, binding->slot + writes[i].dstArrayElement,
+                                    writes[i].descriptorType, writes[i].descriptorCount))
          continue;
       for (uint32_t j = 0; j < writes[i].descriptorCount; j++) {
          const void *data;
@@ -433,8 +454,10 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
       if (!sb || !db || sb->type != db->type ||
           copies[i].srcArrayElement > src->layout->descriptor_count - sb->slot ||
           copies[i].dstArrayElement > dst->layout->descriptor_count - db->slot ||
-          copies[i].descriptorCount > src->layout->descriptor_count - sb->slot - copies[i].srcArrayElement ||
-          copies[i].descriptorCount > dst->layout->descriptor_count - db->slot - copies[i].dstArrayElement)
+          !rd_descriptor_span_valid(src->layout, sb->slot + copies[i].srcArrayElement,
+                                    sb->type, copies[i].descriptorCount) ||
+          !rd_descriptor_span_valid(dst->layout, db->slot + copies[i].dstArrayElement,
+                                    db->type, copies[i].descriptorCount))
          continue;
       uint32_t first = db->slot + copies[i].dstArrayElement;
       memmove(&dst->descriptors[first],
@@ -464,7 +487,8 @@ rd_UpdateDescriptorSetWithTemplate(VkDevice handle, VkDescriptorSet set_handle,
       const struct rd_binding *binding = rd_find_binding(set->layout, entry->binding);
       if (!binding || entry->type != binding->type ||
           entry->array_element > set->layout->descriptor_count - binding->slot ||
-          entry->array_count > set->layout->descriptor_count - binding->slot - entry->array_element)
+          !rd_descriptor_span_valid(set->layout, binding->slot + entry->array_element,
+                                    entry->type, entry->array_count))
          continue;
       for (uint32_t j = 0; j < entry->array_count; j++)
          rd_write_descriptor(set, binding->slot + entry->array_element + j,

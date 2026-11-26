@@ -175,6 +175,51 @@ struct vk_sync_wait { struct vk_sync *sync; };
 #include "vertex_input_under_test.h"
 #include "query_range_under_test.h"
 
+struct rd_binding { uint32_t slot, count; VkDescriptorType type; };
+struct rd_set_layout {
+   uint32_t descriptor_count, binding_count;
+   struct rd_binding bindings[8];
+};
+#include "descriptor_span_under_test.h"
+
+enum rd_drain_reason {
+   RD_DRAIN_CPU, RD_DRAIN_FINAL, RD_DRAIN_CAPACITY, RD_DRAIN_SIGNAL,
+   RD_DRAIN_FALLBACK, RD_DRAIN_ERROR, RD_DRAIN_TRACE, RD_DRAIN_OTHER,
+   RD_DRAIN_COUNT,
+};
+static const char *rd_drain_names[RD_DRAIN_COUNT] = {
+   "cpu", "final", "capacity", "signal", "fallback", "error", "trace", "other",
+};
+#include "drain_index_under_test.h"
+
+static void test_drain_index(void)
+{
+   assert(rd_drain_index("cpu") == RD_DRAIN_CPU);
+   assert(rd_drain_index("final") == RD_DRAIN_FINAL);
+   assert(rd_drain_index("capacity") == RD_DRAIN_CAPACITY);
+   assert(rd_drain_index("unknown") == RD_DRAIN_OTHER);
+}
+
+static void test_descriptor_span(void)
+{
+   struct rd_set_layout layout = {
+      .descriptor_count = 6,
+      .binding_count = 3,
+      .bindings = {
+         {0, 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE},
+         {2, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+         {4, 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER},
+      },
+   };
+   assert(rd_descriptor_span_valid(&layout, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2));
+   assert(rd_descriptor_span_valid(&layout, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1));
+   assert(!rd_descriptor_span_valid(&layout, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2));
+   assert(rd_descriptor_span_valid(&layout, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2));
+   assert(!rd_descriptor_span_valid(&layout, 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3));
+   assert(!rd_descriptor_span_valid(&layout, 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0));
+   assert(rd_descriptor_span_valid(&layout, 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0));
+}
+
 static void test_query_range(void)
 {
    struct rd_query_pool pool = { .vk.query_count = 4 };
@@ -468,7 +513,8 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
-   test_query_range(); test_vertex_input(); test_fence_export(); test_sync_policy(); test_sync_waits();
+   test_drain_index(); test_descriptor_span(); test_query_range(); test_vertex_input();
+   test_fence_export(); test_sync_policy(); test_sync_waits();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -476,6 +522,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy and waits, query range, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy and waits, query range, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }

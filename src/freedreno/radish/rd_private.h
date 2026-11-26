@@ -87,6 +87,20 @@ struct rd_physical_device {
    const struct vk_sync_type *sync_types[2];
    struct wsi_device wsi;
 };
+enum rd_drain_reason {
+   RD_DRAIN_CPU, RD_DRAIN_FINAL, RD_DRAIN_CAPACITY, RD_DRAIN_SIGNAL,
+   RD_DRAIN_FALLBACK, RD_DRAIN_ERROR, RD_DRAIN_TRACE, RD_DRAIN_OTHER,
+   RD_DRAIN_COUNT,
+};
+
+struct rd_submit_diag {
+   uint32_t drain_count[RD_DRAIN_COUNT];
+   uint64_t drain_ns[RD_DRAIN_COUNT];
+   uint32_t markers;
+   bool fence_imported;
+   bool cpu_signalled;
+};
+
 struct rd_device {
    struct vk_device vk;
    struct fd_device *fd;
@@ -104,6 +118,7 @@ struct rd_device {
    int submit_in_fence_fd;
    bool submit_out_fence;
    bool publish_signal_fence;
+   struct rd_submit_diag diag;
    struct fd_bo *render_timing_bo;
    int64_t render_timing_start_ns;
    bool render_timing_gmem;
