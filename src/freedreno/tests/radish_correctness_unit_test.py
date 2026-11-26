@@ -56,6 +56,7 @@ def main():
     assert 'emit_ns' in queue and 'kernel_ns' in queue and 'wait_ns' in queue
     assert 'RADISH_PENDING_BLOCKING_WAIT' in device_src
     assert '!!transfer->src_buffer == !!transfer->dst_buffer' in image_src
+    assert 'assert(!!transfer->src_buffer != !!transfer->src_image)' in image_src
     assert 'compute_deferred' not in queue
     assert 'rd_compute_can_defer(async, deferred,' in queue
     assert 'device->publish_signal_fence' in queue

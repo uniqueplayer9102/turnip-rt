@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include <assert.h>
 #include "common/fd5_hw.h"
 #include "util/cache_ops.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -1830,6 +1831,9 @@ rd_image_copy_side(const struct rd_image_transfer *transfer, bool source,
 void
 rd_image_copy_bos(const struct rd_image_transfer *transfer, struct fd_bo *bos[2])
 {
+   assert(!!transfer->src_buffer != !!transfer->src_image);
+   assert(!!transfer->dst_buffer != !!transfer->dst_image);
+   assert(bos);
    bos[0] = transfer->src_buffer ? transfer->src_buffer->memory->bo : transfer->src_image->memory->bo;
    bos[1] = transfer->dst_buffer ? transfer->dst_buffer->memory->bo : transfer->dst_image->memory->bo;
 }
