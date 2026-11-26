@@ -39,6 +39,8 @@ def main():
     assert direct.index('result = queries ?') < direct.index('if (result == VK_SUCCESS && queries)')
     assert 'q.zero |= i != 0;' in graphics
     assert '.pipelineStatisticsQuery = false' in instance
+    assert '#ifdef VK_USE_PLATFORM_XCB_KHR' in instance
+    assert '.KHR_xcb_surface = true,' in instance
     assert 'util_dynarray_append(' not in graphics
     pipeline = (driver / 'rd_pipeline.c').read_text()
     assert pipeline.index('rd_nir_lower_subword_storage(nir)') < pipeline.index(

@@ -78,6 +78,12 @@ static const struct vk_instance_extension_table rd_instance_extensions = {
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
    .KHR_wayland_surface = true,
 #endif
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   .KHR_xcb_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_XLIB_KHR
+   .KHR_xlib_surface = true,
+#endif
    .KHR_get_physical_device_properties2 = true,
    .KHR_device_group_creation = true,
    .KHR_external_memory_capabilities = true,
