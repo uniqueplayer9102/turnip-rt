@@ -1810,27 +1810,44 @@ rd_image_transfer_bounds(VkDeviceSize offset, VkDeviceSize row, VkDeviceSize sli
    return transfer->slices == 1 || slice <= (remaining - rows) / (transfer->slices - 1);
 }
 
+static bool
+rd_image_copy_side(const struct rd_image_transfer *transfer, bool source,
+                   struct rd_memory **memory, VkDeviceSize *offset, VkDeviceSize *size)
+{
+   struct rd_image *image = source ? transfer->src_image : transfer->dst_image;
+   struct rd_buffer *buffer = source ? transfer->src_buffer : transfer->dst_buffer;
+   if (!!image == !!buffer)
+      return false;
+   if (image && (image->vk.image_type != VK_IMAGE_TYPE_2D ||
+                 image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+                 image->native_layout.tile_mode ||
+                 vk_format_is_compressed(image->vk.format) ||
+                 vk_format_is_depth_or_stencil(image->vk.format)))
+      return false;
+   return rd_image_transfer_memory(image, buffer, memory, offset, size);
+}
+
+void
+rd_image_copy_bos(const struct rd_image_transfer *transfer, struct fd_bo *bos[2])
+{
+   bos[0] = transfer->src_buffer ? transfer->src_buffer->memory->bo : transfer->src_image->memory->bo;
+   bos[1] = transfer->dst_buffer ? transfer->dst_buffer->memory->bo : transfer->dst_image->memory->bo;
+}
+
 bool
 rd_image_copy_gpu_supported(struct rd_device *device,
                             const struct rd_image_transfer *transfer, bool small_copies)
 {
    if (!debug_get_option_gpu_image_copy() ||
        fd_device_version(device->fd) < FD_VERSION_SOFTPIN ||
-       !transfer->src_buffer || !transfer->dst_image ||
-       transfer->src_image || transfer->dst_buffer || transfer->copy_mask || transfer->lane_step ||
-       transfer->dst_image->vk.image_type != VK_IMAGE_TYPE_2D ||
-       transfer->dst_image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
-       transfer->dst_image->native_layout.tile_mode ||
+       !!transfer->src_buffer == !!transfer->dst_buffer ||
+       transfer->copy_mask || transfer->lane_step ||
        transfer->rows > 65535 || transfer->slices > 65535)
-      return false;
-   VkFormat format = transfer->dst_image->vk.format;
-   if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R8G8B8A8_SRGB &&
-       format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_B8G8R8A8_SRGB)
       return false;
    struct rd_memory *src, *dst;
    VkDeviceSize src_offset, dst_offset, src_size, dst_size;
-   if (!rd_image_transfer_memory(NULL, transfer->src_buffer, &src, &src_offset, &src_size) ||
-       !rd_image_transfer_memory(transfer->dst_image, NULL, &dst, &dst_offset, &dst_size) ||
+   if (!rd_image_copy_side(transfer, true, &src, &src_offset, &src_size) ||
+       !rd_image_copy_side(transfer, false, &dst, &dst_offset, &dst_size) ||
        !rd_image_transfer_bounds(transfer->src_offset, transfer->src_row_pitch,
                                  transfer->src_slice_pitch, transfer, src_size, 0, 0) ||
        !rd_image_transfer_bounds(transfer->dst_offset, transfer->dst_row_pitch,

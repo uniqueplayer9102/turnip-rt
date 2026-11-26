@@ -158,8 +158,12 @@ struct vk_device_extension_table { bool KHR_swapchain, KHR_incremental_present; 
 
 struct rd_image_level { VkDeviceSize array_pitch; };
 struct rd_image {
-   struct { uint32_t array_layers; VkImageUsageFlags usage; } vk;
+   struct { uint32_t array_layers; VkImageUsageFlags usage; VkFormat format;
+            VkImageType image_type; VkSampleCountFlagBits samples; } vk;
+   struct { uint32_t tile_mode; } native_layout;
    struct rd_image_level levels[1];
+   struct rd_memory *memory;
+   VkDeviceSize memory_offset, size;
 };
 #include "image_pitch_under_test.h"
 
@@ -183,6 +187,45 @@ struct rd_set_layout {
    uint32_t descriptor_count, binding_count;
    struct rd_binding bindings[8];
 };
+struct rd_memory { struct { VkDeviceSize size; } vk; };
+struct rd_buffer { struct { VkDeviceSize size; } vk; struct rd_memory *memory; VkDeviceSize offset; };
+struct rd_image_transfer {
+   struct rd_image *src_image, *dst_image;
+   struct rd_buffer *src_buffer, *dst_buffer;
+};
+#define vk_format_is_compressed(f) (0)
+#define vk_format_is_depth_or_stencil(f) (0)
+#include "copy_side_under_test.h"
+
+static void test_copy_side(void)
+{
+   struct rd_memory memory = { .vk.size = 4096 };
+   struct rd_image image = {
+      .vk.format = VK_FORMAT_R8_UNORM, .vk.image_type = VK_IMAGE_TYPE_2D,
+      .vk.samples = VK_SAMPLE_COUNT_1_BIT, .memory = &memory, .size = 4096,
+   };
+   struct rd_buffer buffer = { .vk.size = 4096, .memory = &memory };
+   struct rd_image_transfer transfer = { .src_buffer = &buffer, .dst_image = &image };
+   struct rd_memory *mem = NULL;
+   VkDeviceSize offset = 0, size = 0;
+   assert(rd_image_copy_side(&transfer, true, &mem, &offset, &size));
+   assert(mem == &memory);
+   assert(rd_image_copy_side(&transfer, false, &mem, &offset, &size));
+   transfer.src_image = &image;
+   transfer.src_buffer = NULL;
+   assert(rd_image_copy_side(&transfer, true, &mem, &offset, &size));
+   transfer.dst_buffer = &buffer;
+   transfer.dst_image = NULL;
+   assert(rd_image_copy_side(&transfer, false, &mem, &offset, &size));
+   transfer.src_buffer = &buffer;
+   transfer.src_image = NULL;
+   assert(rd_image_copy_side(&transfer, true, &mem, &offset, &size));
+   transfer.src_buffer = NULL;
+   transfer.src_image = &image;
+   image.native_layout.tile_mode = 1;
+   assert(!rd_image_copy_side(&transfer, true, &mem, &offset, &size));
+}
+
 #include "descriptor_span_under_test.h"
 
 enum rd_drain_reason {
@@ -537,7 +580,8 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
-   test_render_query_before_work(); test_drain_index(); test_descriptor_span();
+   test_copy_side(); test_render_query_before_work(); test_drain_index();
+   test_descriptor_span();
    test_query_range(); test_vertex_input();
    test_fence_export(); test_sync_policy(); test_sync_waits();
    test_device_extensions();
@@ -547,6 +591,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, empty-render queries, waits, query range, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, empty-render queries, waits, query range, copy direction, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }

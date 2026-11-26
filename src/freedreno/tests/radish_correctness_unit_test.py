@@ -29,6 +29,7 @@ def main():
     instance = (driver / 'rd_instance.c').read_text()
     queue = (driver / 'rd_queue.c').read_text()
     descriptor = (driver / 'rd_descriptor.c').read_text()
+    image_src = (driver / 'rd_image.c').read_text()
     device_src = (driver / 'rd_device.c').read_text()
     event = (driver / 'rd_event.c').read_text()
     query = (driver / 'rd_query.c').read_text()
@@ -54,6 +55,7 @@ def main():
     assert 'RADISH_SUBMIT_DIAG_EVERY' in queue
     assert 'emit_ns' in queue and 'kernel_ns' in queue and 'wait_ns' in queue
     assert 'RADISH_PENDING_BLOCKING_WAIT' in device_src
+    assert '!!transfer->src_buffer == !!transfer->dst_buffer' in image_src
     assert 'compute_deferred' not in queue
     assert 'rd_compute_can_defer(async, deferred,' in queue
     assert 'device->publish_signal_fence' in queue
@@ -98,6 +100,9 @@ def main():
             extract(descriptor, 'rd_descriptor_span_valid'))
         (directory / 'drain_index_under_test.h').write_text(
             extract(queue, 'rd_drain_index'))
+        (directory / 'copy_side_under_test.h').write_text(''.join(
+            extract(image_src, name) for name in ('rd_image_transfer_memory',
+                                                  'rd_image_copy_side')))
         includes = ['-I', str(directory)]
         if args.include:
             includes += ['-I', str(args.include)]

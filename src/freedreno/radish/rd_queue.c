@@ -2286,7 +2286,8 @@ rd_image_copy_batch_count(struct rd_device *device, const struct rd_command *fir
           !rd_image_copy_gpu_supported(device, &command->image_transfer, true))
          break;
       const struct rd_image_transfer *copy = &command->image_transfer;
-      struct fd_bo *used[] = { copy->src_buffer->memory->bo, copy->dst_image->memory->bo };
+      struct fd_bo *used[2];
+      rd_image_copy_bos(copy, used);
       for (unsigned i = 0; i < ARRAY_SIZE(used); i++) {
          bool found = false;
          for (unsigned j = 0; j < bo_count; j++)
