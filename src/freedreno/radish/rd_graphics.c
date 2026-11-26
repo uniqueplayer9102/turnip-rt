@@ -38,13 +38,17 @@ DEBUG_GET_ONCE_BOOL_OPTION(gmem, "RADISH_GMEM", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_cull, "RADISH_GMEM_CULL", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_viewport_reuse, "RADISH_GMEM_VIEWPORT_REUSE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_dump, "RADISH_GMEM_DUMP", false)
+DEBUG_GET_ONCE_BOOL_OPTION(gmem_elide_clear_load, "RADISH_GMEM_ELIDE_CLEAR_LOAD", false)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_damage_tiles, "RADISH_GMEM_DAMAGE_TILES", false)
 DEBUG_GET_ONCE_BOOL_OPTION(async_depth_stencil, "RADISH_ASYNC_DEPTH_STENCIL", false)
 DEBUG_GET_ONCE_BOOL_OPTION(readonly_bo_tracking, "RADISH_READONLY_BO_TRACKING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(render_gpu_timing, "RADISH_RENDER_GPU_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(render_gpu_detail, "RADISH_RENDER_GPU_DETAIL", false)
+DEBUG_GET_ONCE_BOOL_OPTION(gmem_conversion_pass, "RADISH_GMEM_CONVERSION_PASS", false)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_stop, "RADISH_GMEM_STOP", -1)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_min_draws, "RADISH_GMEM_MIN_DRAWS", 4)
+DEBUG_GET_ONCE_NUM_OPTION(gmem_fp16_bin_w, "RADISH_GMEM_FP16_BIN_W", 0)
+DEBUG_GET_ONCE_NUM_OPTION(gmem_fp16_bin_h, "RADISH_GMEM_FP16_BIN_H", 0)
 DEBUG_GET_ONCE_BOOL_OPTION(descriptor_arena, "RADISH_DESCRIPTOR_ARENA", true)
 
 enum ir3_wavesize_option
@@ -3128,6 +3132,17 @@ rd_gmem_layout_init(struct rd_gmem_layout *l, uint32_t cpp, uint32_t width,
       return false;
    l->cpp = cpp;
    l->cbuf_base = 0;
+   int64_t requested_w = debug_get_option_gmem_fp16_bin_w();
+   int64_t requested_h = debug_get_option_gmem_fp16_bin_h();
+   if (cpp == 8 && requested_w > 0 && requested_h > 0 &&
+       requested_w <= info->tile_max_w && requested_h <= info->tile_max_h &&
+       !(requested_w % info->tile_align_w) && !(requested_h % info->tile_align_h)) {
+      struct rd_gmem_layout candidate = { .bin_w = requested_w, .bin_h = requested_h, .cpp = cpp };
+      if (rd_gmem_layout_fits(&candidate, gmem_size)) {
+         *l = candidate;
+         return true;
+      }
+   }
    l->bin_w = rd_gmem_div_align(width, 1, info->tile_align_w);
    l->bin_h = rd_gmem_div_align(height, 1, info->tile_align_h);
    unsigned nbins_x = 1, nbins_y = 1;
@@ -3165,6 +3180,68 @@ rd_gmem_enabled(const struct rd_device *device)
 }
 
 static bool
+rd_gmem_conversion_supported(const struct rd_render *render)
+{
+   if (!debug_get_option_gmem_conversion_pass() || render->color_count != 1 ||
+       !render->color[0].view || render->color[0].view->vk.format != VK_FORMAT_B8G8R8A8_UNORM ||
+       util_dynarray_num_elements(&render->draws, struct rd_draw) != 1)
+      return false;
+   const struct rd_draw *draw = util_dynarray_begin(&render->draws);
+   if (render->color[0].load != VK_ATTACHMENT_LOAD_OP_LOAD &&
+       (draw->scissor.offset.x > render->area.offset.x ||
+        draw->scissor.offset.y > render->area.offset.y ||
+        (int64_t)draw->scissor.offset.x + draw->scissor.extent.width <
+           (int64_t)render->area.offset.x + render->area.extent.width ||
+        (int64_t)draw->scissor.offset.y + draw->scissor.extent.height <
+           (int64_t)render->area.offset.y + render->area.extent.height))
+      return false;
+   const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
+   const struct rd_pipeline *stage = gfx->fs.res;
+   if (gfx->vs.res->resource_count || !gfx->fs.v->has_no_side_effects || !draw->descriptors[1])
+      return false;
+   const struct rd_image *target = container_of(render->color[0].view->vk.image, struct rd_image, vk);
+   if (!target->memory || !target->memory->bo->handle)
+      return false;
+   const struct rd_image_view *view = NULL;
+   for (unsigned i = 0; i < stage->resource_count; i++) {
+      if (!(stage->resource_usage.descriptors & (UINT64_C(1) << i)))
+         continue;
+      VkDescriptorType type = stage->resources[i].type;
+      if (type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+         if (view)
+            return false;
+         view = draw->descriptors[1][i].image_view;
+         if (!view)
+            return false;
+      } else if (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                 type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+         const struct rd_image_view *sampled = draw->descriptors[1][i].image_view;
+         if (!sampled)
+            return false;
+         const struct rd_image *image = container_of(sampled->vk.image, struct rd_image, vk);
+         if (!image->memory || !image->memory->bo->handle ||
+             image->memory->bo->handle == target->memory->bo->handle)
+            return false;
+      } else if (type != VK_DESCRIPTOR_TYPE_SAMPLER) {
+         return false;
+      }
+   }
+   if (!view || view->vk.format != VK_FORMAT_R16G16B16A16_SFLOAT ||
+       view->vk.view_type != VK_IMAGE_VIEW_TYPE_2D || view->vk.level_count != 1 ||
+       view->vk.layer_count != 1 || view->vk.base_mip_level || view->vk.base_array_layer ||
+       view->vk.aspects != VK_IMAGE_ASPECT_COLOR_BIT)
+      return false;
+   const struct rd_image *source = container_of(view->vk.image, struct rd_image, vk);
+   if (!source->memory || !target->memory || source->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       !source->memory->bo->handle || !target->memory->bo->handle ||
+       source->memory->bo->handle == target->memory->bo->handle ||
+       view->vk.extent.width != render->color[0].view->vk.extent.width ||
+       view->vk.extent.height != render->color[0].view->vk.extent.height)
+      return false;
+   return true;
+}
+
+static bool
 rd_execute_render_gmem_supported(struct rd_device *device,
                                  const struct rd_render *render)
 {
@@ -3184,13 +3261,15 @@ rd_execute_render_gmem_supported(struct rd_device *device,
       return false;
    if (!util_dynarray_num_elements(&render->draws, struct rd_draw))
       return false;
+   bool conversion = rd_gmem_conversion_supported(render);
    if (util_dynarray_num_elements(&render->draws, struct rd_draw) <
-       (unsigned)debug_get_option_gmem_min_draws())
+        (unsigned)debug_get_option_gmem_min_draws() && !conversion)
       return false;
    if (!list_is_empty(&device->active_queries))
       return false;
    util_dynarray_foreach(&render->draws, struct rd_draw, d) {
-      if (d->indirect || d->barrier || d->occlusion_pool || rd_draw_uses_input_attachment(d))
+      if (d->indirect || d->barrier || d->occlusion_pool ||
+          (rd_draw_uses_input_attachment(d) && !conversion))
          return false;
       if (d->indexed && (!d->index_buffer || !d->index_buffer->memory ||
                          !d->index_buffer->memory->bo))
@@ -3431,6 +3510,42 @@ rd_gmem_emit_msaa_once(struct fd_ringbuffer *ring)
                   A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
 }
 
+static const struct rd_draw *
+rd_gmem_first_clear(struct rd_device *device, const struct rd_render *render)
+{
+   util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+      if (!draw->vertex_count || !draw->instance_count)
+         continue;
+      if (draw->pipeline != device->clear_pipeline || draw->indexed || draw->indirect ||
+          draw->vertex_count != 4 || draw->instance_count != 1 || draw->first_vertex ||
+          draw->first_instance || draw->rasterizer_discard || draw->cull != VK_CULL_MODE_NONE ||
+          draw->ds.depth.test_enable || draw->ds.stencil.test_enable ||
+          draw->cb.attachments[0].write_mask != 0xf || draw->cb.attachments[0].blend_enable ||
+          draw->alpha_to_coverage || !(draw->sample_mask & 1))
+         return NULL;
+      const float full_rect[4] = {-1, -1, 1, 1};
+      if (memcmp(&draw->push[4], full_rect, sizeof(full_rect)))
+         return NULL;
+      return draw;
+   }
+   return NULL;
+}
+
+static bool
+rd_gmem_clear_covers_tile(const struct rd_draw *clear, uint32_t x, uint32_t y,
+                         uint32_t width, uint32_t height)
+{
+   if (!clear)
+      return false;
+   return clear->viewport.width > 0 && clear->viewport.height > 0 &&
+      clear->viewport.x <= x && clear->viewport.y <= y &&
+      clear->viewport.x + clear->viewport.width >= (uint64_t)x + width &&
+      clear->viewport.y + clear->viewport.height >= (uint64_t)y + height &&
+      clear->scissor.offset.x <= (int64_t)x && clear->scissor.offset.y <= (int64_t)y &&
+      (int64_t)clear->scissor.offset.x + clear->scissor.extent.width >= (int64_t)x + width &&
+      (int64_t)clear->scissor.offset.y + clear->scissor.extent.height >= (int64_t)y + height;
+}
+
 static VkResult
 rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
                        struct rd_submit_window *window)
@@ -3584,6 +3699,9 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       }
    }
    uint32_t untouched_tiles = 0;
+   const struct rd_draw *first_clear = rd_gmem_first_clear(device, render);
+   bool elide_clear_load = debug_get_option_gmem_elide_clear_load();
+   uint32_t elidable_loads = 0, actual_loads = 0;
    const struct rd_draw *previous = NULL;
    int64_t timer_start = 0;
    struct fd_bo *timer_bo = stop_at > 0 ? NULL : rd_render_timer_prepare(device, ring,
@@ -3620,7 +3738,11 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
          bool preserve = x1 < (uint32_t)render->area.offset.x ||
                          y1 < (uint32_t)render->area.offset.y ||
                          x1 + tw > area_maxx || y1 + th > area_maxy;
-         if (load || preserve) {
+         bool clear_covers = load && !preserve &&
+            rd_gmem_clear_covers_tile(first_clear, x1, y1, tw, th);
+         elidable_loads += clear_covers;
+         if ((load && !(elide_clear_load && clear_covers)) || preserve) {
+            actual_loads++;
             OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
             OUT_RING(ring, A5XX_RB_CNTL_WIDTH(l.bin_w) |
                               A5XX_RB_CNTL_HEIGHT(l.bin_h) | A5XX_RB_CNTL_BYPASS);
@@ -3696,6 +3818,8 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       fprintf(stderr, "radish gmem viewport: updates=%" PRIu64 " reuses=%" PRIu64
               " state_waits=%" PRIu64 " enabled=%u\n",
               viewport_updates, viewport_reuses, state_waits, viewport_reuse);
+      fprintf(stderr, "radish gmem loads: actual=%u elidable=%u enabled=%u\n",
+              actual_loads, elidable_loads, elide_clear_load);
       fprintf(stderr, "radish gmem damage: skipped_tiles=%u enabled=%u\n",
               untouched_tiles, damage_tiles);
    }
