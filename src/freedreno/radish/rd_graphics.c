@@ -650,15 +650,18 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    render->layers = info->layerCount;
    render->view_mask = info->viewMask;
    render->color_count = info->colorAttachmentCount;
-   for (uint32_t i = 0; i < info->colorAttachmentCount; i++)
+   render->samples = 1;
+   for (uint32_t i = 0; i < render->color_count; i++) {
       rd_render_attachment(&render->color[i], &info->pColorAttachments[i]);
+      if (render->color[i].view)
+         render->samples = MAX2(render->samples, render->color[i].view->vk.image->samples);
+   }
    rd_render_attachment(&render->depth, info->pDepthAttachment);
    rd_render_attachment(&render->stencil, info->pStencilAttachment);
-   render->samples = 1;
-   for (const struct rd_render_attachment *a = render->color; a <= &render->stencil; a++) {
-      if (a->view && (a < render->color + render->color_count || a >= &render->depth))
-         render->samples = MAX2(render->samples, a->view->vk.image->samples);
-   }
+   if (render->depth.view)
+      render->samples = MAX2(render->samples, render->depth.view->vk.image->samples);
+   if (render->stencil.view)
+      render->samples = MAX2(render->samples, render->stencil.view->vk.image->samples);
    struct rd_command *recorded = rd_command_append(command, RD_CMD_RENDER);
    if (!recorded) {
       rd_render_free(command, render);
@@ -2843,13 +2846,6 @@ static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
                          struct rd_submit_window *window)
 {
-   for (const struct rd_render_attachment *a = &render->depth; a <= &render->stencil; a++) {
-      if (!a->view)
-         continue;
-      const struct rd_image *image = container_of(a->view->vk.image, struct rd_image, vk);
-      if (!image->memory || image->vk.samples != render->samples)
-         return VK_ERROR_FEATURE_NOT_PRESENT;
-   }
    uint32_t width = 0, height = 0;
    for (unsigned i = 0; i < render->color_count; i++) {
       const struct rd_render_attachment *a = &render->color[i];
@@ -2861,11 +2857,16 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       width = MAX2(width, a->view->vk.extent.width);
       height = MAX2(height, a->view->vk.extent.height);
    }
-   for (const struct rd_render_attachment *a = &render->depth; a <= &render->stencil; a++) {
-      if (a->view) {
-         width = MAX2(width, a->view->vk.extent.width);
-         height = MAX2(height, a->view->vk.extent.height);
-      }
+   const struct rd_image_view *views[] = {render->depth.view, render->stencil.view};
+   for (unsigned i = 0; i < ARRAY_SIZE(views); i++) {
+      const struct rd_image_view *view = views[i];
+      if (!view)
+         continue;
+      const struct rd_image *image = container_of(view->vk.image, struct rd_image, vk);
+      if (!image->memory || image->vk.samples != render->samples)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      width = MAX2(width, view->vk.extent.width);
+      height = MAX2(height, view->vk.extent.height);
    }
    uint32_t samples = render->samples;
    if (!width) {
