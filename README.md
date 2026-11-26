@@ -130,6 +130,7 @@ values; a running compositor can also be switched to bypass with a marker file
 
 | Variable | Default | Effect |
 | --- | --- | --- |
+| `RADISH_WSI_FIFO_NO_THROTTLE` | unset | `1`: skip Mesa's legacy frame-callback FIFO throttle on compositors without `wp_fifo_manager_v1` (raises FPS, still presents at VSync) |
 | `RADISH_ASYNC_QUEUE_SYNC` | `0` | pass sync-file fences to MSM instead of CPU-waiting each submit |
 | `RADISH_ASYNC_QUEUE_SYNC_DEBUG` | `0` | log async submit/skip decisions |
 | `RADISH_BATCH_CHUNKS` | `1` | compute chunks per submit; `8` enables deferred compute batching |
