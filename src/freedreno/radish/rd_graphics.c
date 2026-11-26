@@ -447,29 +447,37 @@ rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline)
 
 
 
+#define RD_MAX_VERTEX_ATTRIBUTES 16
+#define RD_MAX_VERTEX_BINDINGS 16
+#define RD_MAX_VERTEX_BINDING_STRIDE 2048
+#define RD_MAX_VERTEX_ATTRIBUTE_OFFSET 2047
+
 static bool
 rd_vertex_input_valid(const VkPipelineVertexInputStateCreateInfo *vi)
 {
    if (!vi)
       return true;
-   if (vi->vertexBindingDescriptionCount > MESA_VK_MAX_VERTEX_BINDINGS ||
-       vi->vertexAttributeDescriptionCount > MESA_VK_MAX_VERTEX_ATTRIBUTES ||
+   if (vk_find_struct_const(vi->pNext, PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT))
+      return false;
+   if (vi->vertexBindingDescriptionCount > RD_MAX_VERTEX_BINDINGS ||
+       vi->vertexAttributeDescriptionCount > RD_MAX_VERTEX_ATTRIBUTES ||
        (vi->vertexBindingDescriptionCount && !vi->pVertexBindingDescriptions) ||
        (vi->vertexAttributeDescriptionCount && !vi->pVertexAttributeDescriptions))
       return false;
    uint32_t declared = 0;
    for (uint32_t i = 0; i < vi->vertexBindingDescriptionCount; i++) {
       const VkVertexInputBindingDescription *binding = &vi->pVertexBindingDescriptions[i];
-      if (binding->binding >= MESA_VK_MAX_VERTEX_BINDINGS ||
-          binding->stride > MESA_VK_MAX_VERTEX_BINDING_STRIDE ||
+      if (binding->binding >= RD_MAX_VERTEX_BINDINGS ||
+          binding->stride > RD_MAX_VERTEX_BINDING_STRIDE ||
           binding->inputRate > VK_VERTEX_INPUT_RATE_INSTANCE)
          return false;
       declared |= 1u << binding->binding;
    }
    for (uint32_t i = 0; i < vi->vertexAttributeDescriptionCount; i++) {
       const VkVertexInputAttributeDescription *attribute = &vi->pVertexAttributeDescriptions[i];
-      if (attribute->location >= MESA_VK_MAX_VERTEX_ATTRIBUTES ||
-          attribute->binding >= MESA_VK_MAX_VERTEX_BINDINGS ||
+      if (attribute->location >= RD_MAX_VERTEX_ATTRIBUTES ||
+          attribute->binding >= RD_MAX_VERTEX_BINDINGS ||
+          attribute->offset > RD_MAX_VERTEX_ATTRIBUTE_OFFSET ||
           !(declared & (1u << attribute->binding)))
          return false;
    }

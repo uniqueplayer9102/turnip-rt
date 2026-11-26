@@ -84,7 +84,8 @@ def main():
             extract(sync_header, 'vk_sync_waits_have_timeline'))
         (directory / 'sync_policy_under_test.h').write_text(''.join(
             extract(queue, name) for name in ('rd_compute_can_defer', 'rd_publish_signal_fences',
-                                              'rd_render_exports_fence')))
+                                              'rd_render_exports_fence',
+                                              'rd_render_query_before_work')))
         (directory / 'vertex_input_under_test.h').write_text(
             extract(graphics, 'rd_vertex_input_valid'))
         (directory / 'query_range_under_test.h').write_text(

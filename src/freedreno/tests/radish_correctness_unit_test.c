@@ -169,9 +169,12 @@ struct vk_sync_wait { struct vk_sync *sync; };
 #include "sync_waits_under_test.h"
 #include "sync_policy_under_test.h"
 
-#define MESA_VK_MAX_VERTEX_BINDINGS 32
-#define MESA_VK_MAX_VERTEX_ATTRIBUTES 32
-#define MESA_VK_MAX_VERTEX_BINDING_STRIDE UINT16_MAX
+#define RD_MAX_VERTEX_ATTRIBUTES 16
+#define RD_MAX_VERTEX_BINDINGS 16
+#define RD_MAX_VERTEX_BINDING_STRIDE 2048
+#define RD_MAX_VERTEX_ATTRIBUTE_OFFSET 2047
+struct VkPipelineVertexInputDivisorStateCreateInfoEXT;
+#define vk_find_struct_const(pnext, type) ((void)(pnext), (void *)NULL)
 #include "vertex_input_under_test.h"
 #include "query_range_under_test.h"
 
@@ -184,19 +187,37 @@ struct rd_set_layout {
 
 enum rd_drain_reason {
    RD_DRAIN_CPU, RD_DRAIN_FINAL, RD_DRAIN_CAPACITY, RD_DRAIN_SIGNAL,
-   RD_DRAIN_FALLBACK, RD_DRAIN_ERROR, RD_DRAIN_TRACE, RD_DRAIN_OTHER,
-   RD_DRAIN_COUNT,
+   RD_DRAIN_FALLBACK, RD_DRAIN_ERROR, RD_DRAIN_TRACE, RD_DRAIN_CAPACITY_RESERVE,
+   RD_DRAIN_REAP_ERROR, RD_DRAIN_UNSUPPORTED, RD_DRAIN_QUEUE_IDLE,
+   RD_DRAIN_SIGNAL_FALLBACK, RD_DRAIN_OTHER, RD_DRAIN_COUNT,
 };
 static const char *rd_drain_names[RD_DRAIN_COUNT] = {
-   "cpu", "final", "capacity", "signal", "fallback", "error", "trace", "other",
+   "cpu", "final", "capacity", "signal", "fallback", "error", "trace",
+   "capacity-reserve", "reap-error", "unsupported", "queue-idle",
+   "signal-fallback", "other",
 };
 #include "drain_index_under_test.h"
+
+static void test_render_query_before_work(void)
+{
+   struct rd_render render = {0};
+   assert(!rd_render_query_before_work(&render));
+   struct rd_render_query query = {0};
+   render.queries.data = &query;
+   render.queries.size = sizeof(query);
+   assert(rd_render_query_before_work(&render));
+   struct rd_draw draw = {0};
+   render.draws.data = &draw;
+   render.draws.size = sizeof(draw);
+   assert(!rd_render_query_before_work(&render));
+}
 
 static void test_drain_index(void)
 {
    assert(rd_drain_index("cpu") == RD_DRAIN_CPU);
    assert(rd_drain_index("final") == RD_DRAIN_FINAL);
    assert(rd_drain_index("capacity") == RD_DRAIN_CAPACITY);
+   assert(rd_drain_index("signal-fallback") == RD_DRAIN_SIGNAL_FALLBACK);
    assert(rd_drain_index("unknown") == RD_DRAIN_OTHER);
 }
 
@@ -259,6 +280,9 @@ static void test_vertex_input(void)
    assert(!rd_vertex_input_valid(&vi));
    binding.stride = 16;
    binding.inputRate = 2;
+   assert(!rd_vertex_input_valid(&vi));
+   binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+   attribute.offset = 2048;
    assert(!rd_vertex_input_valid(&vi));
 }
 
@@ -513,7 +537,8 @@ static void test_trace(void)
 int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
-   test_drain_index(); test_descriptor_span(); test_query_range(); test_vertex_input();
+   test_render_query_before_work(); test_drain_index(); test_descriptor_span();
+   test_query_range(); test_vertex_input();
    test_fence_export(); test_sync_policy(); test_sync_waits();
    test_device_extensions();
    test_blit_src();
@@ -522,6 +547,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy and waits, query range, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, empty-render queries, waits, query range, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }

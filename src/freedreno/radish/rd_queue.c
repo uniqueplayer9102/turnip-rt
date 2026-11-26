@@ -41,7 +41,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(fence_debug, "RADISH_FENCE_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(submit_diag, "RADISH_SUBMIT_DIAG", false)
 
 static const char *rd_drain_names[RD_DRAIN_COUNT] = {
-   "cpu", "final", "capacity", "signal", "fallback", "error", "trace", "other",
+   "cpu", "final", "capacity", "signal", "fallback", "error", "trace",
+   "capacity-reserve", "reap-error", "unsupported", "queue-idle",
+   "signal-fallback", "other",
 };
 
 static unsigned
@@ -927,6 +929,7 @@ rd_queue_submit_has_render(const struct vk_queue_submit *submit)
 }
 
 static bool rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch);
+static bool rd_render_query_before_work(const struct rd_render *render);
 static VkResult rd_resolve_dispatch(const struct rd_dispatch_record *record,
                                    struct rd_dispatch *dispatch);
 
@@ -973,6 +976,12 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
          if (recorded->type == RD_CMD_IMAGE_COPY &&
              rd_image_copy_gpu_supported(device, &recorded->image_transfer, small_copies))
             continue;
+         if (recorded->type == RD_CMD_RENDER && rd_render_query_before_work(recorded->render) &&
+             (submit->wait_count || device->submit_in_fence_fd >= 0)) {
+            if (debug)
+               fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP empty-render-query\n");
+            return false;
+         }
          if (recorded->type != RD_CMD_RENDER) {
             if (debug) {
                fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP command=%u\n",
@@ -1004,6 +1013,13 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
       }
    }
    return supported;
+}
+
+static bool
+rd_render_query_before_work(const struct rd_render *render)
+{
+   return !util_dynarray_num_elements(&render->draws, struct rd_draw) &&
+          util_dynarray_num_elements(&render->queries, struct rd_render_query);
 }
 
 static bool
@@ -1177,13 +1193,19 @@ rd_signal_submit_fence(struct rd_device *device, struct rd_submit_window *window
             break;
       }
    }
-   if (imported == signal_count)
+   if (imported == signal_count) {
+      if (debug_get_option_submit_diag() && signal_count)
+         device->diag.fence_imported = true;
       return VK_SUCCESS;
+   }
 
    VkResult result = rd_window_drain(device, window, "signal-fallback");
    if (result != VK_SUCCESS)
       return result;
-   return vk_sync_signal_many(&device->vk, signal_count - imported, signals + imported);
+   result = vk_sync_signal_many(&device->vk, signal_count - imported, signals + imported);
+   if (debug_get_option_submit_diag() && result == VK_SUCCESS)
+      device->diag.cpu_signalled = true;
+   return result;
 }
 
 static VkResult
@@ -2865,8 +2887,6 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
           window->pending[window->count - 1].fence->use_fence_fd) {
          result = rd_signal_submit_fence(device, window,
                                         submit->signal_count, submit->signals);
-         if (diag && result == VK_SUCCESS)
-            device->diag.fence_imported = true;
       } else if (device->submit_in_fence_fd >= 0 ||
           (submit->signal_count && window->count)) {
          result = rd_submit_sync_marker(device, window,
@@ -2882,8 +2902,6 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    } else if (device->publish_signal_fence && window->count) {
       result = rd_signal_submit_fence(device, window,
                                      submit->signal_count, submit->signals);
-      if (diag && result == VK_SUCCESS)
-         device->diag.fence_imported = true;
    } else {
       result = rd_window_drain(device, window, "final");
       if (result == VK_SUCCESS)
