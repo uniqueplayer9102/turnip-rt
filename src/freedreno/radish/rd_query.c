@@ -277,6 +277,10 @@ rd_CmdWriteTimestamp2(VkCommandBuffer handle, VkPipelineStageFlags2 stage,
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
+   if (command->render) {
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
    if (!pool || pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP) {
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;

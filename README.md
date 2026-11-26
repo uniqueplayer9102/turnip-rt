@@ -242,6 +242,20 @@ up as soon as there are real draws, which is why GMEM is the default for the
 passes it accepts. These figures predate the draw-count threshold, viewport
 reuse, and program cache; re-measure before quoting them for current builds.
 
+## Known limitations
+
+Some operations are rejected rather than executed with incorrect ordering or
+unsupported hardware state:
+
+- Event waits (`vkCmdWaitEvents2`) and timestamps (`vkCmdWriteTimestamp2`)
+  recorded inside dynamic rendering return `VK_ERROR_FEATURE_NOT_PRESENT`.
+  A rendering instance is aggregated into one submit-time draw batch, so these
+  operations cannot currently take effect at their recorded position.
+- Storage images are supported in fragment shaders only. Vertex, tessellation
+  and geometry stages that use them are rejected at pipeline creation.
+- Sampled array and cube-array images whose layer pitch cannot be encoded by
+  the native texture descriptor are rejected at image creation.
+
 ## Related repository
 
 Docs, CTS ledgers and tablet scripts live separately in

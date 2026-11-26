@@ -119,6 +119,10 @@ rd_CmdWaitEvents2(VkCommandBuffer handle, uint32_t count,
                   const VkEvent *events, const VkDependencyInfo *infos)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   if (command->render) {
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
    for (uint32_t i = 0; i < count; i++)
       rd_record_event(command, RD_CMD_EVENT_WAIT, events[i]);
    for (uint32_t i = 0; i < count; i++)

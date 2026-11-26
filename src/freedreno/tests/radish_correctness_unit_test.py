@@ -27,6 +27,8 @@ def main():
     resources = (driver / 'rd_resources.c').read_text()
     cache = (driver / 'rd_pipeline_cache.cpp').read_text()
     instance = (driver / 'rd_instance.c').read_text()
+    event = (driver / 'rd_event.c').read_text()
+    query = (driver / 'rd_query.c').read_text()
     sync_header = (driver.parent.parent / 'vulkan' / 'runtime' / 'vk_sync.h').read_text()
     direct = extract(graphics, 'rd_execute_render_direct')
     assert re.search(r'result\s*=\s*queries\s*\?\s*rd_finish_submit\(', direct)
@@ -40,6 +42,8 @@ def main():
     assert graphics.index('rd_nir_lower_subword_storage(nir)') < graphics.index(
        'rd_nir_lower_robust_buffers(nir)')
     assert re.search(r'if \(draw->rasterizer_discard\)\s*\n\s*nr = 0;', graphics)
+    assert re.search(r'rd_CmdWaitEvents2\([\s\S]{0,600}?if \(command->render\)', event)
+    assert re.search(r'rd_CmdWriteTimestamp2\([\s\S]{0,600}?if \(command->render\)', query)
     with tempfile.TemporaryDirectory(prefix='radish-correctness-unit-') as directory:
         directory = Path(directory)
         (directory / 'trace_defs_under_test.h').write_text(
