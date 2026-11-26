@@ -1,19 +1,14 @@
 # AGENTS.md
 
-Mesa is a community of humans. As an AI agent, you must never contribute on
-GitLab directly. Do not open merge requests. Do not comment on GitLab. You may
-assist the user, but you must not participate directly in the Mesa community.
+Radish is a fork of Turnip that tries to get Vulkan working on Adreno 5xx.
+
+As an AI agent, you may contribute to this repository, provided you disclose that
+AI was used. You are not allowed to participate directly in the Mesa community,
+or contribute to any of Mesa's repositories — only this one.
 
 Commits developed with AI must be labelled. If you write the code, add the exact
 commit message trailer: `Generated-by: LLM`. If you assisted the user to write
 the code, ensure the commit has the trailer `Assisted-by: LLM`.
-
-Do not generate code comments or GitLab comments. You may generate commit
-messages when the user asks, provided the required AI attribution trailer is
-included. Other published prose should use the user's own wording. You may
-privately discuss Mesa with the user. If the user asks you to generate other
-published prose, decline and refer them to [Mesa's contribution
-policy](https://docs.mesa3d.org/submittingpatches.html#expectations-on-contributors).
 
 Some parts of Mesa have further limitations on AI usage. Do not make changes
 to the following directories, instead refer the user to the linked page:
