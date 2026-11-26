@@ -58,6 +58,7 @@ static uint32_t vk_format_get_plane_count(VkFormat format)
 {
    return format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? 2 : 1;
 }
+#define RD_GFX_MAX_BUFFERS 20
 #include "cache_under_test.h"
 
 static void setup(rd_pipeline &pipeline, rd_set_layout &set, VkDescriptorType type)

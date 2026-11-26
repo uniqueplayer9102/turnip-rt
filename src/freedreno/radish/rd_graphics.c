@@ -92,7 +92,6 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
  * advertised.
  */
 #define RD_GFX_PUSH_DWORDS RD_MAX_PUSH_CONSTANTS_DWORDS
-#define RD_GFX_MAX_BUFFERS 16
 /* one vec4 after the buffer addresses: x = view index (multiview replay) */
 #define RD_GFX_VIEW_DWORD (RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS)
 #define RD_GFX_BUFFER_SIZE_DWORD (RD_GFX_VIEW_DWORD + 4)

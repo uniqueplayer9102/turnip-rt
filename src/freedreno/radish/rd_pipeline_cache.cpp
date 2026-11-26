@@ -125,7 +125,7 @@ static bool resource_metadata_valid(const rd_pipeline *saved,
        usage->texture_count > 16 || usage->sampler_count > 16 || usage->image_count > 16 ||
        saved->buffer_count + usage->image_count > 32 ||
        saved->sampling_mask || saved->sampling_buffer ||
-       (stage != VK_SHADER_STAGE_COMPUTE_BIT && saved->buffer_count > 16))
+       (stage != VK_SHADER_STAGE_COMPUTE_BIT && saved->buffer_count > RD_GFX_MAX_BUFFERS))
       return false;
    const uint64_t descriptors = count == 64 ? UINT64_MAX : (UINT64_C(1) << count) - 1;
    if ((saved->used_descriptors | usage->descriptors) & ~descriptors ||
@@ -338,7 +338,7 @@ rd_pipeline_cache_restore(rd_device *device, rd_pipeline *pipeline,
       uint64_t(native_size) + nir_size == uint64_t(in.end - in.current) &&
        variant_bounds(device, &saved, in.current, native_size, stage->stage);
    if (stage->stage != VK_SHADER_STAGE_COMPUTE_BIT)
-      valid = valid && !nir_size && saved.buffer_count <= 16;
+      valid = valid && !nir_size && saved.buffer_count <= RD_GFX_MAX_BUFFERS;
    const ir3_shader_variant *variant = nullptr;
    nir_shader *nir = nullptr;
    if (valid) {
