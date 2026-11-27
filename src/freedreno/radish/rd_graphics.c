@@ -44,6 +44,10 @@ DEBUG_GET_ONCE_BOOL_OPTION(async_depth_stencil, "RADISH_ASYNC_DEPTH_STENCIL", fa
 DEBUG_GET_ONCE_BOOL_OPTION(readonly_bo_tracking, "RADISH_READONLY_BO_TRACKING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(render_gpu_timing, "RADISH_RENDER_GPU_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(render_gpu_detail, "RADISH_RENDER_GPU_DETAIL", false)
+DEBUG_GET_ONCE_BOOL_OPTION(query_free_render, "RADISH_QUERY_FREE_RENDER", true)
+DEBUG_GET_ONCE_BOOL_OPTION(no_coverage_pass, "RADISH_NO_COVERAGE_PASS", false)
+DEBUG_GET_ONCE_BOOL_OPTION(render_query_debug, "RADISH_RENDER_QUERY_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(debug_queries, "RADISH_DEBUG_QUERIES", false)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_conversion_pass, "RADISH_GMEM_CONVERSION_PASS", false)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_stop, "RADISH_GMEM_STOP", -1)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_min_draws, "RADISH_GMEM_MIN_DRAWS", 4)
@@ -2616,7 +2620,7 @@ rd_stats_need_fragments(const struct rd_query_pool *pool)
 static bool
 rd_render_needs_query_accounting(struct rd_device *device, const struct rd_render *render)
 {
-   if (!debug_get_bool_option("RADISH_QUERY_FREE_RENDER", true) ||
+   if (!debug_get_option_query_free_render() ||
        !list_is_empty(&device->active_queries) || render->queries.size)
       return true;
    util_dynarray_foreach(&render->draws, struct rd_draw, draw)
@@ -3095,7 +3099,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          const struct rd_draw *d = util_dynarray_element(&render->draws, struct rd_draw, i);
          slots[i] = d->occlusion_pool || fragments > 0 ? (int)counted : -1;
          coverage[i] = fragments > 0 && !d->pipeline->gfx->fs.v->has_ssbo &&
-                       !debug_get_bool_option("RADISH_NO_COVERAGE_PASS", false);
+                       !debug_get_option_no_coverage_pass();
          /* two counter pairs: the draw itself, and a coverage pass */
          counted += slots[i] >= 0 ? 2 : 0;
       }
@@ -3113,7 +3117,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          return result;
       }
    }
-   if (debug_get_bool_option("RADISH_RENDER_QUERY_DEBUG", false))
+   if (debug_get_option_render_query_debug())
       fprintf(stderr, "RADISH_RENDER_QUERY path=%s draws=%u counters=%u allocations=%u\n",
               queries ? "accounting" : "query-free", ndraws, counted, queries ? 3 : 0);
    int64_t timer_start = 0;
@@ -3231,7 +3235,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
             values[(slots[i] * 2 + 1) * 2] - values[(slots[i] * 2) * 2] : 0;
          uint64_t fragments = coverage[i] ?
             values[((slots[i] + 1) * 2 + 1) * 2] - values[((slots[i] + 1) * 2) * 2] : samples;
-         if (debug_get_bool_option("RADISH_DEBUG_QUERIES", false))
+         if (debug_get_option_debug_queries())
             fprintf(stderr, "radish: draw %u vertices %u instances %u samples %" PRIu64
                     " fragments %" PRIu64 " raw %" PRIx64 " %" PRIx64 " %" PRIx64 " %" PRIx64 "\n",
                     i, resolved[i].vertex_count,

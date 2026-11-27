@@ -6,6 +6,8 @@
 #include "util/u_math.h"
 #include "util/u_debug.h"
 
+DEBUG_GET_ONCE_BOOL_OPTION(resource_diagnostics, "RADISH_RESOURCE_DIAGNOSTICS", false)
+
 struct rd_resource {
    struct fd_bo *bo;
    VkDeviceSize offset;
@@ -451,7 +453,7 @@ rd_emit_resource_texture_words(struct fd_ringbuffer *ring, uint32_t slot,
       (resource->type == A5XX_TEX_3D ? A5XX_TEX_CONST_3_MIN_LAYERSZ(MIN2(resource->min_layer_size, 0xf000u)) : 0));
    OUT_RELOC(ring, resource->bo, resource->offset,
       (uint64_t)A5XX_TEX_CONST_5_DEPTH(resource->depth) << 32, 0);
-   if (debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false)) {
+   if (debug_get_option_resource_diagnostics()) {
       uint64_t address = fd_bo_get_iova(resource->bo) + resource->offset;
       uint32_t words[6] = {
          resource->format_word | A5XX_TEX_CONST_0_MIPLVLS(resource->mip_levels),
@@ -567,7 +569,7 @@ rd_emit_resource_image_sb(struct fd_ringbuffer *ring, uint32_t slot,
                   A5XX_SSBO_1_0_WIDTH(width));
    OUT_RING(ring, A5XX_SSBO_1_1_HEIGHT(height) |
                   A5XX_SSBO_1_1_DEPTH(resource->depth));
-   if (debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false)) {
+   if (debug_get_option_resource_diagnostics()) {
       uint64_t address = fd_bo_get_iova(resource->bo) + resource->offset;
       fprintf(stderr, "RADISH_IMAGE_DIAG slot=%u buffer=%u bo=%llx bo_size=%u offset=%llu address=%llx constants=%08x,%08x address_words=%08x,%08x\n",
          slot, resource->buffer, (unsigned long long)fd_bo_get_iova(resource->bo), fd_bo_size(resource->bo),
@@ -647,7 +649,7 @@ rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
          memcpy(words, dispatch->descriptors[pipeline->sampler_descriptors[i]].sampler,
                 sizeof(words));
       rd_resource_packet(ring, i, SB4_CS_TEX, ST4_SHADER, 1, 4);
-      if (debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false))
+      if (debug_get_option_resource_diagnostics())
          fprintf(stderr, "radish: RADISH_SAMPLER_DIAG slot=%u words=%08x,%08x,%08x,%08x\n",
             i, words[0], words[1], words[2], words[3]);
       for (uint32_t j = 0; j < 4; j++)

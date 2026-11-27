@@ -4,6 +4,9 @@
 #include "vk_format.h"
 #include "util/u_debug.h"
 
+DEBUG_GET_ONCE_BOOL_OPTION(sw_texel_fetch, "RADISH_SW_TEXEL_FETCH", false)
+DEBUG_GET_ONCE_BOOL_OPTION(resource_diagnostics, "RADISH_RESOURCE_DIAGNOSTICS", false)
+
 VkResult
 rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
 {
@@ -13,7 +16,7 @@ rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
    struct rd_sampling_key key = {0};
    struct fd_bo *bos[16] = {0};
    uint64_t addresses[16] = {0};
-   bool force = debug_get_bool_option("RADISH_SW_TEXEL_FETCH", false);
+   bool force = debug_get_option_sw_texel_fetch();
    for (unsigned i = 0; i < source->resource_usage.texture_count; i++) {
       if (!(source->resource_usage.textures & (1u << i)))
          continue;
@@ -110,7 +113,7 @@ rd_prepare_sampling(struct rd_device *device, struct rd_dispatch *dispatch)
       return VK_ERROR_MEMORY_MAP_FAILED;
    }
    memcpy(map, addresses, sizeof(addresses));
-   if (debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false)) {
+   if (debug_get_option_resource_diagnostics()) {
       const struct ir3_shader_variant *v = pipeline->variant;
       fprintf(stderr, "RADISH_SAMPLING_DIAG mask=%x native=%u full=%d half=%d branch=%u constlen=%u private=%u buffers=%u textures=%u samplers=%u aliases=%u metadata=%llx size=%u shader=%llx size=%u\n",
          key.mask, v->instrlen, v->info.max_reg + 1, v->info.max_half_reg + 1,

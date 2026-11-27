@@ -46,6 +46,9 @@ DEBUG_GET_ONCE_NUM_OPTION(submit_diag_every, "RADISH_SUBMIT_DIAG_EVERY", 1)
 DEBUG_GET_ONCE_BOOL_OPTION(a506_rb_dp2_workaround, "RADISH_A506_RB_DP2_WORKAROUND", true)
 DEBUG_GET_ONCE_BOOL_OPTION(deferred_resource_diagnostics, "RADISH_RESOURCE_DIAGNOSTICS", false)
 DEBUG_GET_ONCE_BOOL_OPTION(async_queue_sync_debug, "RADISH_ASYNC_QUEUE_SYNC_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(gpu_image_copy_debug, "RADISH_GPU_IMAGE_COPY_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(gpu_buffer_transfer_debug, "RADISH_GPU_BUFFER_TRANSFER_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(gpu_buffer_transfer, "RADISH_GPU_BUFFER_TRANSFER", true)
 
 static const char *rd_drain_names[RD_DRAIN_COUNT] = {
    "cpu", "final", "capacity", "signal", "fallback", "error", "trace",
@@ -2118,7 +2121,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
    struct fd_submit *submit = NULL;
    struct fd_ringbuffer *ring = NULL;
    static unsigned diagnostic_dispatches;
-   const bool diagnostics = debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false) &&
+   const bool diagnostics = debug_get_option_deferred_resource_diagnostics() &&
       p_atomic_inc_return(&diagnostic_dispatches) <= 4096;
    const uint64_t first_submit = device->submit_count;
    if (diagnostics) {
@@ -2379,7 +2382,7 @@ rd_emit_gpu_copy(struct rd_device *device, struct fd_ringbuffer *ring,
          .range = buffers[binding].vk.size };
    }
    if ((transfer->src_image || transfer->dst_image) &&
-       debug_get_bool_option("RADISH_GPU_IMAGE_COPY_DEBUG", false))
+       debug_get_option_gpu_image_copy_debug())
       fprintf(stderr, "RADISH_GPU_IMAGE_COPY bytes=%" PRIu64 " rows=%u slices=%u groups=%u,%u,%u direction=%s\n",
               (uint64_t)transfer->row_bytes * transfer->rows * transfer->slices,
               transfer->rows, transfer->slices, dispatch.grid[0], dispatch.grid[1], dispatch.grid[2],
@@ -2477,7 +2480,7 @@ rd_execute_gpu_image_copy_batch(struct rd_device *device, const struct rd_comman
       }
       bytes += copy->row_bytes * copy->rows * copy->slices;
    }
-   if (debug_get_bool_option("RADISH_GPU_IMAGE_COPY_DEBUG", false))
+   if (debug_get_option_gpu_image_copy_debug())
       fprintf(stderr, "RADISH_GPU_IMAGE_COPY_BATCH copies=%u bytes=%" PRIu64 "\n", count, bytes);
    return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
                                      initial_ring_start, count, false, false);
@@ -2585,7 +2588,7 @@ rd_execute_transfer_batch(struct rd_device *device, const struct rd_command *com
       rd_flush(device, ring);
       bytes += transfer->size;
    }
-   if (debug_get_bool_option("RADISH_GPU_BUFFER_TRANSFER_DEBUG", false))
+   if (debug_get_option_gpu_buffer_transfer_debug())
       fprintf(stderr, "RADISH_BUFFER_TRANSFER_BATCH commands=%u bytes=%" PRIu64 "\n", count, bytes);
    return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
                                      initial_ring_start, count, false, false);
@@ -2597,7 +2600,7 @@ rd_transfer_compute_supported(struct rd_device *device, enum rd_command_type typ
 {
    if (type == RD_CMD_UPDATE || transfer->size < 16384 ||
        fd_device_version(device->fd) < FD_VERSION_SOFTPIN ||
-       !debug_get_bool_option("RADISH_GPU_BUFFER_TRANSFER", true))
+       !debug_get_option_gpu_buffer_transfer())
       return false;
    if (type == RD_CMD_COPY && transfer->src->memory->bo == transfer->dst->memory->bo) {
       VkDeviceSize src = transfer->src->offset + transfer->src_offset;
@@ -2663,7 +2666,7 @@ rd_execute_transfer(struct rd_device *device, enum rd_command_type type,
       return VK_ERROR_UNKNOWN;
    if (!transfer->size)
       return VK_SUCCESS;
-   bool debug = debug_get_bool_option("RADISH_GPU_BUFFER_TRANSFER_DEBUG", false);
+   bool debug = debug_get_option_gpu_buffer_transfer_debug();
    uint64_t first_submit = device->submit_count;
    if (!rd_transfer_gpu_supported(type, transfer)) {
       if (type != RD_CMD_COPY)

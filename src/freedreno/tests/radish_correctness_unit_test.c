@@ -122,6 +122,8 @@ static bool debug_get_bool_option(const char *name, bool fallback)
 {
    (void)name; return fallback;
 }
+static bool debug_get_option_resource_diagnostics(void) { return false; }
+static bool debug_get_option_query_free_render(void) { return true; }
 static void emit_timestamp(struct fd_ringbuffer *ring, struct fd_bo *bo, uint32_t offset)
 {
    (void)ring;
