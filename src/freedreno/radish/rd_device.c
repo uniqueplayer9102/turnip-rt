@@ -5,6 +5,14 @@
 #include <time.h>
 #include <pwd.h>
 
+static VkResult
+rd_device_get_timestamp(struct vk_device *vk_device, uint64_t *timestamp)
+{
+   struct rd_device *device = container_of(vk_device, struct rd_device, vk);
+   return fd_pipe_get_param(device->pipe, FD_TIMESTAMP, timestamp) == 0 ?
+      VK_SUCCESS : VK_ERROR_UNKNOWN;
+}
+
 void
 rd_wake_device_waiters(struct vk_device *device)
 {
@@ -96,6 +104,7 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       vk_free2(&physical->vk.instance->alloc, allocator, device);
       return result;
    }
+   device->vk.get_timestamp = rd_device_get_timestamp;
    bool queue_initialized = false, meta_initialized = false;
    const char *marker = debug_get_option("RADISH_GMEM_DISABLE_FILE", NULL);
    if (marker) {

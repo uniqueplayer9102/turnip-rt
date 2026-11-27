@@ -51,6 +51,7 @@ def main():
     assert '.GOOGLE_display_timing = true,' in instance
     assert '.KHR_calibrated_timestamps = true,' in instance
     assert 'vk_device_dispatch_table_from_entrypoints(&dispatch, &vk_common_device_entrypoints, false)' in device_src
+    assert 'device->vk.get_timestamp = rd_device_get_timestamp;' in device_src
     assert 'vk_physical_device_dispatch_table_from_entrypoints(&dispatch,' in instance
     assert '&vk_common_physical_device_entrypoints, false)' in instance
     assert '.KHR_xcb_surface = true,' in instance
