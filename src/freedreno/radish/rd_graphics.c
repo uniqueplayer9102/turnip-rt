@@ -4743,6 +4743,22 @@ rd_CmdResolveImage2(VkCommandBuffer handle, const VkResolveImageInfo2 *info)
    }
 }
 
+static bool
+rd_clear_ds_range_valid(const struct vk_image *image, const VkImageSubresourceRange *range)
+{
+   const VkImageAspectFlags ds = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+   if (!range->aspectMask || (range->aspectMask & ~ds) ||
+       (range->aspectMask & ~image->aspects) ||
+       !(vk_image_usage(image, range->aspectMask) & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+       range->baseMipLevel >= image->mip_levels || range->baseArrayLayer >= image->array_layers)
+      return false;
+
+   uint32_t levels = vk_image_subresource_level_count(image, range);
+   uint32_t layers = vk_image_subresource_layer_count(image, range);
+   return levels && levels <= image->mip_levels - range->baseMipLevel &&
+          layers && layers <= image->array_layers - range->baseArrayLayer;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 rd_CmdClearDepthStencilImage(VkCommandBuffer handle, VkImage image_handle, VkImageLayout layout,
                              const VkClearDepthStencilValue *value, uint32_t count,
@@ -4750,7 +4766,16 @@ rd_CmdClearDepthStencilImage(VkCommandBuffer handle, VkImage image_handle, VkIma
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_image, image, image_handle);
+   if (command->render || command->render_continue || !image || !value || (count && !ranges) ||
+       (layout != VK_IMAGE_LAYOUT_GENERAL && layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)) {
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
    for (uint32_t i = 0; i < count; i++) {
+      if (!rd_clear_ds_range_valid(&image->vk, &ranges[i])) {
+         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+         return;
+      }
       struct rd_command *recorded = rd_command_append(command, RD_CMD_BLIT);
       if (!recorded)
          return;

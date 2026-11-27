@@ -161,9 +161,16 @@ struct vk_device_extension_table { bool KHR_swapchain, KHR_incremental_present; 
 #include "device_extensions_under_test.h"
 
 struct rd_image_level { VkDeviceSize array_pitch; };
+struct vk_image {
+   uint32_t array_layers, mip_levels;
+   VkImageUsageFlags2KHR usage, stencil_usage;
+   VkImageAspectFlags aspects;
+   VkFormat format;
+   VkImageType image_type;
+   VkSampleCountFlagBits samples;
+};
 struct rd_image {
-   struct { uint32_t array_layers; VkImageUsageFlags usage; VkFormat format;
-            VkImageType image_type; VkSampleCountFlagBits samples; } vk;
+   struct vk_image vk;
    struct { uint32_t tile_mode; } native_layout;
    struct rd_image_level levels[1];
    struct rd_memory *memory;
@@ -345,12 +352,17 @@ static void test_dispatch_preflight(void)
    assert(!rd_window_dispatch_supported(&device, &record));
 }
 
+#include "clear_ds_types_under_test.h"
 #include "draw_descriptor_cache_types_under_test.h"
+struct rd_command { enum rd_command_type type; struct rd_blit blit; };
 struct rd_command_buffer {
    struct { VkCommandBufferLevel level; VkResult error; } vk;
    uint32_t push[RD_MAX_PUSH_CONSTANTS_SIZE / 4];
    uint32_t gfx_push[RD_MAX_PUSH_CONSTANTS_SIZE / 4];
    struct rd_render *render;
+   bool render_continue;
+   struct rd_command recorded[2];
+   uint32_t recorded_count;
    const struct rd_pipeline *gfx_pipeline;
    uint64_t gfx_descriptor_bind_generation;
    struct rd_draw_descriptor_cache draw_descriptor_cache;
@@ -364,9 +376,83 @@ struct vk_pipeline_layout {
    uint32_t push_range_count;
    VkPushConstantRange push_ranges[3];
 };
+static struct rd_command *rd_command_append(struct rd_command_buffer *command,
+                                            enum rd_command_type type)
+{
+   assert(command->recorded_count < 2);
+   struct rd_command *recorded = &command->recorded[command->recorded_count++];
+   *recorded = (struct rd_command) { .type = type };
+   return recorded;
+}
+
 #define rd_set_error(command_vk, result) ((command_vk)->error = (result))
 #include "push_constants_under_test.h"
+#include "clear_ds_under_test.h"
 #undef rd_set_error
+
+static void test_clear_ds_recording(void)
+{
+   const VkImageAspectFlags depth = VK_IMAGE_ASPECT_DEPTH_BIT;
+   const VkImageAspectFlags stencil = VK_IMAGE_ASPECT_STENCIL_BIT;
+   struct rd_image image = { .vk = {
+      .aspects = depth | stencil, .mip_levels = 4, .array_layers = 8,
+      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT, .stencil_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   } };
+   struct rd_command_buffer command = {0};
+   VkCommandBuffer cmd = RD_TEST_HANDLE(VkCommandBuffer, &command);
+   VkImage img = RD_TEST_HANDLE(VkImage, &image);
+   VkClearDepthStencilValue value = { .depth = 0.5f, .stencil = 42 };
+   const VkImageSubresourceRange valid[] = {
+      { depth | stencil, 1, VK_REMAINING_MIP_LEVELS, 2, VK_REMAINING_ARRAY_LAYERS },
+      { stencil, 3, 1, 7, 1 },
+   };
+   rd_CmdClearDepthStencilImage(cmd, img, VK_IMAGE_LAYOUT_GENERAL, &value, 2, valid);
+   assert(command.vk.error == VK_SUCCESS && command.recorded_count == 2);
+   assert(command.recorded[0].type == RD_CMD_BLIT);
+   const struct rd_blit *blit = &command.recorded[0].blit;
+   assert(blit->kind == RD_BLIT_CLEAR_DS && blit->dst == &image);
+   assert(blit->dst_level == 1 && blit->levels == 3 && blit->dst_layer == 2 && blit->layers == 6);
+   assert(blit->aspects == (depth | stencil) && blit->clear.depth == 0.5f && blit->clear.stencil == 42);
+   blit = &command.recorded[1].blit;
+   assert(blit->dst_level == 3 && blit->levels == 1 && blit->dst_layer == 7 && blit->layers == 1);
+
+   const VkImageSubresourceRange invalid[] = {
+      { depth, 4, VK_REMAINING_MIP_LEVELS, 0, 1 },
+      { depth, 0, 1, UINT32_MAX, VK_REMAINING_ARRAY_LAYERS },
+      { depth, 1, UINT32_MAX - 1, 0, 1 },
+      { depth, 0, 1, 7, 2 },
+      { depth, 0, 0, 0, 1 },
+      { stencil, 0, 1, 0, 0 },
+      { 0, 0, 1, 0, 1 },
+      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+   };
+   command.recorded_count = 0;
+   for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+      command.vk.error = VK_SUCCESS;
+      rd_CmdClearDepthStencilImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &invalid[i]);
+      assert(command.vk.error == VK_ERROR_UNKNOWN && !command.recorded_count);
+   }
+
+   image.vk.aspects = depth;
+   assert(!rd_clear_ds_range_valid(&image.vk, &valid[1]));
+   image.vk.aspects = depth | stencil;
+   image.vk.usage = 0;
+   assert(!rd_clear_ds_range_valid(&image.vk, &valid[0]));
+
+   /* A stencil-only clear uses separate stencil usage, not depth usage. */
+   command.vk.error = VK_SUCCESS;
+   rd_CmdClearDepthStencilImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &valid[1]);
+   assert(command.vk.error == VK_SUCCESS && command.recorded_count == 1);
+   assert(command.recorded[0].blit.aspects == stencil);
+
+   command.recorded_count = 0;
+   rd_CmdClearDepthStencilImage(cmd, img, VK_IMAGE_LAYOUT_UNDEFINED, &value, 1, &valid[1]);
+   assert(command.vk.error == VK_ERROR_UNKNOWN && !command.recorded_count);
+   command.vk.error = VK_SUCCESS;
+   command.render_continue = true;
+   rd_CmdClearDepthStencilImage(cmd, img, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &valid[1]);
+   assert(command.vk.error == VK_ERROR_UNKNOWN && !command.recorded_count);
+}
 
 static void test_push_constants(void)
 {
@@ -697,6 +783,40 @@ static void test_submit_diag_commands(void)
    assert(diag.cmd_wall_ns == 20 && diag.cmd_host_ns == 20);
    rd_submit_diag_end_commands(&diag, 40, before);
    assert(diag.cmd_wall_ns == 40 && diag.cmd_host_ns == 0);
+}
+
+static void test_descriptor_layout_bindings(void)
+{
+   struct rd_sampler sampler = {0};
+   const VkSampler samplers[] = { RD_TEST_HANDLE(VkSampler, &sampler),
+                                  RD_TEST_HANDLE(VkSampler, &sampler) };
+   VkDescriptorSetLayoutBinding entries[] = {
+      { .binding = 1u << 20, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 2, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .pImmutableSamplers = samplers },
+      { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER },
+      { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+   };
+   VkDescriptorSetLayoutCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 3, .pBindings = entries,
+   };
+   uint32_t bindings, descriptors;
+   assert(rd_descriptor_layout_supported(&info, &bindings, &descriptors));
+   assert(bindings == 2 && descriptors == 3);
+
+   /* Duplicate active bindings must not reach immutable sampler copying. */
+   entries[2].binding = entries[0].binding;
+   assert(!rd_descriptor_layout_supported(&info, &bindings, &descriptors));
+   entries[2].pImmutableSamplers = samplers;
+   assert(!rd_descriptor_layout_supported(&info, &bindings, &descriptors));
+
+   info.pBindings = NULL;
+   assert(!rd_descriptor_layout_supported(&info, &bindings, &descriptors));
+   info.bindingCount = 0;
+   assert(rd_descriptor_layout_supported(&info, &bindings, &descriptors));
+   assert(bindings == 0 && descriptors == 0);
 }
 
 static void test_descriptor_span(void)
@@ -1091,7 +1211,8 @@ int main(void)
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
    test_ring_backings(); test_copy_side();
    test_render_query_before_work(); test_drain_index(); test_submit_diag_commands();
-   test_descriptor_span(); test_descriptor_template_data();
+   test_descriptor_layout_bindings(); test_descriptor_span(); test_descriptor_template_data();
+   test_clear_ds_recording();
    test_query_range(); test_vertex_input(); test_push_constants();
    test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();
    test_dispatch_preflight(); test_draw_descriptor_cache_enabled();
@@ -1103,6 +1224,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans and template data, draw descriptor cache and set generations, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, push constants, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor layouts, spans and template data, draw descriptor cache and set generations, texture/image pitch, device extensions, blit capabilities, depth/stencil clear ranges, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, push constants, multiview, trace wrap, creation errors");
    return 0;
 }

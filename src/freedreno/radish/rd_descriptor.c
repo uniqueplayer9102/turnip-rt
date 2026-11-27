@@ -30,8 +30,9 @@ rd_descriptor_layout_supported(const VkDescriptorSetLayoutCreateInfo *info,
 {
    *binding_count = 0;
    *descriptor_count = 0;
-   if (info->flags)
+   if (info->flags || (info->bindingCount && !info->pBindings))
       return false;
+   uint32_t active_bindings[RD_MAX_BINDINGS];
    for (uint32_t i = 0; i < info->bindingCount; i++) {
       const VkDescriptorSetLayoutBinding *binding = &info->pBindings[i];
       if (!binding->descriptorCount)
@@ -39,6 +40,11 @@ rd_descriptor_layout_supported(const VkDescriptorSetLayoutCreateInfo *info,
       if (!rd_descriptor_type_supported(binding->descriptorType) ||
           binding->descriptorCount > RD_MAX_BINDINGS - *descriptor_count)
          return false;
+      /* Immutable sampler copies look up the destination by binding number. */
+      for (uint32_t j = 0; j < *binding_count; j++) {
+         if (active_bindings[j] == binding->binding)
+            return false;
+      }
       if (binding->pImmutableSamplers &&
           (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
            binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
@@ -55,7 +61,7 @@ rd_descriptor_layout_supported(const VkDescriptorSetLayoutCreateInfo *info,
          }
       }
       *descriptor_count += binding->descriptorCount;
-      (*binding_count)++;
+      active_bindings[(*binding_count)++] = binding->binding;
    }
    return true;
 }

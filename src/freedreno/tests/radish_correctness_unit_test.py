@@ -9,7 +9,7 @@ import tempfile
 def extract(source, name, cpp=False):
     prefix = r'^static bool ' if cpp else (
         r'^(?:VKAPI_ATTR void VKAPI_CALL|(?:static (?:inline )?)?'
-        r'(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|nir_mem_access_size_align|'
+        r'(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|VkImageUsageFlags2KHR|nir_mem_access_size_align|'
         r'const struct (?:rd_binding|vk_sampler_state) \*))\n')
     match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
@@ -100,6 +100,16 @@ def main():
             extract(instance, 'rd_device_extensions_for_mode'))
         (directory / 'image_pitch_under_test.h').write_text(
             extract((driver / 'rd_image.c').read_text(), 'rd_image_sampled_pitch_supported'))
+        image_h = (vk_runtime / 'vk_image.h').read_text()
+        layers = image_h.index('#define vk_image_subresource_layer_count(')
+        (directory / 'clear_ds_under_test.h').write_text(
+            image_h[layers:image_h.index('\n\n', layers)] + '\n' +
+            extract(image_h, 'vk_image_subresource_level_count') +
+            extract((vk_runtime / 'vk_image.c').read_text(), 'vk_image_usage') +
+            extract(graphics, 'rd_clear_ds_range_valid') +
+            extract(graphics, 'rd_CmdClearDepthStencilImage'))
+        (directory / 'clear_ds_types_under_test.h').write_text(
+            private[private.index('enum rd_command_type {'):private.index('struct rd_transfer {')])
         (directory / 'sync_waits_under_test.h').write_text(
             extract(sync_header, 'vk_sync_waits_have_timeline'))
         (directory / 'sync_policy_under_test.h').write_text(''.join(
@@ -120,6 +130,7 @@ def main():
         (directory / 'descriptor_updates_under_test.h').write_text(
             extract((vk_runtime / 'vk_buffer.h').read_text(), 'vk_buffer_range') + ''.join(
                 extract(descriptor, name) for name in (
+                    'rd_descriptor_type_supported', 'rd_descriptor_layout_supported',
                     'rd_find_binding', 'rd_descriptor_span_valid', 'rd_immutable_sampler',
                     'rd_descriptor_set_init_version', 'rd_validate_descriptor_conversion',
                     'rd_write_descriptor', 'rd_UpdateDescriptorSets',
