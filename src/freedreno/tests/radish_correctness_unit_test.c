@@ -405,7 +405,7 @@ struct vk_pipeline_layout {
    uint32_t set_count;
    const struct vk_descriptor_set_layout *set_layouts[RD_MAX_SETS];
    uint32_t push_range_count;
-   VkPushConstantRange push_ranges[3];
+   VkPushConstantRange push_ranges[4];
 };
 
 typedef struct { unsigned sampler_index; } nir_tex_instr;
@@ -494,12 +494,13 @@ static void test_push_constants(void)
 {
    const VkShaderStageFlags graphics = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
    struct vk_pipeline_layout layout = {
-      .push_range_count = 3,
+      .push_range_count = 4,
       .push_ranges = {
          { .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 4, .size = 8 },
          { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 12 },
          { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
            .offset = RD_MAX_PUSH_CONSTANTS_SIZE - 4, .size = 4 },
+         { .stageFlags = VK_SHADER_STAGE_TASK_BIT_EXT, .offset = 0, .size = 4 },
       },
    };
    struct rd_command_buffer command = {0};
@@ -532,6 +533,12 @@ static void test_push_constants(void)
    rd_CmdPushConstants(cmd, pipeline_layout, graphics, 5, 4, values);
    assert(command.vk.error == VK_ERROR_FEATURE_NOT_PRESENT);
    assert(command.gfx_push[1] == 5 && command.gfx_push[2] == 17);
+
+   /* Task-only stages have no radish pipeline, so the request must not succeed silently. */
+   command.vk.error = VK_SUCCESS;
+   rd_CmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_TASK_BIT_EXT, 0, 4, values);
+   assert(command.vk.error == VK_ERROR_FEATURE_NOT_PRESENT);
+   assert(!command.push[0] && !command.gfx_push[0]);
 }
 
 static bool draw_descriptor_cache_option = true;

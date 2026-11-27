@@ -328,7 +328,10 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
+   /* Only compute and graphics stages have radish pipelines that can read
+    * push constants; reject stage sets that would otherwise be dropped. */
    if (!values || !size || ((offset | size) & 3) ||
+       !(stages & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_ALL_GRAPHICS)) ||
        offset >= RD_MAX_PUSH_CONSTANTS_SIZE || size > RD_MAX_PUSH_CONSTANTS_SIZE - offset ||
        !rd_push_constants_covered(pipeline_layout, stages, offset, size)) {
       if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
