@@ -79,6 +79,8 @@ VkResult rd_execute_image_transfer(struct rd_device *device,
 bool rd_image_copy_gpu_supported(struct rd_device *device,
                                   const struct rd_image_transfer *transfer,
                                   bool small_copies);
+bool rd_image_copy_side(const struct rd_image_transfer *transfer, bool source,
+                        struct rd_memory **memory, VkDeviceSize *offset, VkDeviceSize *size);
 struct fd_bo;
 void rd_image_copy_bos(const struct rd_image_transfer *transfer, struct fd_bo *bos[2]);
 bool rd_image_barrier_valid(const VkImageMemoryBarrier2 *barrier);

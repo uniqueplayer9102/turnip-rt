@@ -31,6 +31,7 @@ def main():
     descriptor = (driver / 'rd_descriptor.c').read_text()
     image_src = (driver / 'rd_image.c').read_text()
     device_src = (driver / 'rd_device.c').read_text()
+    private = (driver / 'rd_private.h').read_text()
     event = (driver / 'rd_event.c').read_text()
     query = (driver / 'rd_query.c').read_text()
     sync_header = (driver.parent.parent / 'vulkan' / 'runtime' / 'vk_sync.h').read_text()
@@ -53,9 +54,14 @@ def main():
     assert 'rd_query_range(pool, query, 1)' in query[query.index('rd_CmdEndQuery('):][:400]
     assert 'rd_vertex_input_valid(info->pVertexInputState)' in graphics
     assert descriptor.count('rd_descriptor_span_valid(') >= 4
-    assert 'RADISH_SUBMIT_DIAG' in queue
+    diag_report = extract(queue, 'rd_submit_diag_report')
+    assert 'RADISH_SUBMIT_DIAG id=' in diag_report and 'seq=' in diag_report
     assert 'RADISH_SUBMIT_DIAG_EVERY' in queue
-    assert 'emit_ns' in queue and 'kernel_ns' in queue and 'wait_ns' in queue
+    for field in ('seq_before', 'cmd_wall_ns', 'cmd_host_ns', 'submit_ready_ns',
+                  'wait_export_ns', 'completion_wait_ns', 'oldest_wait_ns',
+                  'wait_export_result', 'out_fence_export_failures'):
+        assert field + '=' in diag_report, field
+    assert 'vk_id=' in queue
     assert 'RADISH_PENDING_BLOCKING_WAIT' in device_src
     assert '!!transfer->src_buffer == !!transfer->dst_buffer' in image_src
     assert 'assert(!!transfer->src_buffer != !!transfer->src_image)' in image_src
@@ -93,6 +99,7 @@ def main():
             extract(sync_header, 'vk_sync_waits_have_timeline'))
         (directory / 'sync_policy_under_test.h').write_text(''.join(
             extract(queue, name) for name in ('rd_compute_can_defer', 'rd_publish_signal_fences',
+                                              'rd_compute_tail_batch',
                                               'rd_render_exports_fence',
                                               'rd_render_query_before_work')))
         (directory / 'vertex_input_under_test.h').write_text(
@@ -101,11 +108,14 @@ def main():
             extract(query, 'rd_query_range'))
         (directory / 'descriptor_span_under_test.h').write_text(
             extract(descriptor, 'rd_descriptor_span_valid'))
-        (directory / 'drain_index_under_test.h').write_text(
-            extract(queue, 'rd_drain_index'))
+        diag_types = private[private.index('enum rd_drain_reason {'):private.index('\nstruct rd_device {')]
+        drain_names = queue[queue.index('static const char *rd_drain_names'):queue.index('\nstatic unsigned\nrd_drain_index')]
+        (directory / 'submit_diag_under_test.h').write_text(diag_types + drain_names + '\n' + ''.join(
+            extract(queue, name) for name in ('rd_drain_index', 'rd_submit_diag_accounted_ns',
+                                               'rd_submit_diag_end_commands')))
         (directory / 'copy_side_under_test.h').write_text(''.join(
             extract(image_src, name) for name in ('rd_image_transfer_memory',
-                                                  'rd_image_copy_side')))
+                                                  'rd_image_copy_side', 'rd_image_copy_bos')))
         (directory / 'ring_backings_under_test.h').write_text(
             extract(queue, 'rd_ring_backings'))
         includes = ['-I', str(directory)]

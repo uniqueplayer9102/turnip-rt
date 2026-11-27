@@ -1837,7 +1837,7 @@ rd_image_transfer_bounds(VkDeviceSize offset, VkDeviceSize row, VkDeviceSize sli
    return transfer->slices == 1 || slice <= (remaining - rows) / (transfer->slices - 1);
 }
 
-static bool
+bool
 rd_image_copy_side(const struct rd_image_transfer *transfer, bool source,
                    struct rd_memory **memory, VkDeviceSize *offset, VkDeviceSize *size)
 {

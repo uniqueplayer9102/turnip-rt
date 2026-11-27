@@ -187,7 +187,7 @@ struct rd_set_layout {
    uint32_t descriptor_count, binding_count;
    struct rd_binding bindings[8];
 };
-struct rd_memory { struct { VkDeviceSize size; } vk; };
+struct rd_memory { struct { VkDeviceSize size; } vk; struct fd_bo *bo; };
 struct rd_buffer { struct { VkDeviceSize size; } vk; struct rd_memory *memory; VkDeviceSize offset; };
 struct rd_image_transfer {
    struct rd_image *src_image, *dst_image;
@@ -199,29 +199,34 @@ struct rd_image_transfer {
 
 static void test_copy_side(void)
 {
-   struct rd_memory memory = { .vk.size = 4096 };
+   struct fd_bo buffer_bo = {0}, image_bo = {0};
+   struct rd_memory buffer_mem = { .vk.size = 4096, .bo = &buffer_bo };
+   struct rd_memory image_mem = { .vk.size = 8192, .bo = &image_bo };
    struct rd_image image = {
       .vk.format = VK_FORMAT_R8_UNORM, .vk.image_type = VK_IMAGE_TYPE_2D,
-      .vk.samples = VK_SAMPLE_COUNT_1_BIT, .memory = &memory, .size = 4096,
+      .vk.samples = VK_SAMPLE_COUNT_1_BIT, .memory = &image_mem,
+      .memory_offset = 512, .size = 4096,
    };
-   struct rd_buffer buffer = { .vk.size = 4096, .memory = &memory };
+   struct rd_buffer buffer = { .vk.size = 2048, .memory = &buffer_mem, .offset = 128 };
    struct rd_image_transfer transfer = { .src_buffer = &buffer, .dst_image = &image };
    struct rd_memory *mem = NULL;
    VkDeviceSize offset = 0, size = 0;
+   struct fd_bo *bos[2];
    assert(rd_image_copy_side(&transfer, true, &mem, &offset, &size));
-   assert(mem == &memory);
+   assert(mem == &buffer_mem && offset == 128 && size == 2048);
    assert(rd_image_copy_side(&transfer, false, &mem, &offset, &size));
-   transfer.src_image = &image;
-   transfer.src_buffer = NULL;
+   assert(mem == &image_mem && offset == 512 && size == 4096);
+   rd_image_copy_bos(&transfer, bos);
+   assert(bos[0] == &buffer_bo && bos[1] == &image_bo);
+
+   transfer = (struct rd_image_transfer){ .src_image = &image, .dst_buffer = &buffer };
    assert(rd_image_copy_side(&transfer, true, &mem, &offset, &size));
-   transfer.dst_buffer = &buffer;
-   transfer.dst_image = NULL;
+   assert(mem == &image_mem && offset == 512 && size == 4096);
    assert(rd_image_copy_side(&transfer, false, &mem, &offset, &size));
-   transfer.src_buffer = &buffer;
-   transfer.src_image = NULL;
-   assert(rd_image_copy_side(&transfer, true, &mem, &offset, &size));
-   transfer.src_buffer = NULL;
-   transfer.src_image = &image;
+   assert(mem == &buffer_mem && offset == 128 && size == 2048);
+   rd_image_copy_bos(&transfer, bos);
+   assert(bos[0] == &image_bo && bos[1] == &buffer_bo);
+
    image.native_layout.tile_mode = 1;
    assert(!rd_image_copy_side(&transfer, true, &mem, &offset, &size));
 }
@@ -263,18 +268,7 @@ static void test_ring_backings(void)
 
 #include "descriptor_span_under_test.h"
 
-enum rd_drain_reason {
-   RD_DRAIN_CPU, RD_DRAIN_FINAL, RD_DRAIN_CAPACITY, RD_DRAIN_SIGNAL,
-   RD_DRAIN_FALLBACK, RD_DRAIN_ERROR, RD_DRAIN_TRACE, RD_DRAIN_CAPACITY_RESERVE,
-   RD_DRAIN_REAP_ERROR, RD_DRAIN_UNSUPPORTED, RD_DRAIN_QUEUE_IDLE,
-   RD_DRAIN_SIGNAL_FALLBACK, RD_DRAIN_OTHER, RD_DRAIN_COUNT,
-};
-static const char *rd_drain_names[RD_DRAIN_COUNT] = {
-   "cpu", "final", "capacity", "signal", "fallback", "error", "trace",
-   "capacity-reserve", "reap-error", "unsupported", "queue-idle",
-   "signal-fallback", "other",
-};
-#include "drain_index_under_test.h"
+#include "submit_diag_under_test.h"
 
 static void test_render_query_before_work(void)
 {
@@ -297,6 +291,25 @@ static void test_drain_index(void)
    assert(rd_drain_index("capacity") == RD_DRAIN_CAPACITY);
    assert(rd_drain_index("signal-fallback") == RD_DRAIN_SIGNAL_FALLBACK);
    assert(rd_drain_index("unknown") == RD_DRAIN_OTHER);
+}
+
+static void test_submit_diag_commands(void)
+{
+   struct rd_submit_diag diag = { .completion_wait_ns = 90, .wait_export_ns = 30 };
+   uint64_t before = rd_submit_diag_accounted_ns(&diag);
+   assert(before == 90);
+
+   diag.submit_ready_ns += 15;
+   diag.completion_wait_ns += 25;
+   diag.drain_ns[RD_DRAIN_CPU] += 10; /* Already in completion_wait_ns. */
+   diag.oldest_wait_ns += 5;
+   rd_submit_diag_end_commands(&diag, 100, before);
+   assert(diag.cmd_wall_ns == 100 && diag.cmd_host_ns == 55);
+
+   rd_submit_diag_end_commands(&diag, 20, rd_submit_diag_accounted_ns(&diag));
+   assert(diag.cmd_wall_ns == 20 && diag.cmd_host_ns == 20);
+   rd_submit_diag_end_commands(&diag, 40, before);
+   assert(diag.cmd_wall_ns == 40 && diag.cmd_host_ns == 0);
 }
 
 static void test_descriptor_span(void)
@@ -400,6 +413,19 @@ static void test_sync_policy(void)
    assert(!rd_publish_signal_fences(true, false, true, true, 1));
    assert(!rd_publish_signal_fences(true, false, false, false, 1));
    assert(!rd_publish_signal_fences(true, false, false, true, 0));
+}
+
+static void test_compute_tail_batch(void)
+{
+   const uint32_t dispatch_grid[3] = {9, 7, 5};
+   const uint32_t base[3] = {8, 4, 4};
+   const uint32_t grid[3] = {1, 3, 1};
+   assert(rd_compute_tail_batch(true, base, grid, dispatch_grid));
+   assert(!rd_compute_tail_batch(false, base, grid, dispatch_grid));
+   assert(!rd_compute_tail_batch(true, (uint32_t[]){4, 4, 4}, grid, dispatch_grid));
+   assert(!rd_compute_tail_batch(true, (uint32_t[]){8, 0, 4}, grid, dispatch_grid));
+   assert(!rd_compute_tail_batch(true, (uint32_t[]){8, 4, 0}, grid, dispatch_grid));
+   assert(rd_compute_tail_batch(true, (uint32_t[]){0, 0, 0}, dispatch_grid, dispatch_grid));
 }
 
 static void test_sync_waits(void)
@@ -616,10 +642,10 @@ int main(void)
 {
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
    test_ring_backings(); test_copy_side();
-   test_render_query_before_work(); test_drain_index();
+   test_render_query_before_work(); test_drain_index(); test_submit_diag_commands();
    test_descriptor_span();
    test_query_range(); test_vertex_input();
-   test_fence_export(); test_sync_policy(); test_sync_waits();
+   test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -627,6 +653,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, empty-render queries, waits, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }

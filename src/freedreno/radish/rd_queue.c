@@ -35,10 +35,12 @@ DEBUG_GET_ONCE_NUM_OPTION(tiled_batch_chunks, "RADISH_TILED_BATCH_CHUNKS", 1)
 DEBUG_GET_ONCE_NUM_OPTION(tiled_groups_x, "RADISH_TILED_GROUPS_X", 1)
 DEBUG_GET_ONCE_BOOL_OPTION(window_wait_oldest, "RADISH_WINDOW_WAIT_OLDEST", true)
 DEBUG_GET_ONCE_BOOL_OPTION(async_render_fence, "RADISH_ASYNC_RENDER_FENCE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(compute_tail_fence, "RADISH_COMPUTE_TAIL_FENCE", false)
 DEBUG_GET_ONCE_BOOL_OPTION(submit_timing, "RADISH_SUBMIT_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(wait_timing, "RADISH_WAIT_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(fence_debug, "RADISH_FENCE_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(submit_diag, "RADISH_SUBMIT_DIAG", false)
+DEBUG_GET_ONCE_NUM_OPTION(submit_diag_every, "RADISH_SUBMIT_DIAG_EVERY", 1)
 DEBUG_GET_ONCE_BOOL_OPTION(a506_rb_dp2_workaround, "RADISH_A506_RB_DP2_WORKAROUND", true)
 DEBUG_GET_ONCE_BOOL_OPTION(deferred_resource_diagnostics, "RADISH_RESOURCE_DIAGNOSTICS", false)
 DEBUG_GET_ONCE_BOOL_OPTION(async_queue_sync_debug, "RADISH_ASYNC_QUEUE_SYNC_DEBUG", false)
@@ -56,6 +58,49 @@ rd_drain_index(const char *reason)
       if (!strcmp(reason, rd_drain_names[i]))
          return i;
    return RD_DRAIN_OTHER;
+}
+
+static uint64_t
+rd_submit_diag_accounted_ns(const struct rd_submit_diag *diag)
+{
+   return diag->submit_ready_ns + diag->completion_wait_ns + diag->oldest_wait_ns;
+}
+
+static void
+rd_submit_diag_end_commands(struct rd_submit_diag *diag, uint64_t wall_ns,
+                            uint64_t accounted_before)
+{
+   uint64_t accounted = rd_submit_diag_accounted_ns(diag) - accounted_before;
+   diag->cmd_wall_ns = wall_ns;
+   diag->cmd_host_ns = wall_ns - MIN2(wall_ns, accounted);
+}
+
+static void
+rd_submit_diag_report(struct rd_device *device, const struct vk_queue_submit *submit,
+                      bool async, VkResult result)
+{
+   struct rd_submit_diag *diag = &device->diag;
+   int64_t every = debug_get_option_submit_diag_every();
+   if (every > 0 && diag->id % (uint64_t)every == 0) {
+      fprintf(stderr, "RADISH_SUBMIT_DIAG id=%" PRIu64 " seq=%" PRIu64 " async=%u"
+              " waits=%u signals=%u marker=%u imported=%u cpu_signal=%u"
+              " seq_before=%" PRIu64 " cmd_wall_ns=%" PRIu64 " cmd_host_ns=%" PRIu64
+              " submit_ready_ns=%" PRIu64 " wait_export_ns=%" PRIu64
+              " completion_wait_ns=%" PRIu64 " oldest_waits=%u oldest_wait_ns=%" PRIu64
+              " wait_export_result=%d out_fence_export_failures=%u result=%d",
+              diag->id, device->submit_count, async, submit->wait_count,
+              submit->signal_count, diag->markers, diag->fence_imported, diag->cpu_signalled,
+              diag->seq_before, diag->cmd_wall_ns, diag->cmd_host_ns,
+              diag->submit_ready_ns, diag->wait_export_ns, diag->completion_wait_ns,
+              diag->oldest_waits, diag->oldest_wait_ns, diag->wait_export_result,
+              diag->out_fence_export_failures, result);
+      for (unsigned i = 0; i < RD_DRAIN_COUNT; i++)
+         if (diag->drain_count[i])
+            fprintf(stderr, " %s=%u/%" PRIu64 "ns", rd_drain_names[i],
+                    diag->drain_count[i], diag->drain_ns[i]);
+      fprintf(stderr, "\n");
+   }
+   diag->id = 0;
 }
 
 struct rd_submit_profile {
@@ -512,12 +557,22 @@ static struct fd_fence *
 rd_flush_submit(struct rd_device *device, struct fd_submit *submit,
                 bool use_fence_fd)
 {
+   bool diag = device->diag.id != 0;
+   int64_t start = diag ? os_time_get_nano() : 0;
    int in_fence_fd = device->submit_in_fence_fd;
    device->submit_in_fence_fd = -1;
-   struct fd_fence *fence = fd_submit_flush(submit, in_fence_fd,
-                                             use_fence_fd);
+   struct fd_fence *fence = fd_submit_flush(submit, in_fence_fd, use_fence_fd);
    if (in_fence_fd >= 0)
       close(in_fence_fd);
+   /* Readiness includes the kernel submit and any requested output fd,
+    * but not waiting for GPU completion. */
+   if (fence)
+      fd_fence_flush(fence);
+   if (diag) {
+      device->diag.submit_ready_ns += os_time_get_nano() - start;
+      if (use_fence_fd && (!fence || !fence->use_fence_fd || fence->fence_fd < 0))
+         device->diag.out_fence_export_failures++;
+   }
    return fence;
 }
 
@@ -684,6 +739,7 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
    device->submit_count++;
    int64_t start = profile ? os_time_get_nano() : 0;
    bool timing = debug_get_option_wait_timing();
+   bool diag = device->diag.id != 0;
    int64_t t0 = device->trace || timing ? os_time_get_nano() : 0;
    int debug_fd = debug_get_option_fence_debug() && device->submit_in_fence_fd >= 0 ?
       os_dupfd_cloexec(device->submit_in_fence_fd) : -1;
@@ -696,21 +752,23 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
    struct fd_fence *fence = rd_flush_submit(device, submit, false);
    VkResult result = VK_ERROR_DEVICE_LOST;
    if (fence) {
-      fd_fence_flush(fence);
-      int64_t t1 = device->trace || timing ? os_time_get_nano() : 0;
+      int64_t t1 = device->trace || timing || diag ? os_time_get_nano() : 0;
       bool failed = fd_device_version(device->fd) >= FD_VERSION_SOFTPIN &&
                     fence->submit_error;
       int wait = failed ? fence->submit_error :
          fd_pipe_wait_timeout(device->pipe, fence, 5000000000ull);
-      int64_t t2 = device->trace || timing ? os_time_get_nano() : 0;
+      int64_t t2 = device->trace || timing || diag ? os_time_get_nano() : 0;
+      if (diag && !failed)
+         device->diag.completion_wait_ns += t2 - t1;
       if (device->trace) {
          device->trace->flush_ns += t1 - t0;
          device->trace->wait_ns += t2 - t1;
       }
       if (timing)
-         fprintf(stderr, "RADISH_WAIT_TIMING type=submit id=%" PRIu64 " host_start_ns=%" PRId64
-                 " host_done_ns=%" PRId64 " flush_ns=%" PRId64 " wait_ns=%" PRId64 " result=%d\n",
-                 device->submit_count, t0, t2, t1 - t0, t2 - t1, wait);
+         fprintf(stderr, "RADISH_WAIT_TIMING type=submit id=%" PRIu64 " vk_id=%" PRIu64
+                 " host_start_ns=%" PRId64 " host_done_ns=%" PRId64
+                 " flush_ns=%" PRId64 " wait_ns=%" PRId64 " result=%d\n",
+                 device->submit_count, device->diag.id, t0, t2, t1 - t0, t2 - t1, wait);
       if (!wait) {
          uint64_t faults = 0;
          if (!fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) &&
@@ -765,7 +823,7 @@ rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
    struct fd_fence *last = window->pending[window->count - 1].fence;
    VkResult result = VK_ERROR_DEVICE_LOST;
    bool timing = debug_get_option_wait_timing();
-   bool diag = debug_get_option_submit_diag();
+   bool diag = device->diag.id != 0;
    int64_t t0 = device->trace || timing || diag ? os_time_get_nano() : 0;
    int wait = fd_pipe_wait_timeout(device->pipe, last, 5000000000ull);
    int64_t done = device->trace || timing || diag ? os_time_get_nano() : 0;
@@ -773,13 +831,15 @@ rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
       unsigned index = rd_drain_index(reason);
       device->diag.drain_count[index]++;
       device->diag.drain_ns[index] += done - t0;
+      device->diag.completion_wait_ns += done - t0;
    }
    if (device->trace)
       device->trace->wait_ns += done - t0;
    if (timing)
-      fprintf(stderr, "RADISH_WAIT_TIMING type=drain reason=%s id=%" PRIu64 " slots=%u"
+      fprintf(stderr, "RADISH_WAIT_TIMING type=drain reason=%s id=%" PRIu64
+              " vk_id=%" PRIu64 " slots=%u"
               " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " wait_ns=%" PRId64 " result=%d\n",
-              reason, device->submit_count, window->count, t0, done, done - t0, wait);
+              reason, device->submit_count, device->diag.id, window->count, t0, done, done - t0, wait);
    if (!wait) {
       uint64_t faults = 0;
       if (!fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) &&
@@ -869,18 +929,20 @@ rd_window_reserve(struct rd_device *device, struct rd_submit_window *window)
    if (!debug_get_option_window_wait_oldest())
       return rd_window_drain(device, window, "capacity-reserve");
    bool timing = debug_get_option_wait_timing();
-   bool diag = debug_get_option_submit_diag();
+   bool diag = device->diag.id != 0;
    int64_t start = device->trace || timing || diag ? os_time_get_nano() : 0;
    int wait = fd_pipe_wait_timeout(device->pipe, window->pending[0].fence, 5000000000ull);
    int64_t done = device->trace || timing || diag ? os_time_get_nano() : 0;
-   if (diag)
-      device->diag.wait_ns += done - start;
+   if (diag) {
+      device->diag.oldest_waits++;
+      device->diag.oldest_wait_ns += done - start;
+   }
    if (device->trace)
       device->trace->wait_ns += done - start;
    if (timing)
-      fprintf(stderr, "RADISH_WAIT_TIMING type=capacity id=%" PRIu64 " slots=%u"
+      fprintf(stderr, "RADISH_WAIT_TIMING type=capacity id=%" PRIu64 " vk_id=%" PRIu64 " slots=%u"
               " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " wait_ns=%" PRId64 " result=%d\n",
-              device->submit_count, window->count, start, done, done - start, wait);
+              device->submit_count, device->diag.id, window->count, start, done, done - start, wait);
    result = wait ? VK_ERROR_DEVICE_LOST : rd_window_reap(device, window);
    rd_window_report("WAIT", "capacity-oldest", window, result);
    if (result == VK_SUCCESS && window->count >= ARRAY_SIZE(window->pending))
@@ -1204,7 +1266,7 @@ rd_signal_submit_fence(struct rd_device *device, struct rd_submit_window *window
       }
    }
    if (imported == signal_count) {
-      if (debug_get_option_submit_diag() && signal_count)
+      if (device->diag.id && signal_count)
          device->diag.fence_imported = true;
       return VK_SUCCESS;
    }
@@ -1213,7 +1275,7 @@ rd_signal_submit_fence(struct rd_device *device, struct rd_submit_window *window
    if (result != VK_SUCCESS)
       return result;
    result = vk_sync_signal_many(&device->vk, signal_count - imported, signals + imported);
-   if (debug_get_option_submit_diag() && result == VK_SUCCESS)
+   if (device->diag.id && result == VK_SUCCESS)
       device->diag.cpu_signalled = true;
    return result;
 }
@@ -1245,7 +1307,6 @@ rd_submit_sync_marker(struct rd_device *device,
       fd_submit_del(submit);
       return VK_ERROR_DEVICE_LOST;
    }
-   fd_fence_flush(fence);
    if (fence->submit_error) {
       fd_fence_del(fence);
       fd_ringbuffer_del(ring);
@@ -1396,7 +1457,7 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
                           struct rd_gpu_elapsed *sample,
                           struct rd_submit_window *window,
                           uint32_t *initial_start, unsigned chunks,
-                          bool render)
+                          bool render, bool tail_fence)
 {
    if (!window)
       return rd_finish_submit(device, submit, ring, profile, sample);
@@ -1409,14 +1470,8 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
    }
    device->submit_count++;
    int64_t t0 = device->trace ? os_time_get_nano() : 0;
-   bool diag = debug_get_option_submit_diag();
-   int64_t submit_start = diag ? os_time_get_nano() : 0;
    struct fd_fence *fence = rd_flush_submit(device, submit,
-      (render && device->submit_out_fence) || device->publish_signal_fence);
-   if (diag)
-      device->diag.kernel_ns += os_time_get_nano() - submit_start;
-   if (fence)
-      fd_fence_flush(fence);
+       (render && device->submit_out_fence) || device->publish_signal_fence || tail_fence);
    if (device->trace)
       device->trace->flush_ns += os_time_get_nano() - t0;
    if (!fence) {
@@ -1456,13 +1511,13 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
    const uint64_t backing_bytes = (uint64_t)window->backing_bytes + new_backing_bytes;
    if (!segments || backing_bytes > 4 * 1024 * 1024) {
       VkResult before = rd_window_drain(device, window, "fallback");
-      bool diag = debug_get_option_submit_diag();
+      bool diag = device->diag.id != 0;
       int64_t w0 = device->trace || diag ? os_time_get_nano() : 0;
       VkResult result = fd_pipe_wait_timeout(device->pipe, fence, 5000000000ull) ?
          VK_ERROR_DEVICE_LOST : VK_SUCCESS;
       int64_t w1 = device->trace || diag ? os_time_get_nano() : 0;
       if (diag)
-         device->diag.wait_ns += w1 - w0;
+         device->diag.completion_wait_ns += w1 - w0;
       if (device->trace)
          device->trace->wait_ns += w1 - w0;
       uint64_t faults = 0;
@@ -1508,7 +1563,7 @@ rd_finish_window_submit(struct rd_device *device, struct fd_submit *submit,
                         uint32_t *initial_ring_start, bool render)
 {
    return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
-                                    initial_ring_start, 1, render);
+                                     initial_ring_start, 1, render, false);
 }
 
 VkResult
@@ -1828,9 +1883,19 @@ rd_packed_attention_batch_resources(struct rd_device *device,
    return UINT64_C(32) * ir3_shader_halfregs(v) <= 4096;
 }
 
+static bool
+rd_compute_tail_batch(bool tail_fence, const uint32_t base[3], const uint32_t grid[3],
+                      const uint32_t dispatch_grid[3])
+{
+   return tail_fence && base[0] + grid[0] == dispatch_grid[0] &&
+          base[1] + grid[1] == dispatch_grid[1] &&
+          base[2] + grid[2] == dispatch_grid[2];
+}
+
 static VkResult
 rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch,
-                    struct rd_submit_profile *profile, struct rd_submit_window *window)
+                     struct rd_submit_profile *profile, struct rd_submit_window *window,
+                     bool tail_fence)
 {
    if (!dispatch->grid[0] || !dispatch->grid[1] || !dispatch->grid[2])
       return VK_SUCCESS;
@@ -2080,7 +2145,8 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
                   OUT_WFI5(ring);
                }
                VkResult result = rd_finish_dispatch_submit(device, submit, ring, profile,
-                                                   sample, window, initial_ring_start, chunks, false);
+                  sample, window, initial_ring_start, chunks, false,
+                  rd_compute_tail_batch(tail_fence, base, grid, dispatch->grid));
                rd_gpu_elapsed_release(sample);
                sample = NULL;
                submit = NULL;
@@ -2095,7 +2161,8 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
    if (submit) {
       rd_flush(device, ring);
       VkResult result = rd_finish_dispatch_submit(device, submit, ring, profile, sample,
-                                                    window, initial_ring_start, chunks, false);
+                                                    window, initial_ring_start, chunks, false,
+                                                    tail_fence);
       rd_gpu_elapsed_release(sample);
       if (diagnostics) {
          fprintf(stderr, "RADISH_DISPATCH_END native=%u result=%d submits=%" PRIu64 "\n",
@@ -2286,10 +2353,12 @@ rd_emit_gpu_copy(struct rd_device *device, struct fd_ringbuffer *ring,
          .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .buffer = &buffers[binding],
          .range = buffers[binding].vk.size };
    }
-   if (transfer->dst_image && debug_get_bool_option("RADISH_GPU_IMAGE_COPY_DEBUG", false))
-      fprintf(stderr, "RADISH_GPU_IMAGE_COPY bytes=%" PRIu64 " rows=%u slices=%u groups=%u,%u,%u\n",
-         (uint64_t)transfer->row_bytes * transfer->rows * transfer->slices,
-         transfer->rows, transfer->slices, dispatch.grid[0], dispatch.grid[1], dispatch.grid[2]);
+   if ((transfer->src_image || transfer->dst_image) &&
+       debug_get_bool_option("RADISH_GPU_IMAGE_COPY_DEBUG", false))
+      fprintf(stderr, "RADISH_GPU_IMAGE_COPY bytes=%" PRIu64 " rows=%u slices=%u groups=%u,%u,%u direction=%s\n",
+              (uint64_t)transfer->row_bytes * transfer->rows * transfer->slices,
+              transfer->rows, transfer->slices, dispatch.grid[0], dispatch.grid[1], dispatch.grid[2],
+              transfer->src_buffer ? "buffer-to-image" : "image-to-buffer");
    const uint32_t base[3] = {0};
    rd_emit_dispatch_chunk(device, ring, &dispatch, dispatch.grid, base, true, NULL);
    rd_flush(device, ring);
@@ -2368,13 +2437,14 @@ rd_execute_gpu_image_copy_batch(struct rd_device *device, const struct rd_comman
    uint64_t bytes = 0;
    for (unsigned i = 0; i < count; i++) {
       const struct rd_image_transfer *copy = &commands[i].image_transfer;
+      struct rd_memory *src, *dst;
+      VkDeviceSize src_offset, dst_offset, src_size, dst_size;
       VkResult result = VK_ERROR_UNKNOWN;
-      if (rd_image_copy_gpu_supported(device, copy, true)) {
-         struct rd_buffer *src = copy->src_buffer;
-         struct rd_image *dst = copy->dst_image;
-         result = rd_emit_gpu_copy(device, ring, copy, src->memory, dst->memory,
-            src->offset + copy->src_offset, dst->memory_offset + copy->dst_offset);
-      }
+      if (rd_image_copy_gpu_supported(device, copy, true) &&
+          rd_image_copy_side(copy, true, &src, &src_offset, &src_size) &&
+          rd_image_copy_side(copy, false, &dst, &dst_offset, &dst_size))
+         result = rd_emit_gpu_copy(device, ring, copy, src, dst,
+                                  src_offset + copy->src_offset, dst_offset + copy->dst_offset);
       if (result != VK_SUCCESS) {
          fd_ringbuffer_del(ring);
          fd_submit_del(submit);
@@ -2385,7 +2455,7 @@ rd_execute_gpu_image_copy_batch(struct rd_device *device, const struct rd_comman
    if (debug_get_bool_option("RADISH_GPU_IMAGE_COPY_DEBUG", false))
       fprintf(stderr, "RADISH_GPU_IMAGE_COPY_BATCH copies=%u bytes=%" PRIu64 "\n", count, bytes);
    return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
-                                    initial_ring_start, count, false);
+                                     initial_ring_start, count, false, false);
 }
 
 static VkResult
@@ -2493,7 +2563,7 @@ rd_execute_transfer_batch(struct rd_device *device, const struct rd_command *com
    if (debug_get_bool_option("RADISH_GPU_BUFFER_TRANSFER_DEBUG", false))
       fprintf(stderr, "RADISH_BUFFER_TRANSFER_BATCH commands=%u bytes=%" PRIu64 "\n", count, bytes);
    return rd_finish_dispatch_submit(device, submit, ring, NULL, NULL, window,
-                                    initial_ring_start, count, false);
+                                     initial_ring_start, count, false, false);
 }
 
 static bool
@@ -2550,7 +2620,7 @@ rd_execute_gpu_buffer_transfer(struct rd_device *device, enum rd_command_type ty
       if (profile)
          profile->chunks++;
       result = rd_finish_dispatch_submit(device, submit, ring, profile, NULL, window,
-                                         initial_ring_start, 1, false);
+                                         initial_ring_start, 1, false, false);
       if (result != VK_SUCCESS)
          return result;
       done += bytes;
@@ -2721,6 +2791,42 @@ rd_resolve_dispatch(const struct rd_dispatch_record *record,
    return VK_SUCCESS;
 }
 
+static bool
+rd_find_compute_tail(struct rd_device *device, const struct vk_queue_submit *submit,
+                     const struct rd_command **last_work, uint32_t *last_work_buffer)
+{
+   if (vk_queue_submit_has_bind(submit))
+      return false;
+   for (uint32_t i = submit->command_buffer_count; i > 0; i--) {
+      const struct rd_command_buffer *command = container_of(submit->command_buffers[i - 1],
+         struct rd_command_buffer, vk);
+      const struct rd_command *commands = util_dynarray_begin(&command->commands);
+      unsigned count = util_dynarray_num_elements(&command->commands, struct rd_command);
+      while (count && commands[count - 1].type == RD_CMD_BARRIER)
+         count--;
+      if (!count)
+         continue;
+
+      const struct rd_command *tail = &commands[count - 1];
+      if (tail->type != RD_CMD_DISPATCH || tail->dispatch.indirect ||
+          !tail->dispatch.grid[0] || !tail->dispatch.grid[1] || !tail->dispatch.grid[2])
+         return false;
+      struct rd_dispatch dispatch;
+      if (rd_resolve_dispatch(&tail->dispatch, &dispatch) != VK_SUCCESS ||
+          !rd_window_pipeline(device, &dispatch))
+         return false;
+      for (uint32_t s = 0; s < submit->signal_count; s++) {
+         const struct vk_sync_signal *signal = &submit->signals[s];
+         if (!rd_sync_value_supported(device, signal->sync, signal->signal_value, false))
+            return false;
+      }
+      *last_work = tail;
+      *last_work_buffer = i - 1;
+      return true;
+   }
+   return false;
+}
+
 VkResult
 rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
@@ -2731,6 +2837,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    if (diag) {
       memset(&device->diag, 0, sizeof(device->diag));
       device->diag.id = device->vk_submit_id;
+      device->diag.seq_before = device->submit_count;
    }
    bool profile = debug_get_bool_option("RADISH_PROFILE", false);
    struct rd_submit_window *window = &device->submit_window;
@@ -2758,7 +2865,14 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
               device->submit_in_fence_fd >= 0, submit->wait_count, submit->signal_count);
    if (async) {
       int wait_fd = -1;
-      if (rd_export_waits(device, submit, &wait_fd) == VK_SUCCESS)
+      bool measure_export = diag && submit->wait_count;
+      int64_t start = measure_export ? os_time_get_nano() : 0;
+      VkResult export_result = rd_export_waits(device, submit, &wait_fd);
+      if (measure_export) {
+         device->diag.wait_export_ns = os_time_get_nano() - start;
+         device->diag.wait_export_result = export_result;
+      }
+      if (export_result == VK_SUCCESS)
          device->submit_in_fence_fd = wait_fd;
       else
          async = false;
@@ -2769,28 +2883,45 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
               submit->wait_count, submit->signal_count);
    __sync_synchronize();
    const int64_t queue_start = device->trace ? os_time_get_nano() : 0;
-   const int64_t emit_start = diag ? os_time_get_nano() : 0;
    VkResult result = VK_SUCCESS;
+   bool compute_tail = false;
    if (!async) {
       if (device->submit_in_fence_fd >= 0) {
          int wait_fd = device->submit_in_fence_fd;
          device->submit_in_fence_fd = -1;
+         int64_t start = diag ? os_time_get_nano() : 0;
          int wait_result = sync_wait(wait_fd, -1);
+         if (diag)
+            device->diag.completion_wait_ns += os_time_get_nano() - start;
          close(wait_fd);
-         if (wait_result < 0)
-            return rd_queue_fail(queue);
+         if (wait_result < 0) {
+            result = VK_ERROR_DEVICE_LOST;
+            goto done;
+         }
       }
       result = rd_window_drain(device, window, "cpu");
       if (result != VK_SUCCESS)
-         return rd_queue_fail(queue);
-      int64_t wait_start = diag ? os_time_get_nano() : 0;
+         goto done;
+      bool measure_wait = diag && submit->wait_count;
+      int64_t wait_start = measure_wait ? os_time_get_nano() : 0;
       result = vk_sync_wait_many(&device->vk, submit->wait_count,
          submit->waits, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
-      if (diag)
-         device->diag.wait_ns += os_time_get_nano() - wait_start;
+      if (measure_wait)
+         device->diag.completion_wait_ns += os_time_get_nano() - wait_start;
       if (result != VK_SUCCESS)
-         return rd_queue_fail(queue);
+         goto done;
+      /* The last batch can signal for all prior work on the same pipe. */
+      compute_tail = deferred && !device->trace && softpin && submit->signal_count &&
+         debug_get_option_compute_tail_fence() &&
+         rd_find_compute_tail(device, submit, &last_work, &last_work_buffer);
+      /* Use the tail export instead of requesting fds from every submission. */
+      if (compute_tail)
+         device->publish_signal_fence = false;
    }
+   /* Command host work excludes only the explicit waits/readiness timed
+    * inside this loop, not any waits before or after it. */
+   const uint64_t accounted_before = diag ? rd_submit_diag_accounted_ns(&device->diag) : 0;
+   const int64_t cmd_start = diag ? os_time_get_nano() : 0;
    for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
       struct rd_command_buffer *command = container_of(submit->command_buffers[i],
          struct rd_command_buffer, vk);
@@ -2798,7 +2929,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          if (rd_trace_needs_resolve(device)) {
             result = rd_window_drain(device, window, "trace");
             if (result != VK_SUCCESS)
-               return rd_queue_fail(queue);
+               goto commands_done;
             rd_trace_resolve(device, queue_start);
          }
          rd_trace_command_begin(device);
@@ -2811,7 +2942,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          if (recorded->type == RD_CMD_DISPATCH) {
             result = rd_resolve_dispatch(&recorded->dispatch, &execution);
             if (result != VK_SUCCESS)
-               return rd_queue_fail(queue);
+               goto commands_done;
          }
          /* barriers need no CPU drain: every GPU chunk ends with a cache
           * flush and starts with UCHE invalidate + WFI, and same-pipe
@@ -2830,9 +2961,11 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             result = rd_window_drain(device, window,
                recorded->type == RD_CMD_BARRIER ? "barrier" : "cpu");
             if (result != VK_SUCCESS)
-               return rd_queue_fail(queue);
+               goto commands_done;
          }
          if (recorded->type == RD_CMD_DISPATCH) {
+            bool tail_fence = compute_tail && can_defer &&
+               i == last_work_buffer && recorded == last_work;
             result = VK_SUCCESS;
             if (dispatch->indirect)
                result = rd_resolve_indirect(device, &execution);
@@ -2841,7 +2974,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             if (result == VK_SUCCESS)
                result = rd_execute_dispatch(device, dispatch,
                                             profile ? &submit_profile : NULL,
-                                            can_defer ? window : NULL);
+                                            can_defer ? window : NULL, tail_fence);
             if (result == VK_SUCCESS)
                rd_query_account_dispatch(device, dispatch);
             if (execution.sampling_addresses)
@@ -2943,12 +3076,16 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          }
          if (result != VK_SUCCESS) {
             rd_window_drain(device, window, "error");
-            return rd_queue_fail(queue);
+            goto commands_done;
          }
       }
    }
+commands_done:
    if (diag)
-      device->diag.emit_ns += os_time_get_nano() - emit_start;
+      rd_submit_diag_end_commands(&device->diag, os_time_get_nano() - cmd_start,
+                                  accounted_before);
+   if (result != VK_SUCCESS)
+      goto done;
    rd_trace_resolve(device, queue_start);
    if (async) {
       if (device->submit_in_fence_fd < 0 && submit->signal_count && window->count &&
@@ -2963,36 +3100,25 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             device->diag.markers++;
       } else if (submit->signal_count) {
          result = vk_sync_signal_many(&device->vk, submit->signal_count,
-                                      submit->signals);
-         if (diag)
+                                       submit->signals);
+         if (diag && result == VK_SUCCESS)
             device->diag.cpu_signalled = true;
       }
-   } else if (device->publish_signal_fence && window->count) {
+   } else if ((device->publish_signal_fence || compute_tail) && window->count) {
       result = rd_signal_submit_fence(device, window,
                                      submit->signal_count, submit->signals);
    } else {
       result = rd_window_drain(device, window, "final");
-      if (result == VK_SUCCESS)
+      if (result == VK_SUCCESS) {
          result = vk_sync_signal_many(&device->vk, submit->signal_count,
-                                      submit->signals);
-      if (diag)
-         device->diag.cpu_signalled = true;
-   }
-   int64_t every = debug_get_num_option("RADISH_SUBMIT_DIAG_EVERY", 1);
-   if (diag && every > 0 && device->vk_submit_id % (uint64_t)every == 0) {
-      fprintf(stderr, "RADISH_SUBMIT_DIAG id=%" PRIu64 " seq=%" PRIu64 " async=%u"
-              " waits=%u signals=%u marker=%u imported=%u cpu_signal=%u"
-              " emit_ns=%" PRIu64 " kernel_ns=%" PRIu64 " wait_ns=%" PRIu64,
-              device->diag.id, device->submit_count, async != 0, submit->wait_count,
-              submit->signal_count, device->diag.markers, device->diag.fence_imported,
-              device->diag.cpu_signalled, device->diag.emit_ns,
-              device->diag.kernel_ns, device->diag.wait_ns);
-      for (unsigned i = 0; i < RD_DRAIN_COUNT; i++)
-         if (device->diag.drain_count[i])
-            fprintf(stderr, " %s=%u/%" PRIu64 "ns", rd_drain_names[i],
-                    device->diag.drain_count[i], device->diag.drain_ns[i]);
-      fprintf(stderr, "\n");
+                                       submit->signals);
+         if (diag && result == VK_SUCCESS && submit->signal_count)
+            device->diag.cpu_signalled = true;
+      }
    }
    device->publish_signal_fence = false;
+done:
+   if (diag)
+      rd_submit_diag_report(device, submit, async, result);
    return result == VK_SUCCESS ? VK_SUCCESS : rd_queue_fail(queue);
 }

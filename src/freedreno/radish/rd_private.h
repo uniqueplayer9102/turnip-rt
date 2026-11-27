@@ -96,11 +96,13 @@ enum rd_drain_reason {
 };
 
 struct rd_submit_diag {
-   uint64_t id;
-   uint64_t emit_ns, kernel_ns, wait_ns;
+   uint64_t id, seq_before;
+   uint64_t cmd_wall_ns, cmd_host_ns;
+   uint64_t submit_ready_ns, wait_export_ns, completion_wait_ns, oldest_wait_ns;
    uint32_t drain_count[RD_DRAIN_COUNT];
    uint64_t drain_ns[RD_DRAIN_COUNT];
-   uint32_t markers;
+   uint32_t markers, oldest_waits, out_fence_export_failures;
+   VkResult wait_export_result;
    bool fence_imported;
    bool cpu_signalled;
 };

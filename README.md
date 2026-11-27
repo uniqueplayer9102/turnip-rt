@@ -113,7 +113,7 @@ values; a running compositor can also be switched to bypass with a marker file
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `RADISH_GPU_IMAGE_COPY` | `1` | use a compute shader for buffer→image copies |
+| `RADISH_GPU_IMAGE_COPY` | `1` | use a compute shader for eligible buffer↔image copies |
 | `RADISH_GPU_IMAGE_COPY_SMALL` | `1` | allow GPU copies below the 512 KiB floor in async submits |
 | `RADISH_GPU_IMAGE_COPY_BATCH` | `8` | max copies batched into one GPU submit (1–8) |
 | `RADISH_GPU_IMAGE_COPY_DEBUG` | `0` | log GPU copy dispatches and batches |
@@ -133,7 +133,8 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_WSI_FIFO_NO_THROTTLE` | unset | `1`: skip Mesa's legacy frame-callback FIFO throttle on compositors without `wp_fifo_manager_v1` (raises FPS, still presents at VSync) |
 | `RADISH_ASYNC_QUEUE_SYNC` | `0` | pass sync-file fences to MSM instead of CPU-waiting each submit |
 | `RADISH_ASYNC_QUEUE_SYNC_DEBUG` | `0` | log async submit/skip decisions |
-| `RADISH_SUBMIT_DIAG` | `0` | per-submit CPU summary: async selection, waits, signals, marker/fence outcomes, drain waits by reason, emit/kernel/wait time |
+| `RADISH_COMPUTE_TAIL_FENCE` | `0` | request a fence fd only on the final batch of an eligible direct compute dispatch at the end of a non-async submit |
+| `RADISH_SUBMIT_DIAG` | `0` | per-submit CPU summary: async selection, fence outcomes, command time, and submit/wait costs |
 | `RADISH_SUBMIT_DIAG_EVERY` | `1` | log only every Nth submit when `RADISH_SUBMIT_DIAG` is on |
 | `RADISH_PENDING_BLOCKING_WAIT` | `0` | block on binary-fence publication instead of polling with 1 ms sleeps; opt-in prototype |
 | `RADISH_BATCH_CHUNKS` | `1` | max compute chunks per submit; `2`/`4`/`8` batch multiple chunks, while eligible dispatches still defer at `1` when async sync is enabled |
@@ -144,6 +145,24 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_TILED_BATCH_CHUNKS` | `1` | tiled compute chunks per submit |
 | `RADISH_TILED_GROUPS_X` | `1` | tiled workgroup X factor (`2` enables x2 tiling) |
 | `RADISH_WAVESIZE` | unset (`IR3_SINGLE_ONLY`) | `double`: `IR3_DOUBLE_ONLY`; `any`: `IR3_SINGLE_OR_DOUBLE` ([`rd_real_wavesize`](src/freedreno/radish/rd_pipeline.c)) |
+
+`RADISH_SUBMIT_DIAG` reports `cmd_wall_ns` for the command loop and `cmd_host_ns`
+for the same loop minus the measured submit and wait calls. The latter includes
+command preparation, CPU-side commands, and any waits internal to them that are
+not measured separately. `submit_ready_ns` includes flushing each low-level
+submit until the kernel result and any requested output fence fd are ready;
+`wait_export_ns` and `wait_export_result` cover exporting and merging input
+wait fences. `out_fence_export_failures` counts missing requested output fds.
+`completion_wait_ns` includes full-window drain waits (also shown by reason)
+but not `oldest_wait_ns`, which only covers waiting for a single window slot.
+Low-level submits issued for Vulkan submit `id` have counters in
+`(seq_before, seq]`. Enable `RADISH_WAIT_TIMING=1` alongside diagnostics to see
+the current low-level counter as `id` and the Vulkan submit as `vk_id` on
+detailed wait lines.
+
+`RADISH_COMPUTE_TAIL_FENCE` requires `RADISH_BATCH_CHUNKS=8`, a softpin device,
+and importable signal syncs. It does not apply while profiling or tracing. If
+the final batch's fence cannot be used, the driver waits and signals on the CPU.
 
 ### Descriptors / sampling / compatibility
 
