@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "vk_common_entrypoints.h"
 
 #include "util/os_misc.h"
 #include "util/build_id.h"
@@ -94,6 +95,7 @@ static const struct vk_instance_extension_table rd_instance_extensions = {
 static const struct vk_device_extension_table rd_device_extensions = {
    .KHR_swapchain = true,
    .KHR_incremental_present = true,
+   .KHR_calibrated_timestamps = true,
    .GOOGLE_display_timing = true,
    .KHR_device_group = true,
    .KHR_descriptor_update_template = true,
@@ -219,6 +221,8 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       &rd_physical_device_entrypoints, true);
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch,
       &wsi_physical_device_entrypoints, false);
+   vk_physical_device_dispatch_table_from_entrypoints(&dispatch,
+      &vk_common_physical_device_entrypoints, false);
    struct vk_properties properties = {
       .apiVersion = VK_API_VERSION_1_1,
       .driverVersion = 1,

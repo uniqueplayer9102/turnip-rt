@@ -49,6 +49,10 @@ def main():
     assert '.pipelineStatisticsQuery = false' in instance
     assert '#ifdef VK_USE_PLATFORM_XCB_KHR' in instance
     assert '.GOOGLE_display_timing = true,' in instance
+    assert '.KHR_calibrated_timestamps = true,' in instance
+    assert 'vk_device_dispatch_table_from_entrypoints(&dispatch, &vk_common_device_entrypoints, false)' in device_src
+    assert 'vk_physical_device_dispatch_table_from_entrypoints(&dispatch,' in instance
+    assert '&vk_common_physical_device_entrypoints, false)' in instance
     assert '.KHR_xcb_surface = true,' in instance
     assert 'util_dynarray_append(' not in graphics
     pipeline = (driver / 'rd_pipeline.c').read_text()

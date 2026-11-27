@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "vk_common_entrypoints.h"
 #include "rd_trace.h"
 #include "util/os_time.h"
 #include <time.h>
@@ -88,6 +89,7 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    struct vk_device_dispatch_table dispatch;
    vk_device_dispatch_table_from_entrypoints(&dispatch, &rd_device_entrypoints, true);
    vk_device_dispatch_table_from_entrypoints(&dispatch, &wsi_device_entrypoints, false);
+   vk_device_dispatch_table_from_entrypoints(&dispatch, &vk_common_device_entrypoints, false);
    VkResult result = vk_device_init(&device->vk, &physical->vk, &dispatch,
                                     info, allocator);
    if (result != VK_SUCCESS) {
