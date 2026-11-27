@@ -253,6 +253,14 @@ rd_CreateDescriptorPool(VkDevice handle, const VkDescriptorPoolCreateInfo *info,
 }
 
 static void
+rd_descriptor_set_init_version(struct rd_device *device, struct rd_descriptor_set *set)
+{
+   set->version = (struct rd_descriptor_set_version) {
+      .serial = p_atomic_inc_return(&device->descriptor_set_serial),
+   };
+}
+
+static void
 rd_free_set(struct rd_device *device, struct rd_descriptor_set *set)
 {
    list_del(&set->link);
@@ -268,11 +276,8 @@ rd_ResetDescriptorPool(VkDevice handle, VkDescriptorPool pool_handle,
 {
    VK_FROM_HANDLE(rd_device, device, handle);
    VK_FROM_HANDLE(rd_descriptor_pool, pool, pool_handle);
-   bool had_sets = !list_is_empty(&pool->sets);
    list_for_each_entry_safe(struct rd_descriptor_set, set, &pool->sets, link)
       rd_free_set(device, set);
-   if (had_sets)
-      p_atomic_inc(&device->descriptor_storage_generation);
    return VK_SUCCESS;
 }
 
@@ -332,10 +337,9 @@ rd_AllocateDescriptorSets(VkDevice handle, const VkDescriptorSetAllocateInfo *in
       pool->used_sets++;
       pool->used_descriptors += layout->pool_descriptor_count;
       list_addtail(&set->link, &pool->sets);
+      rd_descriptor_set_init_version(device, set);
       out[i] = rd_descriptor_set_to_handle(set);
    }
-   if (info->descriptorSetCount)
-      p_atomic_inc(&device->descriptor_storage_generation);
    return VK_SUCCESS;
 }
 
@@ -347,8 +351,6 @@ rd_FreeDescriptorSets(VkDevice handle, VkDescriptorPool pool, uint32_t count,
    for (uint32_t i = 0; i < count; i++)
       if (sets[i])
          rd_free_set(device, rd_descriptor_set_from_handle(sets[i]));
-   if (count)
-      p_atomic_inc(&device->descriptor_storage_generation);
    return VK_SUCCESS;
 }
 
@@ -367,15 +369,15 @@ rd_validate_descriptor_conversion(struct rd_descriptor *descriptor, const struct
    }
 }
 
-static void
+static bool
 rd_write_descriptor(struct rd_descriptor_set *set, uint32_t slot,
-                     VkDescriptorType type, const void *data)
+                    VkDescriptorType type, const void *data)
 {
    const struct vk_sampler_state *immutable = rd_immutable_sampler(set->layout, slot);
    if (type == VK_DESCRIPTOR_TYPE_SAMPLER && immutable)
-      return;
+      return false;
    if (!data)
-      return;
+      return false;
    struct rd_descriptor descriptor = { .type = type };
    switch (type) {
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
@@ -419,14 +421,14 @@ rd_write_descriptor(struct rd_descriptor_set *set, uint32_t slot,
    }
    rd_validate_descriptor_conversion(&descriptor, immutable);
    set->descriptors[slot] = descriptor;
+   return true;
 }
 
 VKAPI_ATTR void VKAPI_CALL
-rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
+rd_UpdateDescriptorSets(UNUSED VkDevice handle, uint32_t write_count,
                          const VkWriteDescriptorSet *writes,
                          uint32_t copy_count, const VkCopyDescriptorSet *copies)
 {
-   VK_FROM_HANDLE(rd_device, device, handle);
    for (uint32_t i = 0; i < write_count; i++) {
       VK_FROM_HANDLE(rd_descriptor_set, set, writes[i].dstSet);
       if (!set)
@@ -437,6 +439,7 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
           !rd_descriptor_span_valid(set->layout, binding->slot + writes[i].dstArrayElement,
                                     writes[i].descriptorType, writes[i].descriptorCount))
          continue;
+      bool written = false;
       for (uint32_t j = 0; j < writes[i].descriptorCount; j++) {
          const void *data;
          if (binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
@@ -449,14 +452,16 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
             data = writes[i].pTexelBufferView ? &writes[i].pTexelBufferView[j] : NULL;
          else
             data = writes[i].pImageInfo ? &writes[i].pImageInfo[j] : NULL;
-         rd_write_descriptor(set, binding->slot + writes[i].dstArrayElement + j,
-                              binding->type, data);
+         written |= rd_write_descriptor(set, binding->slot + writes[i].dstArrayElement + j,
+                                        binding->type, data);
       }
+      if (written)
+         set->version.generation++;
    }
    for (uint32_t i = 0; i < copy_count; i++) {
       VK_FROM_HANDLE(rd_descriptor_set, src, copies[i].srcSet);
       VK_FROM_HANDLE(rd_descriptor_set, dst, copies[i].dstSet);
-      if (!src || !dst)
+      if (!src || !dst || !copies[i].descriptorCount)
          continue;
       const struct rd_binding *sb = rd_find_binding(src->layout, copies[i].srcBinding);
       const struct rd_binding *db = rd_find_binding(dst->layout, copies[i].dstBinding);
@@ -480,35 +485,33 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
             rd_sampler_descriptor(immutable, dst->descriptors[slot].sampler);
          }
       }
+      dst->version.generation++;
    }
-   /* One bump for all writes and copies, including immutable-sampler fixes. */
-   if (write_count || copy_count)
-      p_atomic_inc(&device->descriptor_storage_generation);
 }
 
 VKAPI_ATTR void VKAPI_CALL
-rd_UpdateDescriptorSetWithTemplate(VkDevice handle, VkDescriptorSet set_handle,
+rd_UpdateDescriptorSetWithTemplate(UNUSED VkDevice handle, VkDescriptorSet set_handle,
    VkDescriptorUpdateTemplate template_handle, const void *data)
 {
-   VK_FROM_HANDLE(rd_device, device, handle);
    VK_FROM_HANDLE(rd_descriptor_set, set, set_handle);
    VK_FROM_HANDLE(vk_descriptor_update_template, update, template_handle);
    if (!set || !update || !data)
       return;
+   bool written = false;
    for (uint32_t i = 0; i < update->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &update->entries[i];
       const struct rd_binding *binding = rd_find_binding(set->layout, entry->binding);
       if (!binding || entry->type != binding->type ||
           entry->array_element > set->layout->descriptor_count - binding->slot ||
           !rd_descriptor_span_valid(set->layout, binding->slot + entry->array_element,
-                                    entry->type, entry->array_count))
+                                     entry->type, entry->array_count))
          continue;
       for (uint32_t j = 0; j < entry->array_count; j++)
-         rd_write_descriptor(set, binding->slot + entry->array_element + j,
-            entry->type, (const uint8_t *)data + entry->offset + j * entry->stride);
+         written |= rd_write_descriptor(set, binding->slot + entry->array_element + j,
+                                        entry->type, (const uint8_t *)data + entry->offset + j * entry->stride);
    }
-   if (update->entry_count)
-      p_atomic_inc(&device->descriptor_storage_generation);
+   if (written)
+      set->version.generation++;
 }
 
 bool

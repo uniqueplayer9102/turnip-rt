@@ -164,11 +164,15 @@ detailed wait lines.
 and importable signal syncs. It does not apply while profiling or tracing. If
 the final batch's fence cannot be used, the driver waits and signals on the CPU.
 
+See the [on-device benchmark matrix](docs/radish-benchmark-matrix.md) for sweeps
+and diagnostics-free comparisons.
+
 ### Descriptors / sampling / compatibility
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `RADISH_DESCRIPTOR_ARENA` | `1` | arena-allocate descriptor snapshots and reuse them for adjacent primary direct draws with unchanged descriptor state |
+| `RADISH_DESCRIPTOR_ARENA` | `1` | arena-allocate draw descriptor snapshots |
+| `RADISH_DRAW_DESCRIPTOR_CACHE` | `1` | reuse snapshots for adjacent primary direct draws with unchanged descriptor state; requires the arena. `0` leaves arena allocation enabled |
 | `RADISH_LAYOUT_COMPATIBILITY_CACHE` | `1` | cache pipeline-layout compatibility hashes |
 | `RADISH_LAYOUT_COMPATIBILITY_DEBUG` | `0` | log layout compatibility computation |
 | `RADISH_SW_TEXEL_FETCH` | `0` | force the software texture-sampling fallback |

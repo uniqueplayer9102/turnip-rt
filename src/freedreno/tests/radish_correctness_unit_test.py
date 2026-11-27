@@ -7,7 +7,10 @@ import tempfile
 
 
 def extract(source, name, cpp=False):
-    prefix = r'^static bool ' if cpp else r'^(?:static (?:inline )?)?(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|nir_mem_access_size_align)\n'
+    prefix = r'^static bool ' if cpp else (
+        r'^(?:VKAPI_ATTR void VKAPI_CALL|(?:static (?:inline )?)?'
+        r'(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|nir_mem_access_size_align|'
+        r'const struct (?:rd_binding|vk_sampler_state) \*))\n')
     match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
     return source[match.start():source.index('\n}', match.end()) + 3] + '\n'
@@ -34,7 +37,8 @@ def main():
     private = (driver / 'rd_private.h').read_text()
     event = (driver / 'rd_event.c').read_text()
     query = (driver / 'rd_query.c').read_text()
-    sync_header = (driver.parent.parent / 'vulkan' / 'runtime' / 'vk_sync.h').read_text()
+    vk_runtime = driver.parent.parent / 'vulkan' / 'runtime'
+    sync_header = (vk_runtime / 'vk_sync.h').read_text()
     direct = extract(graphics, 'rd_execute_render_direct')
     assert re.search(r'result\s*=\s*queries\s*\?\s*rd_finish_submit\(', direct)
     assert direct.index('result = queries ?') < direct.index('if (result == VK_SUCCESS && queries)')
@@ -106,8 +110,16 @@ def main():
             extract(graphics, 'rd_vertex_input_valid'))
         (directory / 'query_range_under_test.h').write_text(
             extract(query, 'rd_query_range'))
-        (directory / 'descriptor_span_under_test.h').write_text(
-            extract(descriptor, 'rd_descriptor_span_valid'))
+        set_version = private[private.index('struct rd_descriptor_set_version {'):
+                              private.index('struct rd_descriptor_set {')]
+        (directory / 'descriptor_set_version_under_test.h').write_text(set_version)
+        (directory / 'descriptor_updates_under_test.h').write_text(
+            extract((vk_runtime / 'vk_buffer.h').read_text(), 'vk_buffer_range') + ''.join(
+                extract(descriptor, name) for name in (
+                    'rd_find_binding', 'rd_descriptor_span_valid', 'rd_immutable_sampler',
+                    'rd_descriptor_set_init_version', 'rd_validate_descriptor_conversion',
+                    'rd_write_descriptor', 'rd_UpdateDescriptorSets',
+                    'rd_UpdateDescriptorSetWithTemplate')))
         (directory / 'dispatch_preflight_under_test.h').write_text(
             extract(descriptor, 'rd_descriptor_dynamic_offset_valid') +
             ''.join(extract(queue, name) for name in ('rd_window_pipeline',
@@ -118,6 +130,7 @@ def main():
         (directory / 'draw_descriptor_cache_types_under_test.h').write_text(cache_types)
         (directory / 'draw_descriptor_cache_under_test.h').write_text(
             extract(private, 'rd_invalidate_draw_descriptor_cache') +
+            extract(graphics, 'rd_draw_descriptor_cache_track_set') +
             extract(graphics, 'rd_draw_descriptor_cache_enabled') +
             extract(graphics, 'rd_draw_descriptor_cache_hit'))
         diag_types = private[private.index('enum rd_drain_reason {'):private.index('\nstruct rd_device {')]

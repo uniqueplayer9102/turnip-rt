@@ -88,6 +88,7 @@ struct rd_render {
 struct rd_device {
    struct rd_trace *trace;
    uint64_t submit_count;
+   uint64_t descriptor_set_serial;
    struct list_head active_queries;
    void *pipe, *fd;
    struct { uint32_t threadsize_base; } info;
@@ -185,13 +186,19 @@ struct VkPipelineVertexInputDivisorStateCreateInfoEXT;
 #include "vertex_input_under_test.h"
 #include "query_range_under_test.h"
 
-struct rd_binding { uint32_t slot, count; VkDescriptorType type; };
+struct rd_binding { uint32_t slot, count, binding, immutable_offset; VkDescriptorType type; };
+struct vk_sampler_state {
+   bool has_ycbcr_conversion;
+   uint32_t ycbcr_conversion, words[4];
+};
 struct rd_set_layout {
-   uint32_t descriptor_count, binding_count;
+   uint32_t descriptor_count, binding_count, immutable_count;
+   struct vk_sampler_state *immutable_sampler_states;
    struct rd_binding bindings[8];
 };
 struct rd_memory { struct { VkDeviceSize size; } vk; struct fd_bo *bo; };
-struct rd_buffer { struct { VkDeviceSize size; } vk; struct rd_memory *memory; VkDeviceSize offset; };
+struct vk_buffer { VkDeviceSize size; };
+struct rd_buffer { struct vk_buffer vk; struct rd_memory *memory; VkDeviceSize offset; };
 
 #define RD_MAX_SETS 4
 #define RD_MAX_BINDINGS 1024
@@ -212,15 +219,45 @@ static unsigned fd_pipe_dev_id(const void *pipe) { return *(const unsigned *)pip
 static unsigned fd_dev_gpu_id(unsigned id) { return id; }
 static unsigned fd_device_version(const void *fd) { return *(const unsigned *)fd; }
 
+struct rd_image_view { bool ycbcr; uint32_t conversion; };
+struct rd_sampler { struct vk_sampler_state state; };
 struct rd_descriptor {
    VkDescriptorType type;
    struct rd_buffer *buffer;
    VkDeviceSize offset, range;
+   struct rd_image_view *image_view;
+   struct rd_buffer_view *buffer_view;
+   bool has_sampler;
+   uint32_t sampler[4];
 };
+#include "descriptor_set_version_under_test.h"
 struct rd_descriptor_set {
-   const struct rd_set_layout *layout;
+   struct rd_set_layout *layout;
+   struct rd_descriptor_set_version version;
    struct rd_descriptor descriptors[2];
 };
+struct vk_descriptor_update_template {
+   uint32_t entry_count;
+   struct vk_descriptor_template_entry {
+      VkDescriptorType type;
+      uint32_t binding, array_element, array_count;
+      size_t offset, stride;
+   } entries[1];
+};
+#define RD_TEST_HANDLE(type, obj) ((type)(uintptr_t)(obj))
+#define RD_TEST_FROM_HANDLE(type, handle) ((struct type *)(uintptr_t)(handle))
+#define VK_FROM_HANDLE(type, name, handle) struct type *name = RD_TEST_FROM_HANDLE(type, handle)
+#define rd_buffer_from_handle(h) RD_TEST_FROM_HANDLE(rd_buffer, h)
+#define rd_buffer_view_from_handle(h) RD_TEST_FROM_HANDLE(rd_buffer_view, h)
+#define rd_image_view_from_handle(h) RD_TEST_FROM_HANDLE(rd_image_view, h)
+#define p_atomic_inc_return(v) __atomic_add_fetch((v), 1, __ATOMIC_ACQ_REL)
+#define UNUSED __attribute__((unused))
+static void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4])
+{
+   memcpy(words, state->words, sizeof(state->words));
+}
+#include "descriptor_updates_under_test.h"
+
 /* Resource metadata shared with the shader compiler. */
 #include "../radish/rd_nir_resources.h"
 struct rd_pipeline {
@@ -315,56 +352,30 @@ struct rd_command_buffer {
    uint64_t gfx_descriptor_bind_generation;
    struct rd_draw_descriptor_cache draw_descriptor_cache;
    struct rd_bind_state {
+      struct rd_descriptor_set *sets[RD_MAX_SETS];
       uint32_t dynamic_offsets[RD_MAX_SETS][RD_MAX_BINDINGS];
    } bind[2];
 };
+
+static bool draw_descriptor_cache_option = true;
+static bool debug_get_option_draw_descriptor_cache(void)
+{
+   return draw_descriptor_cache_option;
+}
 #include "draw_descriptor_cache_under_test.h"
 
-static void test_draw_descriptor_cache(void)
+static void test_draw_descriptor_cache_enabled(void)
 {
-   struct rd_render render = { .descriptor_arena = true, .draws.size = sizeof(struct rd_draw) };
-   struct rd_render next_render = render;
-   struct rd_pipeline pipeline = {0}, other_pipeline = {0};
-   uint64_t storage_generation = 7;
+   struct rd_render render = { .descriptor_arena = true };
    struct rd_command_buffer command = {
       .vk.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .render = &render,
-      .gfx_pipeline = &pipeline, .gfx_descriptor_bind_generation = 3,
    };
    assert(rd_draw_descriptor_cache_enabled(&command, true));
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
-
-   command.bind[1].dynamic_offsets[0][1] = 32;
-   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1] = 64;
-   command.draw_descriptor_cache = (struct rd_draw_descriptor_cache) {
-      .render = &render, .pipeline = &pipeline, .bind_generation = 3,
-      .storage_generation = storage_generation, .draws_size = render.draws.size,
-      .offsets = {
-         { .count = 1, .entries = {{ .set = 0, .slot = 1, .value = 32 }} },
-         { .count = 1, .entries = {{ .set = RD_MAX_SETS - 1, .slot = RD_MAX_BINDINGS - 1, .value = 64 }} },
-      },
-   };
-   assert(rd_draw_descriptor_cache_hit(&command, storage_generation));
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation + 1));
-   command.gfx_descriptor_bind_generation++;
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
-   command.draw_descriptor_cache.bind_generation = command.gfx_descriptor_bind_generation;
-   command.bind[1].dynamic_offsets[0][1]++;
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
-   command.bind[1].dynamic_offsets[0][1]--;
-   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1]++;
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
-   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1]--;
-   command.gfx_pipeline = &other_pipeline;
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
-   command.gfx_pipeline = &pipeline;
-   command.render = &next_render;
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
-   command.render = &render;
-   render.draws.size += sizeof(struct rd_draw);
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
-   render.draws.size -= sizeof(struct rd_draw);
-   assert(rd_draw_descriptor_cache_hit(&command, storage_generation));
-
+   draw_descriptor_cache_option = false;
+   assert(!rd_draw_descriptor_cache_enabled(&command, true));
+   assert(render.descriptor_arena);
+   draw_descriptor_cache_option = true;
+   assert(rd_draw_descriptor_cache_enabled(&command, true));
    assert(!rd_draw_descriptor_cache_enabled(&command, false));
    render.descriptor_arena = false;
    assert(!rd_draw_descriptor_cache_enabled(&command, true));
@@ -372,10 +383,144 @@ static void test_draw_descriptor_cache(void)
    command.vk.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
    assert(!rd_draw_descriptor_cache_enabled(&command, true));
    command.vk.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+   command.render = NULL;
+   assert(!rd_draw_descriptor_cache_enabled(&command, true));
+}
+
+static void test_draw_descriptor_cache(void)
+{
+   struct rd_render render = { .descriptor_arena = true, .draws.size = sizeof(struct rd_draw) };
+   struct rd_render next_render = render;
+   struct rd_pipeline pipeline = {0}, other_pipeline = {0};
+   struct rd_device device = {0};
+   struct rd_descriptor_set first = {0}, last = {0};
+   rd_descriptor_set_init_version(&device, &first);
+   rd_descriptor_set_init_version(&device, &last);
+   struct rd_command_buffer command = {
+      .vk.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .render = &render,
+      .gfx_pipeline = &pipeline, .gfx_descriptor_bind_generation = 3,
+      .bind[1].sets = { [0] = &first, [RD_MAX_SETS - 1] = &last },
+   };
+   assert(!rd_draw_descriptor_cache_hit(&command));
+
+   command.bind[1].dynamic_offsets[0][1] = 32;
+   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1] = 64;
+   command.draw_descriptor_cache = (struct rd_draw_descriptor_cache) {
+       .render = &render, .pipeline = &pipeline, .bind_generation = 3,
+       .draws_size = render.draws.size,
+      .offsets = {
+         { .count = 1, .entries = {{ .set = 0, .slot = 1, .value = 32 }} },
+         { .count = 1, .entries = {{ .set = RD_MAX_SETS - 1, .slot = RD_MAX_BINDINGS - 1, .value = 64 }} },
+      },
+   };
+   rd_draw_descriptor_cache_track_set(&command.draw_descriptor_cache, 0, &first);
+   rd_draw_descriptor_cache_track_set(&command.draw_descriptor_cache, RD_MAX_SETS - 1, &last);
+   assert(rd_draw_descriptor_cache_hit(&command));
+   command.gfx_descriptor_bind_generation++;
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   command.draw_descriptor_cache.bind_generation = command.gfx_descriptor_bind_generation;
+   command.bind[1].dynamic_offsets[0][1]++;
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   command.bind[1].dynamic_offsets[0][1]--;
+   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1]++;
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1]--;
+   command.gfx_pipeline = &other_pipeline;
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   command.gfx_pipeline = &pipeline;
+   command.render = &next_render;
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   command.render = &render;
+   render.draws.size += sizeof(struct rd_draw);
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   render.draws.size -= sizeof(struct rd_draw);
+   command.bind[1].sets[0] = NULL;
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   command.bind[1].sets[0] = &first;
+   assert(rd_draw_descriptor_cache_hit(&command));
+
    /* Reset and secondary execution discard the entry even if the other key
     * fields would still match. */
    rd_invalidate_draw_descriptor_cache(&command);
-   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+   assert(!rd_draw_descriptor_cache_hit(&command));
+   assert(!command.draw_descriptor_cache.set_mask);
+}
+
+static void test_draw_descriptor_set_generations(void)
+{
+   const VkDescriptorType combined = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+   struct vk_sampler_state immutable = { .words = { 17 } };
+   struct rd_set_layout src_layout = {
+      .descriptor_count = 1, .binding_count = 1,
+      .bindings = {{ .count = 1, .type = combined, .immutable_offset = UINT32_MAX }},
+   };
+   struct rd_set_layout dst_layout = src_layout;
+   dst_layout.immutable_count = 1;
+   dst_layout.immutable_sampler_states = &immutable;
+   dst_layout.bindings[0].immutable_offset = 0;
+   struct rd_device device = {0};
+   struct rd_descriptor_set src = { .layout = &src_layout }, dst = { .layout = &dst_layout };
+   rd_descriptor_set_init_version(&device, &src);
+   rd_descriptor_set_init_version(&device, &dst);
+   struct rd_render render = { .draws.size = sizeof(struct rd_draw) };
+   struct rd_pipeline pipeline = {0}, other_pipeline = {0};
+   struct rd_command_buffer a = {
+      .render = &render, .gfx_pipeline = &pipeline,
+      .bind[1].sets = { &src, &dst },
+      .draw_descriptor_cache = { .render = &render, .pipeline = &pipeline,
+                                 .draws_size = render.draws.size },
+   };
+   struct rd_command_buffer b = a;
+   b.gfx_pipeline = b.draw_descriptor_cache.pipeline = &other_pipeline;
+   rd_draw_descriptor_cache_track_set(&a.draw_descriptor_cache, 0, &src);
+   rd_draw_descriptor_cache_track_set(&b.draw_descriptor_cache, 1, &dst);
+   assert(rd_draw_descriptor_cache_hit(&a) && rd_draw_descriptor_cache_hit(&b));
+
+   struct rd_descriptor_set unrelated;
+   rd_descriptor_set_init_version(&device, &unrelated);
+   assert(rd_draw_descriptor_cache_hit(&a) && rd_draw_descriptor_cache_hit(&b));
+   /* Model a fresh allocation reusing dst's address after free or pool reset.
+    * The generation starts at zero again, but the allocation serial differs. */
+   rd_descriptor_set_init_version(&device, &dst);
+   assert(!dst.version.generation && rd_draw_descriptor_cache_hit(&a));
+   assert(!rd_draw_descriptor_cache_hit(&b));
+   b.draw_descriptor_cache.set_mask = 0;
+   rd_draw_descriptor_cache_track_set(&b.draw_descriptor_cache, 1, &dst);
+
+   struct rd_image_view view = {0}, other_view = {0};
+   struct rd_sampler sampler = { .state.words = { 5 } };
+   VkDescriptorImageInfo image = {
+      .imageView = RD_TEST_HANDLE(VkImageView, &view),
+      .sampler = RD_TEST_HANDLE(VkSampler, &sampler),
+   };
+   VkWriteDescriptorSet write = {
+      .dstSet = RD_TEST_HANDLE(VkDescriptorSet, &src), .descriptorCount = 1,
+      .descriptorType = combined, .pImageInfo = &image,
+   };
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 1, &write, 0, NULL);
+   assert(src.descriptors[0].sampler[0] == 5);
+   assert(!rd_draw_descriptor_cache_hit(&a) && rd_draw_descriptor_cache_hit(&b));
+   a.draw_descriptor_cache.set_mask = 0;
+   rd_draw_descriptor_cache_track_set(&a.draw_descriptor_cache, 0, &src);
+
+   VkCopyDescriptorSet copy = {
+      .srcSet = write.dstSet, .dstSet = RD_TEST_HANDLE(VkDescriptorSet, &dst),
+      .descriptorCount = 1,
+   };
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 0, NULL, 1, &copy);
+   assert(dst.descriptors[0].image_view == &view && dst.descriptors[0].sampler[0] == 17);
+   assert(rd_draw_descriptor_cache_hit(&a) && !rd_draw_descriptor_cache_hit(&b));
+   b.draw_descriptor_cache.set_mask = 0;
+   rd_draw_descriptor_cache_track_set(&b.draw_descriptor_cache, 1, &dst);
+
+   struct vk_descriptor_update_template update = {
+      .entry_count = 1, .entries = {{ .type = combined, .array_count = 1 }},
+   };
+   image.imageView = RD_TEST_HANDLE(VkImageView, &other_view);
+   rd_UpdateDescriptorSetWithTemplate(VK_NULL_HANDLE, copy.dstSet,
+      RD_TEST_HANDLE(VkDescriptorUpdateTemplate, &update), &image);
+   assert(dst.descriptors[0].image_view == &other_view && dst.descriptors[0].sampler[0] == 17);
+   assert(rd_draw_descriptor_cache_hit(&a) && !rd_draw_descriptor_cache_hit(&b));
 }
 
 struct rd_image_transfer {
@@ -455,8 +600,6 @@ static void test_ring_backings(void)
    assert(!rd_ring_backings(&ring.base, bos, 1, &count, &bytes));
 }
 
-#include "descriptor_span_under_test.h"
-
 #include "submit_diag_under_test.h"
 
 static void test_render_query_before_work(void)
@@ -507,9 +650,9 @@ static void test_descriptor_span(void)
       .descriptor_count = 6,
       .binding_count = 3,
       .bindings = {
-         {0, 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE},
-         {2, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-         {4, 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER},
+         { .slot = 0, .count = 2, .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE },
+         { .slot = 2, .count = 2, .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER },
+         { .slot = 4, .count = 2, .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER },
       },
    };
    assert(rd_descriptor_span_valid(&layout, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2));
@@ -835,7 +978,8 @@ int main(void)
    test_descriptor_span();
    test_query_range(); test_vertex_input();
    test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();
-   test_dispatch_preflight(); test_draw_descriptor_cache();
+   test_dispatch_preflight(); test_draw_descriptor_cache_enabled();
+   test_draw_descriptor_cache(); test_draw_descriptor_set_generations();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -843,6 +987,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, draw descriptor cache, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, draw descriptor cache and set generations, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }

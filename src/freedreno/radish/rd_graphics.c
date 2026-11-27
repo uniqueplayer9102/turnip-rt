@@ -50,6 +50,7 @@ DEBUG_GET_ONCE_NUM_OPTION(gmem_min_draws, "RADISH_GMEM_MIN_DRAWS", 4)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_fp16_bin_w, "RADISH_GMEM_FP16_BIN_W", 0)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_fp16_bin_h, "RADISH_GMEM_FP16_BIN_H", 0)
 DEBUG_GET_ONCE_BOOL_OPTION(descriptor_arena, "RADISH_DESCRIPTOR_ARENA", true)
+DEBUG_GET_ONCE_BOOL_OPTION(draw_descriptor_cache, "RADISH_DRAW_DESCRIPTOR_CACHE", true)
 
 enum ir3_wavesize_option
 rd_fragment_wavesize(void)
@@ -777,13 +778,24 @@ rd_CmdBindIndexBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offs
    command->index_type = type;
 }
 
+static void
+rd_draw_descriptor_cache_track_set(struct rd_draw_descriptor_cache *cache, unsigned index,
+                                   const struct rd_descriptor_set *set)
+{
+   const uint32_t bit = 1u << index;
+   if (!(cache->set_mask & bit)) {
+      cache->set_mask |= bit;
+      cache->set_versions[index] = set->version;
+   }
+}
+
 static bool
 rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *render,
-                          const struct rd_pipeline *stage,
-                          struct rd_stage_dynamic_offsets *offsets,
-                          struct rd_descriptor **out)
+                          const struct rd_pipeline *stage, unsigned stage_index,
+                          struct rd_draw_descriptor_cache *cache, struct rd_descriptor **out)
 {
    *out = NULL;
+   struct rd_stage_dynamic_offsets *offsets = cache ? &cache->offsets[stage_index] : NULL;
    if (offsets)
       offsets->count = 0;
    if (!stage->resource_count)
@@ -826,6 +838,8 @@ rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *r
          rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return false;
       }
+      if (cache)
+         rd_draw_descriptor_cache_track_set(cache, index, set);
       copy[i] = set->descriptors[resource->logical_slot];
       if (copy[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
           copy[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
@@ -1032,22 +1046,31 @@ rd_draw_descriptor_cache_enabled(const struct rd_command_buffer *command, bool o
    /* Successful snapshots reference immutable views and already-bound
     * non-sparse resources. Only share the snapshot memory in its own arena. */
    return ordinary && command->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
-          command->render && command->render->descriptor_arena;
+          command->render && command->render->descriptor_arena &&
+          debug_get_option_draw_descriptor_cache();
 }
 
 static bool
-rd_draw_descriptor_cache_hit(const struct rd_command_buffer *command,
-                             uint64_t storage_generation)
+rd_draw_descriptor_cache_hit(const struct rd_command_buffer *command)
 {
    const struct rd_draw_descriptor_cache *cache = &command->draw_descriptor_cache;
    if (!cache->render || cache->render != command->render ||
        cache->pipeline != command->gfx_pipeline ||
        cache->bind_generation != command->gfx_descriptor_bind_generation ||
-       cache->storage_generation != storage_generation ||
        cache->draws_size != command->render->draws.size)
       return false;
 
    const struct rd_bind_state *bound = &command->bind[1];
+   /* As for a fresh snapshot, referenced bindings must be live: freeing one
+    * (including by pool reset) invalidates any command buffer using it. */
+   for (unsigned i = 0; i < RD_MAX_SETS; i++) {
+      if (!(cache->set_mask & (1u << i)))
+         continue;
+      const struct rd_descriptor_set *set = bound->sets[i];
+      if (!set || set->version.serial != cache->set_versions[i].serial ||
+          set->version.generation != cache->set_versions[i].generation)
+         return false;
+   }
    for (unsigned s = 0; s < 2; s++) {
       const struct rd_stage_dynamic_offsets *offsets = &cache->offsets[s];
       for (unsigned i = 0; i < offsets->count; i++) {
@@ -1101,21 +1124,18 @@ rd_record_draw(struct rd_command_buffer *command, bool ordinary)
    memcpy(draw.vertex_sizes, command->vertex_sizes, sizeof(draw.vertex_sizes));
    memcpy(draw.push, command->gfx_push, sizeof(draw.push));
    struct rd_render *render = command->render;
-   struct rd_draw_descriptor_cache *cache = &command->draw_descriptor_cache;
-   struct rd_device *device = container_of(command->vk.base.device, struct rd_device, vk);
-   const bool cache_enabled = rd_draw_descriptor_cache_enabled(command, ordinary);
-   const uint64_t storage_generation = cache_enabled ?
-      p_atomic_read(&device->descriptor_storage_generation) : 0;
-   const bool cache_hit = cache_enabled && rd_draw_descriptor_cache_hit(command, storage_generation);
+   struct rd_draw_descriptor_cache *cache = rd_draw_descriptor_cache_enabled(command, ordinary) ?
+      &command->draw_descriptor_cache : NULL;
+   const bool cache_hit = cache && rd_draw_descriptor_cache_hit(command);
    if (cache_hit) {
       memcpy(draw.descriptors, cache->descriptors, sizeof(draw.descriptors));
    } else {
-      if (cache_enabled)
+      if (cache)
          rd_invalidate_draw_descriptor_cache(command);
-      if (!rd_copy_stage_descriptors(command, render, pipeline->gfx->vs.res,
-                                     cache_enabled ? &cache->offsets[0] : NULL, &draw.descriptors[0]) ||
-          !rd_copy_stage_descriptors(command, render, pipeline->gfx->fs.res,
-                                     cache_enabled ? &cache->offsets[1] : NULL, &draw.descriptors[1])) {
+      if (!rd_copy_stage_descriptors(command, render, pipeline->gfx->vs.res, 0,
+                                     cache, &draw.descriptors[0]) ||
+          !rd_copy_stage_descriptors(command, render, pipeline->gfx->fs.res, 1,
+                                     cache, &draw.descriptors[1])) {
          rd_render_free_descriptors(command, render, draw.descriptors[0]);
          rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return NULL;
@@ -1125,12 +1145,11 @@ rd_record_draw(struct rd_command_buffer *command, bool ordinary)
    if (!recorded) {
       rd_render_free_descriptors(command, render, draw.descriptors[0]);
       rd_render_free_descriptors(command, render, draw.descriptors[1]);
-   } else if (cache_enabled) {
+   } else if (cache) {
       if (!cache_hit) {
          cache->render = render;
          cache->pipeline = pipeline;
          cache->bind_generation = command->gfx_descriptor_bind_generation;
-         cache->storage_generation = storage_generation;
          memcpy(cache->descriptors, draw.descriptors, sizeof(cache->descriptors));
       }
       cache->draws_size = render->draws.size;

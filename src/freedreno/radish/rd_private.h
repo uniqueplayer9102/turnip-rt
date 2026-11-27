@@ -120,8 +120,8 @@ struct rd_device {
    uint32_t seqno;
    uint64_t submit_count;
    uint64_t vk_submit_id;
-   /* Updated atomically by the host descriptor APIs. */
-   uint64_t descriptor_storage_generation;
+   /* Allocation identity only; incremented atomically across pools. */
+   uint64_t descriptor_set_serial;
    uint64_t faults;
    struct rd_submit_window submit_window;
    int submit_in_fence_fd;
@@ -204,11 +204,16 @@ struct rd_descriptor_pool {
    VkAllocationCallbacks alloc;
    uint32_t max_sets, used_sets, max_descriptors, used_descriptors;
 };
+struct rd_descriptor_set_version {
+   uint64_t serial; /* distinguishes allocations even at the same address */
+   uint64_t generation; /* descriptor writes are externally synchronized */
+};
 struct rd_descriptor_set {
    struct vk_object_base base;
    struct list_head link;
    struct rd_descriptor_pool *pool;
    struct rd_set_layout *layout;
+   struct rd_descriptor_set_version version;
    struct rd_descriptor descriptors[];
 };
 struct rd_pipeline;
@@ -416,9 +421,11 @@ struct rd_stage_dynamic_offsets {
 struct rd_draw_descriptor_cache {
    const struct rd_render *render;
    const struct rd_pipeline *pipeline;
-   uint64_t bind_generation, storage_generation;
+   uint64_t bind_generation;
    /* Only reuse snapshots when no other draw has been appended. */
    unsigned draws_size;
+   uint32_t set_mask; /* sets actually snapshotted by either stage */
+   struct rd_descriptor_set_version set_versions[RD_MAX_SETS];
    struct rd_descriptor *descriptors[2];
    struct rd_stage_dynamic_offsets offsets[2];
 };
@@ -456,6 +463,7 @@ static inline void
 rd_invalidate_draw_descriptor_cache(struct rd_command_buffer *command)
 {
    command->draw_descriptor_cache.render = NULL;
+   command->draw_descriptor_cache.set_mask = 0;
 }
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(rd_set_layout, vk.base, VkDescriptorSetLayout, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
