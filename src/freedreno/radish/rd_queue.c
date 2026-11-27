@@ -39,6 +39,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(submit_timing, "RADISH_SUBMIT_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(wait_timing, "RADISH_WAIT_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(fence_debug, "RADISH_FENCE_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(submit_diag, "RADISH_SUBMIT_DIAG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(a506_rb_dp2_workaround, "RADISH_A506_RB_DP2_WORKAROUND", true)
+DEBUG_GET_ONCE_BOOL_OPTION(deferred_resource_diagnostics, "RADISH_RESOURCE_DIAGNOSTICS", false)
+DEBUG_GET_ONCE_BOOL_OPTION(async_queue_sync_debug, "RADISH_ASYNC_QUEUE_SYNC_DEBUG", false)
 
 static const char *rd_drain_names[RD_DRAIN_COUNT] = {
    "cpu", "final", "capacity", "signal", "fallback", "error", "trace",
@@ -201,7 +204,7 @@ uint32_t
 rd_rb_debug_eco_cntl(const struct rd_device *device)
 {
    bool workaround = fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) == 506 &&
-      debug_get_bool_option("RADISH_A506_RB_DP2_WORKAROUND", true);
+      debug_get_option_a506_rb_dp2_workaround();
    return 0x00100000 | COND(workaround, 0x00000200);
 }
 
@@ -498,7 +501,8 @@ rd_emit_driver_params(struct fd_ringbuffer *ring, const struct rd_dispatch *disp
          .local_group_size_z = v->local_size[2],
       };
       unsigned base = state->allocs.consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4 * 4;
-      unsigned size = MIN2(state->num_driver_params, v->constlen * 4 - base);
+      unsigned available = base < v->constlen * 4 ? v->constlen * 4 - base : 0;
+      unsigned size = MIN2(state->num_driver_params, available);
       if (size)
          emit_const(ring, base, size, (const uint32_t *)&params);
    }
@@ -743,7 +747,7 @@ rd_window_report(const char *action, const char *reason,
                  const struct rd_submit_window *window, VkResult result)
 {
    static int counter;
-   if (!debug_get_bool_option("TRANSCRIBE_RESOURCE_DIAGNOSTICS", false) ||
+   if (!debug_get_option_deferred_resource_diagnostics() ||
        p_atomic_inc_return(&counter) > 256)
       return;
    fprintf(stderr, "RADISH_DEFERRED_%s slots=%u chunks=%u cs_bytes=%u bo_refs=%u metadata_bytes=%zu backing_bytes=%u reason=%s result=%d\n",
@@ -957,7 +961,7 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
                                 bool small_copies, const struct rd_command **last_work,
                                 uint32_t *last_work_buffer)
 {
-   bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   bool debug = debug_get_option_async_queue_sync_debug();
    bool supported = true;
    if (vk_queue_submit_has_bind(submit))
       return false;
@@ -1123,7 +1127,7 @@ static bool
 rd_async_syncs_supported(struct rd_device *device,
                         const struct vk_queue_submit *submit)
 {
-   bool debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   bool debug = debug_get_option_async_queue_sync_debug();
    for (uint32_t i = 0; i < submit->wait_count; i++) {
       const struct vk_sync_wait *wait = &submit->waits[i];
       if (!rd_sync_value_supported(device, wait->sync, wait->wait_value,
@@ -2747,7 +2751,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    device->publish_signal_fence = !async &&
       rd_publish_signal_fences(async_requested, profile, device->trace != NULL,
                                softpin, submit->signal_count);
-   bool async_debug = debug_get_bool_option("RADISH_ASYNC_QUEUE_SYNC_DEBUG", false);
+   bool async_debug = debug_get_option_async_queue_sync_debug();
    if (async_requested && async_debug && !async)
       fprintf(stderr, "RADISH_ASYNC_SYNC_SKIP profile=%u trace=%u commands=%u syncs=%u pending-fd=%u waits=%u signals=%u\n",
               profile, device->trace != NULL, commands_supported, syncs_supported,

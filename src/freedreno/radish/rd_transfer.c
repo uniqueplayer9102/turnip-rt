@@ -55,6 +55,10 @@ rd_CmdFillBuffer(VkCommandBuffer handle, VkBuffer dst_handle, VkDeviceSize offse
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_buffer, dst, dst_handle);
+   if (!dst) {
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
    if (size == VK_WHOLE_SIZE && offset <= dst->vk.size)
       size = (dst->vk.size - offset) & ~3ull;
    if ((offset & 3) || (size & 3)) {

@@ -282,7 +282,8 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
          if (binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
              binding->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
             continue;
-         if (binding->count > dynamic_count - dynamic) {
+         if (dynamic > dynamic_count ||
+             binding->count > dynamic_count - dynamic) {
             rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
             return;
          }
@@ -299,7 +300,20 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
    VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void *values)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   if (offset > RD_MAX_PUSH_CONSTANTS_SIZE ||
+   VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
+   bool covered = size == 0;
+   if (size && pipeline_layout) {
+      for (uint32_t i = 0; i < pipeline_layout->push_range_count; i++) {
+         const VkPushConstantRange *range = &pipeline_layout->push_ranges[i];
+         if (offset >= range->offset && offset - range->offset <= range->size &&
+             size <= range->size - (offset - range->offset) &&
+             (stages & ~range->stageFlags) == 0) {
+            covered = true;
+            break;
+         }
+      }
+   }
+   if (!covered || (!values && size) || offset > RD_MAX_PUSH_CONSTANTS_SIZE ||
        size > RD_MAX_PUSH_CONSTANTS_SIZE - offset) {
       if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
          VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);

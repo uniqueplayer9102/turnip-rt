@@ -1183,7 +1183,16 @@ rd_record_indirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
                    uint32_t count, uint32_t stride, bool indexed)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   if (indexed && !command->index_buffer) {
+   VK_FROM_HANDLE(rd_buffer, indirect, buffer);
+   const VkDeviceSize command_size = indexed ? sizeof(VkDrawIndexedIndirectCommand) :
+                                              sizeof(VkDrawIndirectCommand);
+   if ((indexed && !command->index_buffer) || !indirect || !indirect->memory ||
+       !(indirect->vk.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) ||
+       (offset & 3) || stride < command_size || (stride & 3) ||
+       (count && (offset > indirect->vk.size ||
+                  indirect->vk.size - offset < command_size ||
+                  (VkDeviceSize)(count - 1) >
+                     (indirect->vk.size - offset - command_size) / stride))) {
       rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
@@ -1192,7 +1201,7 @@ rd_record_indirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
       if (!draw)
          return;
       draw->indexed = indexed;
-      draw->indirect = rd_buffer_from_handle(buffer);
+      draw->indirect = indirect;
       draw->indirect_offset = offset + (VkDeviceSize)i * stride;
    }
 }
@@ -2273,6 +2282,9 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_PKT4(ring, REG_A5XX_VFD_INDEX_OFFSET, 2);
    OUT_RING(ring, vertex_base);
    OUT_RING(ring, draw->first_instance);
+   if (draw->indexed && draw->index_type != VK_INDEX_TYPE_UINT16 &&
+       draw->index_type != VK_INDEX_TYPE_UINT32)
+      return false;
    uint32_t index_size = draw->index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
    bool restart = dyn->ia.primitive_restart_enable && draw->indexed;
    OUT_PKT4(ring, REG_A5XX_PC_RESTART_INDEX, 1);
@@ -2292,8 +2304,15 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
                         CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY);
    if (draw->indexed) {
       const struct rd_buffer *ib = draw->index_buffer;
-      VkDeviceSize offset = draw->index_offset + (VkDeviceSize)draw->first_index * index_size;
-      uint32_t max_indices = offset < ib->vk.size ? (ib->vk.size - offset) / index_size : 0;
+      VkDeviceSize first_offset = (VkDeviceSize)draw->first_index * index_size;
+      if (!ib || !ib->memory || first_offset > ib->vk.size - MIN2(draw->index_offset, ib->vk.size) ||
+          draw->index_offset > ib->vk.size)
+         return false;
+      VkDeviceSize offset = draw->index_offset + first_offset;
+      VkDeviceSize available = ib->vk.size - offset;
+      uint32_t max_indices = available / index_size;
+      if (draw->vertex_count > max_indices)
+         return false;
       OUT_PKT7(ring, CP_DRAW_INDX_OFFSET, 7);
       OUT_RING(ring, initiator | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) |
                      CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(index_size == 2 ? INDEX4_SIZE_16_BIT :

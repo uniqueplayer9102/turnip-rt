@@ -801,12 +801,27 @@ rd_image_layout(struct rd_image *image)
       struct rd_image_level *layout = &image->levels[level];
       layout->offset = size;
       VkExtent3D elements = vk_image_extent_to_elements(&image->vk, extent);
-      layout->row_pitch = align64((uint64_t)elements.width * image->texel_size * image->vk.samples, 64);
+      uint64_t row_bytes = elements.width;
+      if (image->texel_size && row_bytes > UINT64_MAX / image->texel_size)
+         return false;
+      row_bytes *= image->texel_size;
+      if (image->vk.samples && row_bytes > UINT64_MAX / image->vk.samples)
+         return false;
+      row_bytes *= image->vk.samples;
+      if (row_bytes > UINT64_MAX - 63)
+         return false;
+      layout->row_pitch = align64(row_bytes, 64);
+      if (elements.height && layout->row_pitch > UINT64_MAX / elements.height)
+         return false;
       layout->depth_pitch = layout->row_pitch * elements.height;
+      if (extent.depth && layout->depth_pitch > UINT64_MAX / extent.depth)
+         return false;
       layout->array_pitch = layout->depth_pitch * extent.depth;
       layout->size = layout->array_pitch;
+      if (image->vk.array_layers && layout->array_pitch > UINT64_MAX / image->vk.array_layers)
+         return false;
       VkDeviceSize level_size = layout->array_pitch * image->vk.array_layers;
-      if (level_size > limit - size)
+      if (size > limit || level_size > limit - size)
          return false;
       size += level_size;
    }
@@ -946,31 +961,42 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
          struct rd_image_level *level = plane ? &image->extra_planes[plane - 1].levels[0] : &image->levels[0];
          VkExtent3D extent = rd_image_plane_extent(image, plane, 0);
          uint32_t cpp = vk_format_get_blocksize(vk_format_get_plane_format(info->format, plane));
-         uint64_t row_bytes = (uint64_t)extent.width * cpp;
+         uint64_t row_bytes = extent.width;
+         if (cpp && row_bytes > UINT64_MAX / cpp)
+            goto invalid_ycbcr_layout;
+         row_bytes *= cpp;
          if (!explicit->rowPitch || explicit->rowPitch < row_bytes || explicit->rowPitch > 0x3fffffu ||
              explicit->rowPitch % (1u << native->pitchalign) || explicit->offset % 64 ||
              explicit->offset > RD_IMAGE_MAX_SIZE ||
-             extent.height > (RD_IMAGE_MAX_SIZE - explicit->offset) / explicit->rowPitch) {
-            vk_image_destroy(&device->vk, allocator, &image->vk);
-            return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
-         }
+             (extent.height && explicit->rowPitch > UINT64_MAX / extent.height))
+            goto invalid_ycbcr_layout;
          uint64_t size_bytes = explicit->rowPitch * extent.height;
+         uint64_t depth_pitch = explicit->depthPitch ? explicit->depthPitch : size_bytes;
+         uint64_t array_pitch = explicit->arrayPitch ? explicit->arrayPitch : size_bytes;
+         if (depth_pitch < size_bytes || array_pitch < depth_pitch ||
+             size_bytes > RD_IMAGE_MAX_SIZE - explicit->offset ||
+             array_pitch > RD_IMAGE_MAX_SIZE - explicit->offset)
+            goto invalid_ycbcr_layout;
+         uint64_t end = explicit->offset + array_pitch;
          for (uint32_t previous = 0; previous < plane; previous++) {
             const struct rd_image_level *other = rd_image_plane_level(image, previous, 0);
-            if (explicit->offset < other->offset + other->size && other->offset < explicit->offset + size_bytes) {
-               vk_image_destroy(&device->vk, allocator, &image->vk);
-               return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
-            }
+            if (explicit->offset < other->offset + other->size && other->offset < end)
+               goto invalid_ycbcr_layout;
          }
          *level = (struct rd_image_level) {
-            .offset = explicit->offset, .row_pitch = explicit->rowPitch, .depth_pitch = size_bytes,
-            .array_pitch = size_bytes, .size = size_bytes,
+            .offset = explicit->offset, .row_pitch = explicit->rowPitch, .depth_pitch = depth_pitch,
+            .array_pitch = array_pitch, .size = array_pitch,
          };
          native->pitch0 = explicit->rowPitch;
-         native->slices[0].size0 = size_bytes;
-         native->layer_size = size_bytes;
-         native->size = size_bytes;
-         size = MAX2(size, explicit->offset + size_bytes);
+         native->slices[0].size0 = depth_pitch;
+         native->layer_size = array_pitch;
+         native->size = array_pitch;
+         size = MAX2(size, end);
+         continue;
+
+invalid_ycbcr_layout:
+         vk_image_destroy(&device->vk, allocator, &image->vk);
+         return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
       }
       image->size = size;
    } else if (modifier_explicit) {

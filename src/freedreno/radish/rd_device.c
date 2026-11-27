@@ -141,6 +141,8 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
    if (result != VK_SUCCESS)
       goto fail;
    queue_initialized = true;
+   simple_mtx_init(&device->query_mutex, mtx_plain);
+   device->query_mutex_initialized = true;
    device->queue.driver_submit = rd_queue_submit;
    device->vk.command_buffer_ops = &rd_command_buffer_ops;
    device->info = fd_dev_info(fd_pipe_dev_id(device->pipe));
@@ -180,6 +182,8 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
 fail:
    if (queue_initialized)
       vk_queue_finish(&device->queue);
+   if (device->query_mutex_initialized)
+      simple_mtx_destroy(&device->query_mutex);
    if (meta_initialized) {
       rd_trace_finish(device);
       simple_mtx_destroy(&device->meta_mutex);
@@ -210,6 +214,7 @@ rd_DestroyDevice(VkDevice handle, const VkAllocationCallbacks *allocator)
    rd_queue_drain_pending(device);
    rd_meta_finish(device);
    simple_mtx_destroy(&device->meta_mutex);
+   simple_mtx_destroy(&device->query_mutex);
    rd_trace_finish(device);
    fd_bo_del(device->border_colors);
    fd_bo_del(device->control);

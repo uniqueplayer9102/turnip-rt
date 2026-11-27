@@ -98,9 +98,13 @@ rd_DestroyQueryPool(VkDevice handle, VkQueryPool pool_handle,
    VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
    if (!pool)
       return;
+   simple_mtx_lock(&device->query_mutex);
+   mtx_lock(&pool->mutex);
    for (uint32_t i = 0; i < pool->vk.query_count; i++)
       if (pool->slots[i].active)
-         list_del(&pool->slots[i].active_link);
+         list_delinit(&pool->slots[i].active_link);
+   mtx_unlock(&pool->mutex);
+   simple_mtx_unlock(&device->query_mutex);
    if (pool->bo)
       fd_bo_del(pool->bo);
    cnd_destroy(&pool->condition);
@@ -337,12 +341,14 @@ rd_query_account_dispatch(struct rd_device *device,
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;
    uint64_t invocations = (uint64_t)dispatch->grid[0] * dispatch->grid[1] *
       dispatch->grid[2] * v->local_size[0] * v->local_size[1] * v->local_size[2];
+   simple_mtx_lock(&device->query_mutex);
    list_for_each_entry(struct rd_query_slot, slot, &device->active_queries, active_link) {
       struct rd_query_pool *pool = slot->pool;
       mtx_lock(&pool->mutex);
       slot->values[10] += invocations;
       mtx_unlock(&pool->mutex);
    }
+   simple_mtx_unlock(&device->query_mutex);
 }
 
 VkResult
@@ -384,6 +390,7 @@ rd_execute_query(struct rd_device *device, enum rd_command_type type,
       return VK_SUCCESS;
    }
    VkResult result = VK_SUCCESS;
+   simple_mtx_lock(&device->query_mutex);
    mtx_lock(&pool->mutex);
    for (uint32_t i = 0; i < command->count; i++) {
       struct rd_query_slot *slot = &pool->slots[command->first + i];
@@ -411,6 +418,7 @@ rd_execute_query(struct rd_device *device, enum rd_command_type type,
       }
    }
    mtx_unlock(&pool->mutex);
+   simple_mtx_unlock(&device->query_mutex);
    return result;
 }
 
@@ -418,9 +426,11 @@ rd_execute_query(struct rd_device *device, enum rd_command_type type,
 VKAPI_ATTR void VKAPI_CALL
 rd_ResetQueryPool(VkDevice handle, VkQueryPool pool_handle, uint32_t first, uint32_t count)
 {
+   VK_FROM_HANDLE(rd_device, device, handle);
    VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
    if (!rd_query_range(pool, first, count))
       return;
+   simple_mtx_lock(&device->query_mutex);
    mtx_lock(&pool->mutex);
    for (uint32_t i = 0; i < count; i++) {
       struct rd_query_slot *slot = &pool->slots[first + i];
@@ -432,4 +442,5 @@ rd_ResetQueryPool(VkDevice handle, VkQueryPool pool_handle, uint32_t first, uint
       slot->available = false;
    }
    mtx_unlock(&pool->mutex);
+   simple_mtx_unlock(&device->query_mutex);
 }

@@ -133,6 +133,8 @@ struct rd_device {
    bool gmem_size_valid;
    char *gmem_disable_file;
    struct list_head active_queries;
+   simple_mtx_t query_mutex;
+   bool query_mutex_initialized;
    uint32_t queue_priority;
    struct rd_trace *trace;
    simple_mtx_t meta_mutex;
