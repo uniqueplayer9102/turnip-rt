@@ -505,6 +505,9 @@ void rd_wsi_finish(struct rd_physical_device *physical);
 void rd_meta_finish(struct rd_device *device);
 VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render,
                            struct rd_submit_window *window);
+bool rd_render_batch_supported(struct rd_device *device, const struct rd_render *render);
+VkResult rd_execute_render_batch(struct rd_device *device, const struct rd_command *commands,
+                                 unsigned count, struct rd_submit_window *window);
 VkResult rd_finish_window_submit(struct rd_device *device,
                                  struct fd_submit *submit,
                                  struct fd_ringbuffer *ring,

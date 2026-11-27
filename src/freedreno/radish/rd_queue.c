@@ -35,6 +35,8 @@ DEBUG_GET_ONCE_NUM_OPTION(tiled_batch_chunks, "RADISH_TILED_BATCH_CHUNKS", 1)
 DEBUG_GET_ONCE_NUM_OPTION(tiled_groups_x, "RADISH_TILED_GROUPS_X", 1)
 DEBUG_GET_ONCE_BOOL_OPTION(window_wait_oldest, "RADISH_WINDOW_WAIT_OLDEST", true)
 DEBUG_GET_ONCE_BOOL_OPTION(async_render_fence, "RADISH_ASYNC_RENDER_FENCE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(render_batch, "RADISH_RENDER_BATCH", false)
+DEBUG_GET_ONCE_BOOL_OPTION(render_batch_debug, "RADISH_RENDER_BATCH_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(compute_tail_fence, "RADISH_COMPUTE_TAIL_FENCE", false)
 DEBUG_GET_ONCE_BOOL_OPTION(submit_timing, "RADISH_SUBMIT_TIMING", false)
 DEBUG_GET_ONCE_BOOL_OPTION(wait_timing, "RADISH_WAIT_TIMING", false)
@@ -1101,6 +1103,30 @@ rd_render_exports_fence(const struct rd_render *render)
          return false;
    }
    return true;
+}
+
+/* Group consecutive query-free renders into one low-level submit. Barriers
+ * between them stay in the batch: the pass boundaries already keep cache
+ * maintenance in the command stream. */
+static unsigned
+rd_render_batch_count(struct rd_device *device, const struct rd_command *first,
+                      const struct rd_command *end, unsigned *renders)
+{
+   unsigned count = 0, nrenders = 0;
+   for (const struct rd_command *command = first; command < end; command++) {
+      if (command->type == RD_CMD_BARRIER) {
+         count++;
+         continue;
+      }
+      if (command->type != RD_CMD_RENDER || nrenders >= 4 ||
+          !rd_render_exports_fence(command->render) ||
+          !rd_render_batch_supported(device, command->render))
+         break;
+      count++;
+      nrenders++;
+   }
+   *renders = nrenders;
+   return count;
 }
 
 static bool
@@ -3028,12 +3054,32 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             result = rd_execute_query(device, recorded->type, &recorded->query);
          } else if (recorded->type == RD_CMD_RENDER) {
             int64_t render_start = debug_get_option_submit_timing() ? os_time_get_nano() : 0;
-            device->submit_out_fence = can_defer && async && submit->signal_count &&
-               i == last_work_buffer && recorded == last_work &&
-               rd_render_exports_fence(recorded->render) &&
-               debug_get_option_async_render_fence();
-            result = rd_execute_render(device, recorded->render,
-                                       can_defer ? window : NULL);
+            unsigned batched = 0, batched_renders = 0;
+            if (debug_get_option_render_batch() && can_defer && !device->trace)
+               batched = rd_render_batch_count(device, recorded,
+                  util_dynarray_end(&command->commands), &batched_renders);
+            if (batched && batched_renders > 1) {
+               if (debug_get_option_render_batch_debug())
+                  fprintf(stderr, "RADISH_RENDER_BATCH commands=%u renders=%u\n",
+                          batched, batched_renders);
+               bool batch_has_last_work = false;
+               for (unsigned k = 0; k < batched; k++)
+                  batch_has_last_work |= &recorded[k] == last_work;
+               device->submit_out_fence = async && submit->signal_count &&
+                  batch_has_last_work &&
+                  rd_render_exports_fence(last_work->render) &&
+                  debug_get_option_async_render_fence();
+               result = rd_execute_render_batch(device, recorded, batched,
+                                                can_defer ? window : NULL);
+               recorded += batched - 1;
+            } else {
+               device->submit_out_fence = can_defer && async && submit->signal_count &&
+                  i == last_work_buffer && recorded == last_work &&
+                  rd_render_exports_fence(recorded->render) &&
+                  debug_get_option_async_render_fence();
+               result = rd_execute_render(device, recorded->render,
+                                          can_defer ? window : NULL);
+            }
             device->submit_out_fence = false;
             if (debug_get_option_submit_timing())
                fprintf(stderr, "RADISH_RENDER_TIMING ns=%" PRId64 " depth_stencil=%u async=%u result=%d\n",

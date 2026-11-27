@@ -107,6 +107,8 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_GFX_CACHE` | `1` | `0`: `cache = VK_NULL_HANDLE` in [`rd_CreateGraphicsPipelines`](src/freedreno/radish/rd_graphics.c); `rd_pipeline_cache_restore` / `rd_pipeline_cache_store` |
 | `RADISH_GFX_CACHE_DEBUG` | `0` | `RADISH_GFX_CACHE stage=… enabled=… hit=…`: [`rd_gfx_compile`](src/freedreno/radish/rd_graphics.c) |
 | `RADISH_QUERY_FREE_RENDER` | `1` | allow the query-free render fast path |
+| `RADISH_RENDER_BATCH` | `0` | `1`: combine consecutive query-free color-only renders into one GPU submit when async sync is enabled |
+| `RADISH_RENDER_BATCH_DEBUG` | `0` | log batched render groups |
 | `RADISH_NO_COVERAGE_PASS` | `0` | disable the coverage pass used by some query paths |
 
 ### Transfers / copies

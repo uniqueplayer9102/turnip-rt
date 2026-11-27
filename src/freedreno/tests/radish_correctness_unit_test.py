@@ -81,6 +81,11 @@ def main():
     assert 'compute_deferred' not in queue
     assert 'rd_compute_can_defer(async, deferred,' in queue
     assert 'device->publish_signal_fence' in queue
+    assert 'RADISH_RENDER_BATCH' in queue
+    assert 'RADISH_RENDER_BATCH_DEBUG' in queue
+    assert 'rd_render_batch_count' in queue
+    assert 'rd_render_batch_supported' in graphics
+    assert 'rd_execute_render_batch' in graphics
     with tempfile.TemporaryDirectory(prefix='radish-correctness-unit-') as directory:
         directory = Path(directory)
         (directory / 'trace_defs_under_test.h').write_text(

@@ -9,7 +9,7 @@
  *
  * Work flow: vkCmdBeginRendering opens an rd_render recorded as one
  * RD_CMD_RENDER; draws append to it; at submit the whole render instance is
- * emitted into one ring and run synchronously, like a compute dispatch.
+ * emitted into a command ring.
  */
 #include "rd_private.h"
 #include "vk_nir_convert_ycbcr.h"
@@ -2790,9 +2790,14 @@ rd_render_detail_end(struct fd_ringbuffer *ring, struct fd_bo *bo, uint32_t inde
          index * sizeof(struct rd_render_detail_slot) + sizeof(uint64_t));
 }
 
+struct rd_render_batch {
+   struct fd_submit *submit;
+   struct fd_ringbuffer *ring;
+};
+
 static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
-                         struct rd_submit_window *window);
+                         struct rd_submit_window *window, const struct rd_render_batch *batch);
 
 static bool rd_execute_render_gmem_supported(struct rd_device *device,
                                         const struct rd_render *render);
@@ -2835,7 +2840,7 @@ rd_execute_render_view(struct rd_device *device, const struct rd_render *render,
    }
    if (gmem)
       return rd_execute_render_gmem(device, render, window);
-   return rd_execute_render_direct(device, render, window);
+   return rd_execute_render_direct(device, render, window, NULL);
 }
 
 static void
@@ -2997,7 +3002,7 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render,
 
 static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render,
-                         struct rd_submit_window *window)
+                         struct rd_submit_window *window, const struct rd_render_batch *batch)
 {
    uint32_t width = 0, height = 0;
    for (unsigned i = 0; i < render->color_count; i++) {
@@ -3038,14 +3043,21 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          rd_render_query_op(device, op);
       return width && height ? rd_render_resolves(device, render) : VK_SUCCESS;
    }
-   struct fd_submit *submit = fd_submit_new(device->pipe);
-   if (!submit)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0,
-      FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
-   if (!ring) {
-      fd_submit_del(submit);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_submit *submit;
+   struct fd_ringbuffer *ring;
+   if (batch) {
+      submit = batch->submit;
+      ring = batch->ring;
+   } else {
+      submit = fd_submit_new(device->pipe);
+      if (!submit)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      ring = fd_submit_new_ringbuffer(submit, 0,
+         FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+      if (!ring) {
+         fd_submit_del(submit);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
    }
    uint32_t *initial_ring_start = ring->start;
    rd_gfx_restore(ring, device);
@@ -3055,7 +3067,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
     * counting fragment-shader invocations active at that draw */
    unsigned ndraws = util_dynarray_num_elements(&render->draws, struct rd_draw);
    struct rd_gfx_program_cache program_cache = {0};
-   bool queries = rd_render_needs_query_accounting(device, render);
+   bool queries = !batch && rd_render_needs_query_accounting(device, render);
    size_t nalloc = ndraws ? ndraws : 1;
    int *slots = queries ? calloc(nalloc, sizeof(int)) : NULL;
    bool *coverage = queries ? calloc(nalloc, sizeof(bool)) : NULL;
@@ -3105,7 +3117,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       fprintf(stderr, "RADISH_RENDER_QUERY path=%s draws=%u counters=%u allocations=%u\n",
               queries ? "accounting" : "query-free", ndraws, counted, queries ? 3 : 0);
    int64_t timer_start = 0;
-   struct fd_bo *timer_bo = rd_render_timer_prepare(device, ring, &timer_start,
+   struct fd_bo *timer_bo = batch ? NULL : rd_render_timer_prepare(device, ring, &timer_start,
       render->color_count && render->color[0].view ? render->color[0].view->vk.format : 0,
       width, height);
    for (unsigned i = 0; i < ndraws; i++) {
@@ -3176,8 +3188,10 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       free(slots);
       free(resolved);
       free(coverage);
-      fd_ringbuffer_del(ring);
-      fd_submit_del(submit);
+      if (!batch) {
+         fd_ringbuffer_del(ring);
+         fd_submit_del(submit);
+      }
       return result;
    }
    OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
@@ -3191,6 +3205,8 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    if (timer_bo && debug_get_option_readonly_bo_tracking() &&
        fd_device_version(device->fd) >= FD_VERSION_SOFTPIN)
       fd_submit_set_bo_access(submit, timer_bo, FD_RELOC_FLAGS_INIT);
+   if (batch)
+      return VK_SUCCESS;
    device->render_timing_bo = timer_bo;
    device->render_timing_start_ns = timer_start;
    device->render_timing_gmem = false;
@@ -3240,6 +3256,57 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    return rd_render_resolves(device, render);
 }
 
+/* The queue already excludes layering, depth/stencil and resolves via
+ * rd_render_exports_fence. The remaining work must be entirely GPU-side. */
+bool
+rd_render_batch_supported(struct rd_device *device, const struct rd_render *render)
+{
+   unsigned draws = util_dynarray_num_elements(&render->draws, struct rd_draw);
+   if (!draws || draws > 16 || render->samples != VK_SAMPLE_COUNT_1_BIT ||
+       render->color_count != 1 || !render->color[0].view ||
+       debug_get_option_render_gpu_timing() || debug_get_option_render_gpu_detail() ||
+       rd_execute_render_gmem_supported(device, render) ||
+       rd_render_needs_query_accounting(device, render))
+      return false;
+   util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+      if (draw->indirect)
+         return false;
+   }
+   return true;
+}
+
+VkResult
+rd_execute_render_batch(struct rd_device *device, const struct rd_command *commands,
+                        unsigned count, struct rd_submit_window *window)
+{
+   struct fd_submit *submit = fd_submit_new(device->pipe);
+   if (!submit)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0,
+      FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+   if (!ring) {
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   const struct rd_render_batch batch = { submit, ring };
+   uint32_t *initial_ring_start = ring->start;
+   for (unsigned i = 0; i < count; i++) {
+      if (commands[i].type == RD_CMD_BARRIER) {
+         /* Each pass still ends in a CCU flush + cache wait and the next
+          * starts with an invalidate, including for input attachments. */
+         __sync_synchronize();
+         continue;
+      }
+      assert(commands[i].type == RD_CMD_RENDER);
+      VkResult result = rd_execute_render_direct(device, commands[i].render, NULL, &batch);
+      if (result != VK_SUCCESS) {
+         fd_ringbuffer_del(ring);
+         fd_submit_del(submit);
+         return result;
+      }
+   }
+   return rd_finish_window_submit(device, submit, ring, window, initial_ring_start, true);
+}
 
 /* --- color-only GMEM (tiled) render path --------------------------------- */
 
@@ -3716,7 +3783,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
    struct rd_gmem_layout l;
    if (!rd_gmem_layout_init(&l, image->texel_size, width, height,
                              info, device->gmem_size))
-      return rd_execute_render_direct(device, render, window);
+      return rd_execute_render_direct(device, render, window, NULL);
 
    uint32_t nbins_x = DIV_ROUND_UP(width, l.bin_w);
    uint32_t nbins_y = DIV_ROUND_UP(height, l.bin_h);
@@ -4926,7 +4993,7 @@ rd_copy_texels(struct rd_device *device, struct rd_image *src, uint32_t src_leve
    memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
    draw.descriptors[1] = &descriptor;
    VkResult result = rd_render_append_meta_draw(&render.draws, &draw) ?
-      rd_execute_render_direct(device, &render, window) : VK_ERROR_OUT_OF_HOST_MEMORY;
+      rd_execute_render_direct(device, &render, window, NULL) : VK_ERROR_OUT_OF_HOST_MEMORY;
    util_dynarray_fini(&render.draws);
    return result;
 }
@@ -5028,7 +5095,7 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
                segment.color[i].resolve = NULL;
          }
           if (result == VK_SUCCESS)
-             result = rd_execute_render_direct(device, &segment, window);
+             result = rd_execute_render_direct(device, &segment, window, NULL);
          util_dynarray_fini(&queries);
          if (result == VK_SUCCESS && !last && area.extent.width && area.extent.height)
             result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area,
