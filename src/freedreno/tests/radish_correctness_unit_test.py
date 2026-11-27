@@ -10,7 +10,7 @@ def extract(source, name, cpp=False):
     prefix = r'^static bool ' if cpp else (
         r'^(?:VKAPI_ATTR void VKAPI_CALL|(?:static (?:inline )?)?'
         r'(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|VkImageUsageFlags2KHR|nir_mem_access_size_align|'
-        r'const struct (?:rd_binding|vk_sampler_state) \*))\n')
+        r'const struct (?:rd_binding|vk_sampler_state|vk_ycbcr_conversion_state) \*))\n')
     match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
     return source[match.start():source.index('\n}', match.end()) + 3] + '\n'
@@ -127,12 +127,17 @@ def main():
         set_version = private[private.index('struct rd_descriptor_set_version {'):
                               private.index('struct rd_descriptor_set {')]
         (directory / 'descriptor_set_version_under_test.h').write_text(set_version)
+        conversion_h = (vk_runtime / 'vk_ycbcr_conversion.h').read_text()
+        conversion = conversion_h.index('struct vk_ycbcr_conversion_state {')
+        (directory / 'ycbcr_conversion_state_under_test.h').write_text(
+            conversion_h[conversion:conversion_h.index('\n};', conversion) + 3] + '\n')
         (directory / 'descriptor_updates_under_test.h').write_text(
             extract((vk_runtime / 'vk_buffer.h').read_text(), 'vk_buffer_range') + ''.join(
                 extract(descriptor, name) for name in (
                     'rd_descriptor_type_supported', 'rd_descriptor_layout_supported',
                     'rd_find_binding', 'rd_descriptor_span_valid', 'rd_immutable_sampler',
-                    'rd_descriptor_set_init_version', 'rd_validate_descriptor_conversion',
+                    'rd_descriptor_set_init_version', 'rd_sampler_ycbcr_conversion',
+                    'rd_ycbcr_conversions_match', 'rd_validate_descriptor_conversion',
                     'rd_write_descriptor', 'rd_UpdateDescriptorSets',
                     'rd_descriptor_template_data_valid', 'rd_UpdateDescriptorSetWithTemplate')))
         (directory / 'dispatch_preflight_under_test.h').write_text(

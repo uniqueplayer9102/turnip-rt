@@ -223,6 +223,13 @@ KHR_copy_commands2
 sync file import and export. `KHR_timeline_semaphore` is advertised when the
 render node's syncobj support includes the required timeline features.
 
+For YCbCr conversion, put the sampler in `pImmutableSamplers` on a combined
+image sampler binding and use an image view with the same conversion state.
+Vulkan requires the conversion to be fixed at pipeline creation
+([VUID 02738](https://docs.vulkan.org/refpages/latest/refpages/source/VkWriteDescriptorSet.html#VUID-VkWriteDescriptorSet-descriptorType-02738)).
+Radish logs an error and invalidates the affected descriptor on an
+incompatible write or copy.
+
 Push constants go to 256 bytes (Vulkan's minimum is 128), sized through
 `RD_MAX_PUSH_CONSTANTS_SIZE`.
 
@@ -281,9 +288,6 @@ unsupported hardware state:
   and geometry stages that use them are rejected at pipeline creation.
 - Sampled array and cube-array images whose layer pitch cannot be encoded by
   the native texture descriptor are rejected at image creation.
-- YCbCR conversion is resolved from immutable samplers at pipeline creation.
-  A combined image/sampler descriptor using a mutable sampler with a conversion
-  is rejected at draw time rather than sampled with incorrect plane expansion.
 
 ## Related repository
 

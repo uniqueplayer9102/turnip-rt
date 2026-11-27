@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "util/log.h"
 #include "util/u_atomic.h"
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
@@ -360,19 +361,43 @@ rd_FreeDescriptorSets(VkDevice handle, VkDescriptorPool pool, uint32_t count,
    return VK_SUCCESS;
 }
 
-static void
-rd_validate_descriptor_conversion(struct rd_descriptor *descriptor, const struct vk_sampler_state *immutable)
+static const struct vk_ycbcr_conversion_state *
+rd_sampler_ycbcr_conversion(const struct vk_sampler_state *sampler)
 {
-   bool converted = descriptor->image_view && descriptor->image_view->ycbcr;
-   bool immutable_conversion = immutable && immutable->has_ycbcr_conversion;
-   if (!converted && !immutable_conversion)
+   return sampler && sampler->has_ycbcr_conversion ? &sampler->ycbcr_conversion : NULL;
+}
+
+static bool
+rd_ycbcr_conversions_match(const struct vk_ycbcr_conversion_state *a,
+                           const struct vk_ycbcr_conversion_state *b)
+{
+   /* vk_ycbcr_conversion_state is initialized for bytewise comparison. */
+   return a && b ? !memcmp(a, b, sizeof(*a)) : a == b;
+}
+
+static void
+rd_validate_descriptor_conversion(struct rd_descriptor *descriptor,
+                                  const struct vk_ycbcr_conversion_state *view_conversion,
+                                  const struct vk_sampler_state *sampler, bool immutable)
+{
+   const struct vk_ycbcr_conversion_state *sampler_conversion = rd_sampler_ycbcr_conversion(sampler);
+   if (!view_conversion && !sampler_conversion)
       return;
-   if (descriptor->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !converted ||
-       !immutable_conversion || memcmp(&descriptor->image_view->conversion, &immutable->ycbcr_conversion,
-                                      sizeof(immutable->ycbcr_conversion))) {
-      descriptor->image_view = NULL;
-      descriptor->has_sampler = false;
-   }
+
+   /* For descriptor sets, the conversion must be fixed at pipeline creation
+    * (VUID-VkWriteDescriptorSet-descriptorType-02738). */
+   bool combined = descriptor->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+   const char *reason;
+   if (combined && !rd_ycbcr_conversions_match(view_conversion, sampler_conversion))
+      reason = "image view and sampler YCbCr conversions do not match";
+   else if (!immutable || !combined)
+      reason = "YCbCr conversion requires an immutable sampler in a combined image sampler binding";
+   else
+      return;
+
+   mesa_loge("radish: rejected descriptor: %s", reason);
+   descriptor->image_view = NULL;
+   descriptor->has_sampler = false;
 }
 
 static bool
@@ -385,6 +410,7 @@ rd_write_descriptor(struct rd_descriptor_set *set, uint32_t slot,
    if (!data)
       return false;
    struct rd_descriptor descriptor = { .type = type };
+   const struct vk_sampler_state *sampler_state = immutable;
    switch (type) {
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
@@ -412,20 +438,22 @@ rd_write_descriptor(struct rd_descriptor_set *set, uint32_t slot,
          descriptor.image_view = rd_image_view_from_handle(info.imageView);
       if (type == VK_DESCRIPTOR_TYPE_SAMPLER ||
           type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-         if (immutable) {
-            descriptor.has_sampler = true;
-            rd_sampler_descriptor(immutable, descriptor.sampler);
-         } else {
+         if (!immutable) {
             VK_FROM_HANDLE(rd_sampler, sampler, info.sampler);
-            descriptor.has_sampler = sampler != NULL;
             if (sampler)
-               rd_sampler_descriptor(&sampler->state, descriptor.sampler);
+               sampler_state = &sampler->state;
+         }
+         if (sampler_state) {
+            descriptor.has_sampler = true;
+            rd_sampler_descriptor(sampler_state, descriptor.sampler);
          }
       }
       break;
    }
    }
-   rd_validate_descriptor_conversion(&descriptor, immutable);
+   const struct vk_ycbcr_conversion_state *view_conversion =
+      descriptor.image_view && descriptor.image_view->ycbcr ? &descriptor.image_view->conversion : NULL;
+   rd_validate_descriptor_conversion(&descriptor, view_conversion, sampler_state, immutable != NULL);
    set->descriptors[slot] = descriptor;
    return true;
 }
@@ -480,15 +508,23 @@ rd_UpdateDescriptorSets(UNUSED VkDevice handle, uint32_t write_count,
                                     db->type, copies[i].descriptorCount))
          continue;
       uint32_t first = db->slot + copies[i].dstArrayElement;
-      memmove(&dst->descriptors[first],
-              &src->descriptors[sb->slot + copies[i].srcArrayElement],
+      uint32_t src_first = sb->slot + copies[i].srcArrayElement;
+      memmove(&dst->descriptors[first], &src->descriptors[src_first],
               copies[i].descriptorCount * sizeof(struct rd_descriptor));
       for (uint32_t j = 0; j < copies[i].descriptorCount; j++) {
          uint32_t slot = first + j;
+         struct rd_descriptor *descriptor = &dst->descriptors[slot];
          const struct vk_sampler_state *immutable = rd_immutable_sampler(dst->layout, slot);
          if (immutable) {
-            dst->descriptors[slot].has_sampler = true;
-            rd_sampler_descriptor(immutable, dst->descriptors[slot].sampler);
+            descriptor->has_sampler = true;
+            rd_sampler_descriptor(immutable, descriptor->sampler);
+         }
+         if (descriptor->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && descriptor->image_view) {
+            /* A copy may reference a destroyed view. Its conversion was
+             * checked on write, so use the source layout, not the view. */
+            const struct vk_sampler_state *source_sampler = rd_immutable_sampler(src->layout, src_first + j);
+            rd_validate_descriptor_conversion(descriptor, rd_sampler_ycbcr_conversion(source_sampler),
+                                              immutable, immutable != NULL);
          }
       }
       dst->version.generation++;

@@ -193,10 +193,12 @@ struct VkPipelineVertexInputDivisorStateCreateInfoEXT;
 #include "vertex_input_under_test.h"
 #include "query_range_under_test.h"
 
+#include "ycbcr_conversion_state_under_test.h"
 struct rd_binding { uint32_t slot, count, binding, immutable_offset; VkDescriptorType type; };
 struct vk_sampler_state {
    bool has_ycbcr_conversion;
-   uint32_t ycbcr_conversion, words[4];
+   struct vk_ycbcr_conversion_state ycbcr_conversion;
+   uint32_t words[4];
 };
 struct rd_set_layout {
    uint32_t descriptor_count, binding_count, immutable_count;
@@ -227,7 +229,7 @@ static unsigned fd_pipe_dev_id(const void *pipe) { return *(const unsigned *)pip
 static unsigned fd_dev_gpu_id(unsigned id) { return id; }
 static unsigned fd_device_version(const void *fd) { return *(const unsigned *)fd; }
 
-struct rd_image_view { bool ycbcr; uint32_t conversion; };
+struct rd_image_view { bool ycbcr; struct vk_ycbcr_conversion_state conversion; };
 struct rd_sampler { struct vk_sampler_state state; };
 struct rd_descriptor {
    VkDescriptorType type;
@@ -263,6 +265,11 @@ struct vk_descriptor_update_template {
 static void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4])
 {
    memcpy(words, state->words, sizeof(state->words));
+}
+static char descriptor_log[256];
+static void mesa_loge(const char *format, const char *reason)
+{
+   snprintf(descriptor_log, sizeof(descriptor_log), format, reason);
 }
 #include "descriptor_updates_under_test.h"
 
@@ -839,6 +846,119 @@ static void test_descriptor_span(void)
    assert(rd_descriptor_span_valid(&layout, 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0));
 }
 
+static void test_descriptor_ycbcr_conversion(void)
+{
+   const VkDescriptorType type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+   struct rd_image_view ycbcr_view = {
+      .ycbcr = true,
+      .conversion = {
+         .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+         .ycbcr_model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601,
+         .ycbcr_range = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW,
+         .mapping = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
+                      VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A },
+         .chroma_offsets = { VK_CHROMA_LOCATION_COSITED_EVEN, VK_CHROMA_LOCATION_MIDPOINT },
+         .chroma_filter = VK_FILTER_LINEAR,
+         .chroma_reconstruction = true,
+      },
+   };
+   struct rd_image_view plain_view = {0};
+   struct rd_sampler ycbcr_sampler = { .state = {
+      .has_ycbcr_conversion = true, .ycbcr_conversion = ycbcr_view.conversion, .words = { 17 },
+   } };
+   struct rd_sampler plain_sampler = { .state.words = { 5 } };
+   struct vk_sampler_state immutable = ycbcr_sampler.state;
+   struct rd_set_layout mutable_layout = {
+      .descriptor_count = 1, .binding_count = 1,
+      .bindings = {{ .count = 1, .type = type, .immutable_offset = UINT32_MAX }},
+   };
+   struct rd_set_layout immutable_layout = mutable_layout;
+   immutable_layout.immutable_count = 1;
+   immutable_layout.immutable_sampler_states = &immutable;
+   immutable_layout.bindings[0].immutable_offset = 0;
+   struct rd_descriptor_set dst = { .layout = &mutable_layout };
+   struct rd_descriptor *desc = &dst.descriptors[0];
+   VkDescriptorImageInfo image = {
+      .imageView = RD_TEST_HANDLE(VkImageView, &plain_view),
+      .sampler = RD_TEST_HANDLE(VkSampler, &plain_sampler),
+   };
+   VkWriteDescriptorSet write = {
+      .dstSet = RD_TEST_HANDLE(VkDescriptorSet, &dst), .descriptorCount = 1,
+      .descriptorType = type, .pImageInfo = &image,
+   };
+
+   /* An ordinary mutable combined descriptor is unchanged. Replacing it
+    * with a converted sampler and an unconverted view must invalidate it. */
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 1, &write, 0, NULL);
+   assert(desc->image_view == &plain_view && desc->has_sampler && desc->sampler[0] == 5);
+   image.sampler = RD_TEST_HANDLE(VkSampler, &ycbcr_sampler);
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 1, &write, 0, NULL);
+   assert(!desc->image_view && !desc->has_sampler && dst.version.generation == 2);
+   assert(strstr(descriptor_log, "conversions do not match"));
+
+   /* Matching values do not make a converted mutable binding valid. */
+   image.imageView = RD_TEST_HANDLE(VkImageView, &ycbcr_view);
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 1, &write, 0, NULL);
+   assert(!desc->image_view && !desc->has_sampler);
+   assert(strstr(descriptor_log, "requires an immutable sampler"));
+   ycbcr_sampler.state.ycbcr_conversion.mapping[0] = VK_COMPONENT_SWIZZLE_B;
+   ycbcr_sampler.state.ycbcr_conversion.mapping[2] = VK_COMPONENT_SWIZZLE_R;
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 1, &write, 0, NULL);
+   assert(!desc->image_view && !desc->has_sampler);
+   assert(strstr(descriptor_log, "conversions do not match"));
+
+   /* An immutable sampler uses the layout state, not the ignored handle
+    * in the write. An independently stored, equal conversion is accepted. */
+   struct rd_descriptor_set src = { .layout = &immutable_layout };
+   write.dstSet = RD_TEST_HANDLE(VkDescriptorSet, &src);
+   descriptor_log[0] = '\0';
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 1, &write, 0, NULL);
+   assert(src.descriptors[0].image_view == &ycbcr_view && src.descriptors[0].has_sampler);
+   assert(src.descriptors[0].sampler[0] == 17 && !descriptor_log[0]);
+
+   struct vk_descriptor_update_template update = {
+      .entry_count = 1, .entries = {{ .type = type, .array_count = 1 }},
+   };
+   VkDescriptorUpdateTemplate update_handle = RD_TEST_HANDLE(VkDescriptorUpdateTemplate, &update);
+   struct rd_image_view wrong_view = ycbcr_view;
+   wrong_view.conversion.ycbcr_model = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709;
+   image.imageView = RD_TEST_HANDLE(VkImageView, &wrong_view);
+   rd_UpdateDescriptorSetWithTemplate(VK_NULL_HANDLE, write.dstSet, update_handle, &image);
+   assert(!src.descriptors[0].image_view && !src.descriptors[0].has_sampler);
+   assert(strstr(descriptor_log, "conversions do not match"));
+   image.imageView = RD_TEST_HANDLE(VkImageView, &ycbcr_view);
+   rd_UpdateDescriptorSetWithTemplate(VK_NULL_HANDLE, write.dstSet, update_handle, &image);
+   assert(src.descriptors[0].image_view == &ycbcr_view && src.descriptors[0].has_sampler);
+
+   /* Copying a converted descriptor must not bypass the destination
+    * binding's immutable requirement or its conversion comparison. */
+   VkCopyDescriptorSet copy = {
+      .srcSet = write.dstSet, .dstSet = RD_TEST_HANDLE(VkDescriptorSet, &dst), .descriptorCount = 1,
+   };
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 0, NULL, 1, &copy);
+   assert(!desc->image_view && !desc->has_sampler);
+
+   struct vk_sampler_state dst_sampler = immutable;
+   dst_sampler.words[0] = 29;
+   struct rd_set_layout dst_layout = immutable_layout;
+   dst_layout.immutable_sampler_states = &dst_sampler;
+   dst.layout = &dst_layout;
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 0, NULL, 1, &copy);
+   assert(desc->image_view == &ycbcr_view && desc->has_sampler && desc->sampler[0] == 29);
+   dst_sampler.ycbcr_conversion.chroma_filter = VK_FILTER_NEAREST;
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 0, NULL, 1, &copy);
+   assert(!desc->image_view && !desc->has_sampler);
+   assert(strstr(descriptor_log, "conversions do not match"));
+
+   /* The converted sampler cannot be used through a sampler-only binding. */
+   mutable_layout.bindings[0].type = write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+   dst.layout = &mutable_layout;
+   write.dstSet = copy.dstSet;
+   rd_UpdateDescriptorSets(VK_NULL_HANDLE, 1, &write, 0, NULL);
+   assert(!desc->has_sampler);
+   assert(strstr(descriptor_log, "combined image sampler binding"));
+}
+
 static void test_descriptor_template_data(void)
 {
    const VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -1212,6 +1332,7 @@ int main(void)
    test_ring_backings(); test_copy_side();
    test_render_query_before_work(); test_drain_index(); test_submit_diag_commands();
    test_descriptor_layout_bindings(); test_descriptor_span(); test_descriptor_template_data();
+   test_descriptor_ycbcr_conversion();
    test_clear_ds_recording();
    test_query_range(); test_vertex_input(); test_push_constants();
    test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();
@@ -1224,6 +1345,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor layouts, spans and template data, draw descriptor cache and set generations, texture/image pitch, device extensions, blit capabilities, depth/stencil clear ranges, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, push constants, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor layouts, spans, template data and YCbCr validation, draw descriptor cache and set generations, texture/image pitch, device extensions, blit capabilities, depth/stencil clear ranges, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, push constants, multiview, trace wrap, creation errors");
    return 0;
 }
