@@ -1000,10 +1000,9 @@ rd_queue_submit_has_render(const struct vk_queue_submit *submit)
    return false;
 }
 
-static bool rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch);
+static bool rd_window_dispatch_supported(struct rd_device *device,
+                                         const struct rd_dispatch_record *record);
 static bool rd_render_query_before_work(const struct rd_render *render);
-static VkResult rd_resolve_dispatch(const struct rd_dispatch_record *record,
-                                   struct rd_dispatch *dispatch);
 
 static bool
 rd_compute_can_defer(bool async, bool deferred, bool indirect, bool pipeline_ok)
@@ -1036,12 +1035,9 @@ rd_async_queue_submit_supported(struct rd_device *device, struct vk_queue_submit
             continue;
          *last_work = recorded;
          *last_work_buffer = i;
-         if (recorded->type == RD_CMD_DISPATCH) {
-            struct rd_dispatch execution;
-            if (rd_resolve_dispatch(&recorded->dispatch, &execution) == VK_SUCCESS &&
-                rd_window_pipeline(device, &execution))
-               continue;
-         }
+         if (recorded->type == RD_CMD_DISPATCH &&
+             rd_window_dispatch_supported(device, &recorded->dispatch))
+            continue;
          if (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE &&
              rd_transfer_gpu_supported(recorded->type, &recorded->transfer))
             continue;
@@ -1330,10 +1326,14 @@ rd_queue_drain_pending(struct rd_device *device)
 }
 
 static bool
-rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch)
+rd_window_pipeline(struct rd_device *device, const struct rd_pipeline *p, bool indirect)
 {
-   const struct rd_pipeline *p = dispatch->pipeline;
+   if (!p || indirect || p->resource_count < 1 || p->resource_count > 5 ||
+       p->descriptor_count != p->resource_count)
+      return false;
    const struct ir3_shader_variant *v = p->variant;
+   if (!v)
+      return false;
    const uint64_t threads = (uint64_t)v->local_size[0] *
       v->local_size[1] * v->local_size[2];
    const uint64_t wave_size = (uint64_t)device->info.threadsize_base *
@@ -1343,7 +1343,7 @@ rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch)
    const uint64_t resident_threads = v->has_barrier ?
       DIV_ROUND_UP(threads, wave_size) * wave_size : wave_size;
    if (fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) != 506 ||
-       fd_device_version(device->fd) < FD_VERSION_SOFTPIN || dispatch->indirect ||
+       fd_device_version(device->fd) < FD_VERSION_SOFTPIN ||
        p->sampling_nir || p->sampling_variants || !p->batch_local_memory ||
        p->linear_subgroups || p->linear_barriers ||
        v->shader_options.workgroup_resident_threads ||
@@ -1351,9 +1351,8 @@ rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch)
        v->pvtmem_size || v->constant_data_size || v->info.preamble_instrs_count ||
        p->private_bo || !threads || threads > 128 ||
        resident_threads * ir3_shader_halfregs(v) > 4096 ||
-       v->shared_size > 16384 || p->resource_count < 1 || p->resource_count > 5 ||
-       v->num_ssbos != p->resource_count ||
-       p->descriptor_count != p->resource_count || p->buffer_count != p->resource_count ||
+       v->shared_size > 16384 || v->num_ssbos != p->resource_count ||
+       p->buffer_count != p->resource_count ||
        p->resource_usage.texture_count || p->resource_usage.sampler_count ||
        p->resource_usage.image_count || p->sampling_mask || v->image_mapping.num_tex)
       return false;
@@ -1906,7 +1905,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
          return VK_ERROR_UNKNOWN;
    }
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;
-   if (window && (profile || !rd_window_pipeline(device, dispatch))) {
+   if (window && (profile || !rd_window_pipeline(device, dispatch->pipeline, dispatch->indirect))) {
       VkResult drained = rd_window_drain(device, window, "unsupported");
       if (drained != VK_SUCCESS)
          return drained;
@@ -2758,6 +2757,45 @@ rd_queue_fail(struct vk_queue *queue)
    return result;
 }
 
+/* Preflight must reject the same descriptor errors as execution, but it
+ * doesn't need to copy the descriptors or materialize the dispatch state. */
+static bool
+rd_resolve_dispatch_descriptors(const struct rd_dispatch_record *record,
+                                struct rd_descriptor *descriptors)
+{
+   const struct rd_pipeline *pipeline = record->pipeline;
+   if (!pipeline || pipeline->resource_count > RD_MAX_ACTIVE_RESOURCES ||
+       pipeline->descriptor_count > RD_MAX_ACTIVE_RESOURCES)
+      return false;
+   for (uint32_t i = 0; i < pipeline->resource_count; i++) {
+      if (!(pipeline->used_descriptors & (UINT64_C(1) << i)))
+         continue;
+      const struct rd_nir_resource_binding *resource = &pipeline->resources[i];
+      const struct rd_descriptor_set *set = resource->descriptor_set < RD_MAX_SETS ?
+         record->sets[resource->descriptor_set] : NULL;
+      if (!set || resource->logical_slot >= set->layout->descriptor_count)
+         return false;
+      const struct rd_descriptor *descriptor = &set->descriptors[resource->logical_slot];
+      const bool dynamic = descriptor->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                           descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+      if (dynamic && !rd_descriptor_dynamic_offset_valid(descriptor, record->dynamic_offsets[i]))
+         return false;
+      if (descriptors) {
+         descriptors[i] = *descriptor;
+         if (dynamic)
+            descriptors[i].offset += record->dynamic_offsets[i];
+      }
+   }
+   return true;
+}
+
+static bool
+rd_window_dispatch_supported(struct rd_device *device, const struct rd_dispatch_record *record)
+{
+   return rd_window_pipeline(device, record->pipeline, record->indirect) &&
+          rd_resolve_dispatch_descriptors(record, NULL);
+}
+
 static VkResult
 rd_resolve_dispatch(const struct rd_dispatch_record *record,
                     struct rd_dispatch *dispatch)
@@ -2770,25 +2808,8 @@ rd_resolve_dispatch(const struct rd_dispatch_record *record,
    memcpy(dispatch->push, record->push, sizeof(dispatch->push));
    memcpy(dispatch->grid, record->grid, sizeof(dispatch->grid));
    memcpy(dispatch->base, record->base, sizeof(dispatch->base));
-   if (!record->pipeline || record->pipeline->resource_count > RD_MAX_ACTIVE_RESOURCES ||
-       record->pipeline->descriptor_count > RD_MAX_ACTIVE_RESOURCES)
-      return VK_ERROR_UNKNOWN;
-   for (uint32_t i = 0; i < record->pipeline->resource_count; i++) {
-      if (!(record->pipeline->used_descriptors & (UINT64_C(1) << i)))
-         continue;
-      const struct rd_nir_resource_binding *resource = &record->pipeline->resources[i];
-      const struct rd_descriptor_set *set = resource->descriptor_set < RD_MAX_SETS ?
-         record->sets[resource->descriptor_set] : NULL;
-      if (!set || resource->logical_slot >= set->layout->descriptor_count)
-         return VK_ERROR_UNKNOWN;
-      struct rd_descriptor *descriptor = &dispatch->descriptors[i];
-      *descriptor = set->descriptors[resource->logical_slot];
-      if ((descriptor->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
-           descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) &&
-          !rd_descriptor_apply_dynamic_offset(descriptor, record->dynamic_offsets[i]))
-         return VK_ERROR_UNKNOWN;
-   }
-   return VK_SUCCESS;
+   return rd_resolve_dispatch_descriptors(record, dispatch->descriptors) ?
+      VK_SUCCESS : VK_ERROR_UNKNOWN;
 }
 
 static bool
@@ -2808,12 +2829,10 @@ rd_find_compute_tail(struct rd_device *device, const struct vk_queue_submit *sub
          continue;
 
       const struct rd_command *tail = &commands[count - 1];
-      if (tail->type != RD_CMD_DISPATCH || tail->dispatch.indirect ||
+      if (tail->type != RD_CMD_DISPATCH ||
           !tail->dispatch.grid[0] || !tail->dispatch.grid[1] || !tail->dispatch.grid[2])
          return false;
-      struct rd_dispatch dispatch;
-      if (rd_resolve_dispatch(&tail->dispatch, &dispatch) != VK_SUCCESS ||
-          !rd_window_pipeline(device, &dispatch))
+      if (!rd_window_dispatch_supported(device, &tail->dispatch))
          return false;
       for (uint32_t s = 0; s < submit->signal_count; s++) {
          const struct vk_sync_signal *signal = &submit->signals[s];
@@ -2956,7 +2975,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
               rd_image_copy_gpu_supported(device, &recorded->image_transfer, small_copies)));
          if (recorded->type == RD_CMD_DISPATCH)
             can_defer = rd_compute_can_defer(async, deferred,
-               recorded->dispatch.indirect, rd_window_pipeline(device, dispatch));
+               recorded->dispatch.indirect,
+               rd_window_pipeline(device, dispatch->pipeline, dispatch->indirect));
          if (!can_defer) {
             result = rd_window_drain(device, window,
                recorded->type == RD_CMD_BARRIER ? "barrier" : "cpu");

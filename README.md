@@ -168,7 +168,7 @@ the final batch's fence cannot be used, the driver waits and signals on the CPU.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `RADISH_DESCRIPTOR_ARENA` | `1` | arena-allocate per-draw descriptor snapshots |
+| `RADISH_DESCRIPTOR_ARENA` | `1` | arena-allocate descriptor snapshots and reuse them for adjacent primary direct draws with unchanged descriptor state |
 | `RADISH_LAYOUT_COMPATIBILITY_CACHE` | `1` | cache pipeline-layout compatibility hashes |
 | `RADISH_LAYOUT_COMPATIBILITY_DEBUG` | `0` | log layout compatibility computation |
 | `RADISH_SW_TEXEL_FETCH` | `0` | force the software texture-sampling fallback |

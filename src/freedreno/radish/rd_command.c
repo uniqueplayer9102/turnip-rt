@@ -6,6 +6,7 @@ static void
 rd_command_reset(struct vk_command_buffer *base, VkCommandBufferResetFlags flags)
 {
    struct rd_command_buffer *command = container_of(base, struct rd_command_buffer, vk);
+   rd_invalidate_draw_descriptor_cache(command);
    util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
       if (recorded->type == RD_CMD_UPDATE)
          vk_free(&base->pool->alloc, recorded->transfer.data);
@@ -107,6 +108,8 @@ rd_CmdBindPipeline(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    struct rd_pipeline *bound = rd_pipeline_from_handle(pipeline);
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && bound->gfx) {
+      if (command->gfx_pipeline != bound)
+         rd_invalidate_draw_descriptor_cache(command);
       command->gfx_pipeline = bound;
       vk_cmd_set_dynamic_graphics_state(&command->vk, &bound->gfx->dynamic);
       return;
@@ -247,6 +250,9 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
    uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
    rd_layout_compatibility(pipeline_layout, compatibility);
    if (count) {
+      /* Covers set replacements, layout disturbances and dynamic offsets. */
+      if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+         command->gfx_descriptor_bind_generation++;
       uint32_t last = first + count - 1;
       for (uint32_t i = 0; i < RD_MAX_SETS; i++) {
          if (!bound->sets[i] || (i >= first && i <= last))
@@ -415,6 +421,7 @@ rd_CmdExecuteCommands(VkCommandBuffer handle, uint32_t count,
                        const VkCommandBuffer *handles)
 {
    VK_FROM_HANDLE(rd_command_buffer, primary, handle);
+   rd_invalidate_draw_descriptor_cache(primary);
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(rd_command_buffer, secondary, handles[i]);
       util_dynarray_foreach(&secondary->commands, struct rd_command, source) {

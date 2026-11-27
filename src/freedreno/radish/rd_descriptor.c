@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "util/u_atomic.h"
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 
@@ -267,8 +268,11 @@ rd_ResetDescriptorPool(VkDevice handle, VkDescriptorPool pool_handle,
 {
    VK_FROM_HANDLE(rd_device, device, handle);
    VK_FROM_HANDLE(rd_descriptor_pool, pool, pool_handle);
+   bool had_sets = !list_is_empty(&pool->sets);
    list_for_each_entry_safe(struct rd_descriptor_set, set, &pool->sets, link)
       rd_free_set(device, set);
+   if (had_sets)
+      p_atomic_inc(&device->descriptor_storage_generation);
    return VK_SUCCESS;
 }
 
@@ -330,6 +334,8 @@ rd_AllocateDescriptorSets(VkDevice handle, const VkDescriptorSetAllocateInfo *in
       list_addtail(&set->link, &pool->sets);
       out[i] = rd_descriptor_set_to_handle(set);
    }
+   if (info->descriptorSetCount)
+      p_atomic_inc(&device->descriptor_storage_generation);
    return VK_SUCCESS;
 }
 
@@ -341,6 +347,8 @@ rd_FreeDescriptorSets(VkDevice handle, VkDescriptorPool pool, uint32_t count,
    for (uint32_t i = 0; i < count; i++)
       if (sets[i])
          rd_free_set(device, rd_descriptor_set_from_handle(sets[i]));
+   if (count)
+      p_atomic_inc(&device->descriptor_storage_generation);
    return VK_SUCCESS;
 }
 
@@ -418,6 +426,7 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
                          const VkWriteDescriptorSet *writes,
                          uint32_t copy_count, const VkCopyDescriptorSet *copies)
 {
+   VK_FROM_HANDLE(rd_device, device, handle);
    for (uint32_t i = 0; i < write_count; i++) {
       VK_FROM_HANDLE(rd_descriptor_set, set, writes[i].dstSet);
       if (!set)
@@ -472,12 +481,16 @@ rd_UpdateDescriptorSets(VkDevice handle, uint32_t write_count,
          }
       }
    }
+   /* One bump for all writes and copies, including immutable-sampler fixes. */
+   if (write_count || copy_count)
+      p_atomic_inc(&device->descriptor_storage_generation);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 rd_UpdateDescriptorSetWithTemplate(VkDevice handle, VkDescriptorSet set_handle,
    VkDescriptorUpdateTemplate template_handle, const void *data)
 {
+   VK_FROM_HANDLE(rd_device, device, handle);
    VK_FROM_HANDLE(rd_descriptor_set, set, set_handle);
    VK_FROM_HANDLE(vk_descriptor_update_template, update, template_handle);
    if (!set || !update || !data)
@@ -494,15 +507,23 @@ rd_UpdateDescriptorSetWithTemplate(VkDevice handle, VkDescriptorSet set_handle,
          rd_write_descriptor(set, binding->slot + entry->array_element + j,
             entry->type, (const uint8_t *)data + entry->offset + j * entry->stride);
    }
+   if (update->entry_count)
+      p_atomic_inc(&device->descriptor_storage_generation);
+}
+
+bool
+rd_descriptor_dynamic_offset_valid(const struct rd_descriptor *descriptor, uint32_t offset)
+{
+   if (!descriptor->buffer || descriptor->offset > descriptor->buffer->vk.size)
+      return false;
+   VkDeviceSize remaining = descriptor->buffer->vk.size - descriptor->offset;
+   return offset <= remaining && descriptor->range <= remaining - offset;
 }
 
 bool
 rd_descriptor_apply_dynamic_offset(struct rd_descriptor *descriptor, uint32_t offset)
 {
-   if (!descriptor->buffer || descriptor->offset > descriptor->buffer->vk.size)
-      return false;
-   VkDeviceSize remaining = descriptor->buffer->vk.size - descriptor->offset;
-   if (offset > remaining || descriptor->range > remaining - offset)
+   if (!rd_descriptor_dynamic_offset_valid(descriptor, offset))
       return false;
    descriptor->offset += offset;
    return true;

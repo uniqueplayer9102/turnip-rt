@@ -10,6 +10,7 @@
 #include <vulkan/vulkan_core.h>
 
 #define MIN2(a, b) ((a) < (b) ? (a) : (b))
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #define align64(v, a) (((v) + (a) - 1) & ~((uint64_t)(a) - 1))
 #define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
 struct list_head { struct list_head *next, *prev; };
@@ -82,12 +83,14 @@ struct rd_render {
    struct util_dynarray draws, queries;
    uint32_t view_mask, layers, color_count;
    struct rd_render_attachment color[8], depth, stencil;
+   bool descriptor_arena;
 };
 struct rd_device {
    struct rd_trace *trace;
    uint64_t submit_count;
    struct list_head active_queries;
    void *pipe, *fd;
+   struct { uint32_t threadsize_base; } info;
    struct fd_bo *border_colors;
    uint64_t border_colors_offset;
 };
@@ -189,6 +192,192 @@ struct rd_set_layout {
 };
 struct rd_memory { struct { VkDeviceSize size; } vk; struct fd_bo *bo; };
 struct rd_buffer { struct { VkDeviceSize size; } vk; struct rd_memory *memory; VkDeviceSize offset; };
+
+#define RD_MAX_SETS 4
+#define RD_MAX_BINDINGS 1024
+#define RD_MAX_ACTIVE_RESOURCES 64
+#define FD_VERSION_SOFTPIN 4
+struct ir3_shader_variant {
+   uint32_t local_size[3], shared_size, num_ssbos, pvtmem_size, constant_data_size, halfregs;
+   bool has_barrier;
+   struct { bool double_threadsize; uint32_t preamble_instrs_count; } info;
+   struct {
+      uint32_t workgroup_resident_threads;
+      struct { bool a5xx_ssbo_size_consts; } nir_options;
+   } shader_options;
+   struct { uint32_t num_tex; } image_mapping;
+};
+static uint32_t ir3_shader_halfregs(const struct ir3_shader_variant *v) { return v->halfregs; }
+static unsigned fd_pipe_dev_id(const void *pipe) { return *(const unsigned *)pipe; }
+static unsigned fd_dev_gpu_id(unsigned id) { return id; }
+static unsigned fd_device_version(const void *fd) { return *(const unsigned *)fd; }
+
+struct rd_descriptor {
+   VkDescriptorType type;
+   struct rd_buffer *buffer;
+   VkDeviceSize offset, range;
+};
+struct rd_descriptor_set {
+   const struct rd_set_layout *layout;
+   struct rd_descriptor descriptors[2];
+};
+/* Resource metadata shared with the shader compiler. */
+#include "../radish/rd_nir_resources.h"
+struct rd_pipeline {
+   const struct ir3_shader_variant *variant;
+   const void *sampling_nir, *sampling_variants, *private_bo;
+   bool batch_local_memory, linear_subgroups, linear_barriers;
+   uint32_t descriptor_count, resource_count, buffer_count, sampling_mask;
+   uint64_t used_descriptors;
+   struct rd_nir_resource_binding resources[RD_MAX_ACTIVE_RESOURCES];
+   struct rd_nir_resource_usage resource_usage;
+};
+struct rd_dispatch_record {
+   const struct rd_pipeline *pipeline;
+   struct rd_buffer *indirect;
+   const struct rd_descriptor_set *sets[RD_MAX_SETS];
+   uint32_t dynamic_offsets[RD_MAX_ACTIVE_RESOURCES];
+};
+#include "dispatch_preflight_under_test.h"
+
+static void test_dispatch_preflight(void)
+{
+   unsigned gpu_id = 506, version = FD_VERSION_SOFTPIN;
+   struct rd_device device = { .pipe = &gpu_id, .fd = &version, .info.threadsize_base = 32 };
+   struct ir3_shader_variant variant = {
+      .local_size = { 32, 1, 1 }, .num_ssbos = 2, .halfregs = 32,
+      .shader_options.nir_options.a5xx_ssbo_size_consts = true,
+   };
+   struct rd_pipeline pipeline = {
+      .variant = &variant, .batch_local_memory = true,
+      .descriptor_count = 2, .resource_count = 2, .buffer_count = 2, .used_descriptors = 1,
+      .resources = {
+         { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+         { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptor_set = 1 },
+      },
+   };
+   struct rd_buffer buffer = { .vk.size = 256 };
+   struct rd_set_layout layout = { .descriptor_count = 1 };
+   struct rd_descriptor_set set = {
+      .layout = &layout,
+      .descriptors = {{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .buffer = &buffer,
+                        .offset = 16, .range = 128 }},
+   };
+   struct rd_dispatch_record record = { .pipeline = &pipeline, .sets = { &set } };
+   assert(rd_window_dispatch_supported(&device, &record)); /* unused set and BO not checked */
+   version--;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   version++;
+   record.indirect = &buffer;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   record.indirect = NULL;
+   pipeline.batch_local_memory = false;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   pipeline.batch_local_memory = true;
+   pipeline.resources[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   pipeline.resources[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+   pipeline.variant = NULL;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   pipeline.variant = &variant;
+   record.pipeline = NULL;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   record.pipeline = &pipeline;
+   pipeline.used_descriptors = 3;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   pipeline.used_descriptors = 1;
+   pipeline.resources[0].logical_slot = layout.descriptor_count;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   pipeline.resources[0].logical_slot = 0;
+
+   /* Check the live descriptor's type, and never modify the set in preflight. */
+   set.descriptors[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+   record.dynamic_offsets[0] = 112;
+   assert(rd_window_dispatch_supported(&device, &record));
+   assert(set.descriptors[0].offset == 16);
+   struct rd_descriptor snapshot[2] = {0};
+   assert(rd_resolve_dispatch_descriptors(&record, snapshot));
+   assert(snapshot[0].offset == 128 && snapshot[1].buffer == NULL);
+   assert(set.descriptors[0].offset == 16);
+   record.dynamic_offsets[0]++;
+   assert(!rd_window_dispatch_supported(&device, &record));
+   assert(!rd_resolve_dispatch_descriptors(&record, snapshot));
+   record.dynamic_offsets[0] = 0;
+   set.descriptors[0].buffer = NULL;
+   assert(!rd_window_dispatch_supported(&device, &record));
+}
+
+#include "draw_descriptor_cache_types_under_test.h"
+struct rd_command_buffer {
+   struct { VkCommandBufferLevel level; } vk;
+   struct rd_render *render;
+   const struct rd_pipeline *gfx_pipeline;
+   uint64_t gfx_descriptor_bind_generation;
+   struct rd_draw_descriptor_cache draw_descriptor_cache;
+   struct rd_bind_state {
+      uint32_t dynamic_offsets[RD_MAX_SETS][RD_MAX_BINDINGS];
+   } bind[2];
+};
+#include "draw_descriptor_cache_under_test.h"
+
+static void test_draw_descriptor_cache(void)
+{
+   struct rd_render render = { .descriptor_arena = true, .draws.size = sizeof(struct rd_draw) };
+   struct rd_render next_render = render;
+   struct rd_pipeline pipeline = {0}, other_pipeline = {0};
+   uint64_t storage_generation = 7;
+   struct rd_command_buffer command = {
+      .vk.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .render = &render,
+      .gfx_pipeline = &pipeline, .gfx_descriptor_bind_generation = 3,
+   };
+   assert(rd_draw_descriptor_cache_enabled(&command, true));
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+
+   command.bind[1].dynamic_offsets[0][1] = 32;
+   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1] = 64;
+   command.draw_descriptor_cache = (struct rd_draw_descriptor_cache) {
+      .render = &render, .pipeline = &pipeline, .bind_generation = 3,
+      .storage_generation = storage_generation, .draws_size = render.draws.size,
+      .offsets = {
+         { .count = 1, .entries = {{ .set = 0, .slot = 1, .value = 32 }} },
+         { .count = 1, .entries = {{ .set = RD_MAX_SETS - 1, .slot = RD_MAX_BINDINGS - 1, .value = 64 }} },
+      },
+   };
+   assert(rd_draw_descriptor_cache_hit(&command, storage_generation));
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation + 1));
+   command.gfx_descriptor_bind_generation++;
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+   command.draw_descriptor_cache.bind_generation = command.gfx_descriptor_bind_generation;
+   command.bind[1].dynamic_offsets[0][1]++;
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+   command.bind[1].dynamic_offsets[0][1]--;
+   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1]++;
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+   command.bind[1].dynamic_offsets[RD_MAX_SETS - 1][RD_MAX_BINDINGS - 1]--;
+   command.gfx_pipeline = &other_pipeline;
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+   command.gfx_pipeline = &pipeline;
+   command.render = &next_render;
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+   command.render = &render;
+   render.draws.size += sizeof(struct rd_draw);
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+   render.draws.size -= sizeof(struct rd_draw);
+   assert(rd_draw_descriptor_cache_hit(&command, storage_generation));
+
+   assert(!rd_draw_descriptor_cache_enabled(&command, false));
+   render.descriptor_arena = false;
+   assert(!rd_draw_descriptor_cache_enabled(&command, true));
+   render.descriptor_arena = true;
+   command.vk.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+   assert(!rd_draw_descriptor_cache_enabled(&command, true));
+   command.vk.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+   /* Reset and secondary execution discard the entry even if the other key
+    * fields would still match. */
+   rd_invalidate_draw_descriptor_cache(&command);
+   assert(!rd_draw_descriptor_cache_hit(&command, storage_generation));
+}
+
 struct rd_image_transfer {
    struct rd_image *src_image, *dst_image;
    struct rd_buffer *src_buffer, *dst_buffer;
@@ -646,6 +835,7 @@ int main(void)
    test_descriptor_span();
    test_query_range(); test_vertex_input();
    test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();
+   test_dispatch_preflight(); test_draw_descriptor_cache();
    test_device_extensions();
    test_blit_src();
    test_subword();
@@ -653,6 +843,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, draw descriptor cache, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
    return 0;
 }

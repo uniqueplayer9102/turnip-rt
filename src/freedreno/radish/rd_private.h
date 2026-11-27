@@ -120,6 +120,8 @@ struct rd_device {
    uint32_t seqno;
    uint64_t submit_count;
    uint64_t vk_submit_id;
+   /* Updated atomically by the host descriptor APIs. */
+   uint64_t descriptor_storage_generation;
    uint64_t faults;
    struct rd_submit_window submit_window;
    int submit_in_fence_fd;
@@ -404,6 +406,22 @@ struct rd_command {
       struct rd_blit blit;
    };
 };
+struct rd_stage_dynamic_offsets {
+   unsigned count;
+   struct rd_stage_dynamic_offset {
+      uint16_t set, slot;
+      uint32_t value;
+   } entries[RD_MAX_ACTIVE_RESOURCES];
+};
+struct rd_draw_descriptor_cache {
+   const struct rd_render *render;
+   const struct rd_pipeline *pipeline;
+   uint64_t bind_generation, storage_generation;
+   /* Only reuse snapshots when no other draw has been appended. */
+   unsigned draws_size;
+   struct rd_descriptor *descriptors[2];
+   struct rd_stage_dynamic_offsets offsets[2];
+};
 struct rd_command_buffer {
    struct vk_command_buffer vk;
    struct rd_pipeline *pipeline;
@@ -421,6 +439,8 @@ struct rd_command_buffer {
       uint8_t gtk_ycbcr_family[RD_MAX_SETS][BLAKE3_OUT_LEN];
       bool gtk_ycbcr_tagged[RD_MAX_SETS];
    } bind[2];
+   uint64_t gfx_descriptor_bind_generation;
+   struct rd_draw_descriptor_cache draw_descriptor_cache;
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
    VkDeviceSize vertex_sizes[32];
@@ -431,6 +451,13 @@ struct rd_command_buffer {
    uint32_t gfx_push[RD_MAX_PUSH_CONSTANTS_DWORDS];
    struct util_dynarray commands;
 };
+
+static inline void
+rd_invalidate_draw_descriptor_cache(struct rd_command_buffer *command)
+{
+   command->draw_descriptor_cache.render = NULL;
+}
+
 VK_DEFINE_NONDISP_HANDLE_CASTS(rd_set_layout, vk.base, VkDescriptorSetLayout, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
 VK_DEFINE_NONDISP_HANDLE_CASTS(rd_descriptor_pool, base, VkDescriptorPool, VK_OBJECT_TYPE_DESCRIPTOR_POOL)
 VK_DEFINE_NONDISP_HANDLE_CASTS(rd_descriptor_set, base, VkDescriptorSet, VK_OBJECT_TYPE_DESCRIPTOR_SET)
@@ -484,6 +511,8 @@ void rd_render_barrier(struct rd_command_buffer *command);
 void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
 bool rd_descriptor_ready(const struct rd_descriptor *descriptor, bool require_native_pitch);
+bool rd_descriptor_dynamic_offset_valid(const struct rd_descriptor *descriptor,
+                                        uint32_t offset);
 bool rd_descriptor_apply_dynamic_offset(struct rd_descriptor *descriptor,
                                         uint32_t offset);
 void rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,

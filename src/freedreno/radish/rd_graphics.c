@@ -739,6 +739,7 @@ VKAPI_ATTR void VKAPI_CALL
 rd_CmdEndRendering(VkCommandBuffer handle)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   rd_invalidate_draw_descriptor_cache(command);
    command->render = NULL;
 }
 
@@ -779,9 +780,12 @@ rd_CmdBindIndexBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offs
 static bool
 rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *render,
                           const struct rd_pipeline *stage,
+                          struct rd_stage_dynamic_offsets *offsets,
                           struct rd_descriptor **out)
 {
    *out = NULL;
+   if (offsets)
+      offsets->count = 0;
    if (!stage->resource_count)
       return true;
    struct rd_descriptor *copy = rd_render_alloc_descriptors(command, render, stage->resource_count);
@@ -823,12 +827,19 @@ rd_copy_stage_descriptors(struct rd_command_buffer *command, struct rd_render *r
          return false;
       }
       copy[i] = set->descriptors[resource->logical_slot];
-      if ((copy[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
-           copy[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) &&
-          !rd_descriptor_apply_dynamic_offset(&copy[i], bound->dynamic_offsets[index][resource->logical_slot])) {
-         rd_render_free_descriptors(command, render, copy);
-         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
-         return false;
+      if (copy[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+          copy[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
+         uint32_t offset = bound->dynamic_offsets[index][resource->logical_slot];
+         if (!rd_descriptor_apply_dynamic_offset(&copy[i], offset)) {
+            rd_render_free_descriptors(command, render, copy);
+            rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+            return false;
+         }
+         if (offsets) {
+            offsets->entries[offsets->count++] = (struct rd_stage_dynamic_offset) {
+               .set = index, .slot = resource->logical_slot, .value = offset,
+            };
+         }
       }
       if (!rd_descriptor_ready(&copy[i], true)) {
          rd_render_free_descriptors(command, render, copy);
@@ -1015,8 +1026,41 @@ rd_render_query(struct rd_command_buffer *command, struct rd_query_pool *pool,
    return true;
 }
 
+static bool
+rd_draw_descriptor_cache_enabled(const struct rd_command_buffer *command, bool ordinary)
+{
+   /* Successful snapshots reference immutable views and already-bound
+    * non-sparse resources. Only share the snapshot memory in its own arena. */
+   return ordinary && command->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+          command->render && command->render->descriptor_arena;
+}
+
+static bool
+rd_draw_descriptor_cache_hit(const struct rd_command_buffer *command,
+                             uint64_t storage_generation)
+{
+   const struct rd_draw_descriptor_cache *cache = &command->draw_descriptor_cache;
+   if (!cache->render || cache->render != command->render ||
+       cache->pipeline != command->gfx_pipeline ||
+       cache->bind_generation != command->gfx_descriptor_bind_generation ||
+       cache->storage_generation != storage_generation ||
+       cache->draws_size != command->render->draws.size)
+      return false;
+
+   const struct rd_bind_state *bound = &command->bind[1];
+   for (unsigned s = 0; s < 2; s++) {
+      const struct rd_stage_dynamic_offsets *offsets = &cache->offsets[s];
+      for (unsigned i = 0; i < offsets->count; i++) {
+         const struct rd_stage_dynamic_offset *entry = &offsets->entries[i];
+         if (entry->value != bound->dynamic_offsets[entry->set][entry->slot])
+            return false;
+      }
+   }
+   return true;
+}
+
 static struct rd_draw *
-rd_record_draw(struct rd_command_buffer *command)
+rd_record_draw(struct rd_command_buffer *command, bool ordinary)
 {
    struct rd_pipeline *pipeline = command->gfx_pipeline;
    if (!command->render && command->render_continue) {
@@ -1056,16 +1100,40 @@ rd_record_draw(struct rd_command_buffer *command)
    memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
    memcpy(draw.vertex_sizes, command->vertex_sizes, sizeof(draw.vertex_sizes));
    memcpy(draw.push, command->gfx_push, sizeof(draw.push));
-   if (!rd_copy_stage_descriptors(command, command->render, pipeline->gfx->vs.res, &draw.descriptors[0]) ||
-       !rd_copy_stage_descriptors(command, command->render, pipeline->gfx->fs.res, &draw.descriptors[1])) {
-      rd_render_free_descriptors(command, command->render, draw.descriptors[0]);
-      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
-      return NULL;
+   struct rd_render *render = command->render;
+   struct rd_draw_descriptor_cache *cache = &command->draw_descriptor_cache;
+   struct rd_device *device = container_of(command->vk.base.device, struct rd_device, vk);
+   const bool cache_enabled = rd_draw_descriptor_cache_enabled(command, ordinary);
+   const uint64_t storage_generation = cache_enabled ?
+      p_atomic_read(&device->descriptor_storage_generation) : 0;
+   const bool cache_hit = cache_enabled && rd_draw_descriptor_cache_hit(command, storage_generation);
+   if (cache_hit) {
+      memcpy(draw.descriptors, cache->descriptors, sizeof(draw.descriptors));
+   } else {
+      if (cache_enabled)
+         rd_invalidate_draw_descriptor_cache(command);
+      if (!rd_copy_stage_descriptors(command, render, pipeline->gfx->vs.res,
+                                     cache_enabled ? &cache->offsets[0] : NULL, &draw.descriptors[0]) ||
+          !rd_copy_stage_descriptors(command, render, pipeline->gfx->fs.res,
+                                     cache_enabled ? &cache->offsets[1] : NULL, &draw.descriptors[1])) {
+         rd_render_free_descriptors(command, render, draw.descriptors[0]);
+         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+         return NULL;
+      }
    }
-   struct rd_draw *recorded = rd_render_append_draw(command, command->render, &draw);
+   struct rd_draw *recorded = rd_render_append_draw(command, render, &draw);
    if (!recorded) {
-      rd_render_free_descriptors(command, command->render, draw.descriptors[0]);
-      rd_render_free_descriptors(command, command->render, draw.descriptors[1]);
+      rd_render_free_descriptors(command, render, draw.descriptors[0]);
+      rd_render_free_descriptors(command, render, draw.descriptors[1]);
+   } else if (cache_enabled) {
+      if (!cache_hit) {
+         cache->render = render;
+         cache->pipeline = pipeline;
+         cache->bind_generation = command->gfx_descriptor_bind_generation;
+         cache->storage_generation = storage_generation;
+         memcpy(cache->descriptors, draw.descriptors, sizeof(cache->descriptors));
+      }
+      cache->draws_size = render->draws.size;
    }
    return recorded;
 }
@@ -1077,7 +1145,7 @@ rd_CmdDraw(VkCommandBuffer handle, uint32_t vertex_count, uint32_t instance_coun
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    if (!vertex_count || !instance_count)
       return;
-   struct rd_draw *draw = rd_record_draw(command);
+   struct rd_draw *draw = rd_record_draw(command, true);
    if (!draw)
       return;
    draw->vertex_count = vertex_count;
@@ -1097,7 +1165,7 @@ rd_CmdDrawIndexed(VkCommandBuffer handle, uint32_t index_count, uint32_t instanc
       rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
-   struct rd_draw *draw = rd_record_draw(command);
+   struct rd_draw *draw = rd_record_draw(command, true);
    if (!draw)
       return;
    draw->indexed = true;
@@ -1114,7 +1182,7 @@ rd_record_multi_draw(struct rd_command_buffer *command, struct rd_draw *state,
 {
    if (*initialized && command->render->descriptor_arena)
       return rd_render_append_draw(command, command->render, state);
-   struct rd_draw *draw = rd_record_draw(command);
+   struct rd_draw *draw = rd_record_draw(command, false);
    if (draw && !*initialized) {
       *state = *draw;
       state->barrier = false;
@@ -1197,7 +1265,7 @@ rd_record_indirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
       return;
    }
    for (uint32_t i = 0; i < count; i++) {
-      struct rd_draw *draw = rd_record_draw(command);
+      struct rd_draw *draw = rd_record_draw(command, false);
       if (!draw)
          return;
       draw->indexed = indexed;

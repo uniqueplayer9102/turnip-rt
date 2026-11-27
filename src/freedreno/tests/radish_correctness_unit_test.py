@@ -108,6 +108,18 @@ def main():
             extract(query, 'rd_query_range'))
         (directory / 'descriptor_span_under_test.h').write_text(
             extract(descriptor, 'rd_descriptor_span_valid'))
+        (directory / 'dispatch_preflight_under_test.h').write_text(
+            extract(descriptor, 'rd_descriptor_dynamic_offset_valid') +
+            ''.join(extract(queue, name) for name in ('rd_window_pipeline',
+                                                     'rd_resolve_dispatch_descriptors',
+                                                     'rd_window_dispatch_supported')))
+        cache_types = private[private.index('struct rd_stage_dynamic_offsets {'):
+                              private.index('struct rd_command_buffer {')]
+        (directory / 'draw_descriptor_cache_types_under_test.h').write_text(cache_types)
+        (directory / 'draw_descriptor_cache_under_test.h').write_text(
+            extract(private, 'rd_invalidate_draw_descriptor_cache') +
+            extract(graphics, 'rd_draw_descriptor_cache_enabled') +
+            extract(graphics, 'rd_draw_descriptor_cache_hit'))
         diag_types = private[private.index('enum rd_drain_reason {'):private.index('\nstruct rd_device {')]
         drain_names = queue[queue.index('static const char *rd_drain_names'):queue.index('\nstatic unsigned\nrd_drain_index')]
         (directory / 'submit_diag_under_test.h').write_text(diag_types + drain_names + '\n' + ''.join(
