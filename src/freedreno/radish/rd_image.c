@@ -25,12 +25,19 @@ DEBUG_GET_ONCE_BOOL_OPTION(tiled_fp16_debug, "RADISH_TILED_FP16_DEBUG", false)
 bool
 rd_ycbcr_format_supported(VkFormat format)
 {
+   /* Only use multiplanar formats whose planes have native UNORM texture
+    * formats. Do not read padded 10/12-bit components as 16-bit UNORM. */
    switch (format) {
    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
    case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+   case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+   case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+   case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+   case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
+   case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
       return true;
    default:
       return false;

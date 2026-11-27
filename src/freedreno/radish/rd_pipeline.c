@@ -76,12 +76,12 @@ rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t elemen
       if (resource->texture_slot != UINT32_MAX)
          textures = MAX2(textures, resource->texture_slot + resource->plane_count);
       if (resource->sampler_slot != UINT32_MAX)
-         samplers = MAX2(samplers, resource->sampler_slot + resource->plane_count);
+         samplers = MAX2(samplers, resource->sampler_slot + 1);
       if (resource->image_slot != UINT32_MAX)
          images = MAX2(images, resource->image_slot + 1);
    }
    if ((texture && (textures > 16 || plane_count > 16 - textures)) ||
-       (sampler && (samplers > 16 || plane_count > 16 - samplers)) ||
+       (sampler && samplers >= 16) ||
        (image && images >= 16))
       return NULL;
    uint32_t slot = pipeline->resource_count++;
@@ -97,15 +97,16 @@ rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t elemen
    };
    if (buffer)
       pipeline->buffer_descriptors[pipeline->buffer_count++] = slot;
-   for (uint32_t plane = 0; plane < plane_count; plane++) {
-      if (texture) {
+   if (texture) {
+      for (uint32_t plane = 0; plane < plane_count; plane++) {
          pipeline->texture_descriptors[textures + plane] = slot;
          pipeline->texture_planes[textures + plane] = plane;
       }
-      if (sampler) {
-         pipeline->sampler_descriptors[samplers + plane] = slot;
-      }
    }
+   /* rd_CreateSampler requires identical luma/chroma filters. All planes of
+    * a converted descriptor use the same immutable sampler state. */
+   if (sampler)
+      pipeline->sampler_descriptors[samplers] = slot;
    if (image)
       pipeline->image_descriptors[images] = slot;
    return resource;

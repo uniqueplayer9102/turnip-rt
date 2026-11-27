@@ -56,6 +56,21 @@ rd_mark_resource(struct rd_resource_lower *state,
 }
 
 static bool
+rd_lower_texture_sampler(nir_tex_instr *tex, struct rd_resource_lower *state,
+                         const struct rd_nir_resource_binding *entry, uint32_t element,
+                         uint32_t plane)
+{
+   if (!entry || (entry->type != VK_DESCRIPTOR_TYPE_SAMPLER &&
+                  entry->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
+       plane >= entry->plane_count ||
+       !rd_mark_resource(state, entry, element, entry->sampler_slot,
+                         &state->usage->samplers, &state->usage->sampler_count))
+      return false;
+   tex->sampler_index = entry->sampler_slot + element;
+   return true;
+}
+
+static bool
 rd_lower_texture(nir_tex_instr *tex, struct rd_resource_lower *state)
 {
    if (tex->sampler_dim != GLSL_SAMPLER_DIM_1D &&
@@ -142,13 +157,8 @@ rd_lower_texture(nir_tex_instr *tex, struct rd_resource_lower *state)
    if (sampler >= 0) {
       entry = rd_resource_binding(state,
          nir_src_as_deref(tex->src[sampler].src), &element);
-      if (!entry || (entry->type != VK_DESCRIPTOR_TYPE_SAMPLER &&
-                     entry->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
-          plane >= entry->plane_count ||
-          !rd_mark_resource(state, entry, element, entry->sampler_slot + plane,
-                            &state->usage->samplers, &state->usage->sampler_count))
+      if (!rd_lower_texture_sampler(tex, state, entry, element, plane))
          return false;
-      tex->sampler_index = entry->sampler_slot + plane + element;
       nir_tex_instr_remove_src(tex, sampler);
    } else if (tex->op == nir_texop_txl || tex->op == nir_texop_txd ||
               tex->op == nir_texop_tg4 || tex->op == nir_texop_tex ||

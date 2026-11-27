@@ -230,6 +230,10 @@ Vulkan requires the conversion to be fixed at pipeline creation
 Radish logs an error and invalidates the affected descriptor on an
 incompatible write or copy.
 
+Radish supports 8- and 16-bit UNORM YCbCr with two or three planes for 4:2:0
+and 4:2:2, and three planes for 4:4:4. It does not support padded 10/12-bit
+formats, single-plane packed 4:2:2, or `VK_EXT_ycbcr_2plane_444_formats`.
+
 Push constants go to 256 bytes (Vulkan's minimum is 128), sized through
 `RD_MAX_PUSH_CONSTANTS_SIZE`.
 

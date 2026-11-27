@@ -57,7 +57,11 @@ struct ir3_const_state {
 };
 static uint32_t vk_format_get_plane_count(VkFormat format)
 {
-   return format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ? 2 : 1;
+   switch (format) {
+   case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM: return 2;
+   case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM: return 3;
+   default: return 1;
+   }
 }
 #define RD_GFX_MAX_BUFFERS 20
 #include "cache_under_test.h"
@@ -122,11 +126,29 @@ int main()
    set.immutable_sampler_states = &sampler; set.immutable_count = 1;
    set.bindings[0].immutable_offset = 0;
    good.resources[0].plane_count = 2;
-   good.resource_usage.texture_count = good.resource_usage.sampler_count = 2;
-   good.resource_usage.textures = good.resource_usage.samplers = 3;
+   good.resource_usage.texture_count = 2;
+   good.resource_usage.textures = 3;
    good.texture_planes[1] = 1;
    assert(valid(good));
    bad = good; bad.texture_planes[1] = 0; assert(!valid(bad));
+   bad = good; bad.resource_usage.sampler_count = 2;
+   bad.resource_usage.samplers = 3; assert(!valid(bad));
+
+   sampler.ycbcr_conversion.format = VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM;
+   good.resources[0].plane_count = 3;
+   good.resource_usage.texture_count = 3;
+   good.resource_usage.textures = 7;
+   good.texture_planes[2] = 2;
+   set.binding_count = set.descriptor_count = 2;
+   set.bindings[1] = {1, 1, 1, VK_DESCRIPTOR_TYPE_SAMPLER, VK_SHADER_STAGE_ALL, UINT32_MAX};
+   good.resource_count = good.descriptor_count = 2;
+   good.resources[1] = {0, 1, 0, 1, 1, VK_DESCRIPTOR_TYPE_SAMPLER, UINT32_MAX, UINT32_MAX, 1, UINT32_MAX, 1};
+   good.resource_usage.sampler_count = 2;
+   good.resource_usage.samplers = 3;
+   good.resource_usage.descriptors = good.used_descriptors = 3;
+   good.sampler_descriptors[1] = 1;
+   assert(valid(good));
+   bad = good; bad.resources[1].sampler_slot = 0; assert(!valid(bad));
    set.bindings[0].immutable_offset = 1; assert(!valid(good));
 
    setup(good, set, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);

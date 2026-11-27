@@ -9,7 +9,9 @@
 #include <threads.h>
 #include <vulkan/vulkan_core.h>
 
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define MIN2(a, b) ((a) < (b) ? (a) : (b))
+#define MAX2(a, b) ((a) > (b) ? (a) : (b))
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 #define align64(v, a) (((v) + (a) - 1) & ~((uint64_t)(a) - 1))
 #define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
@@ -140,9 +142,12 @@ static VkResult rd_draw_counts(struct rd_device *device, const struct rd_draw *d
 
 enum a5xx_tex_type { A5XX_TEX_1D, A5XX_TEX_2D, A5XX_TEX_CUBE, A5XX_TEX_3D };
 struct rd_resource {
+   struct fd_bo *bo;
+   VkDeviceSize offset;
    enum a5xx_tex_type type;
-   uint32_t depth, array_pitch;
-   bool image_size_only;
+   uint32_t cpp, width, height, depth, row_pitch, array_pitch, format_word;
+   uint32_t mip_levels, pitchalign, min_layer_size;
+   bool buffer, image_size_only;
 };
 #include "texture_pitch_under_test.h"
 
@@ -168,6 +173,7 @@ struct vk_image {
    VkFormat format;
    VkImageType image_type;
    VkSampleCountFlagBits samples;
+   VkExtent3D extent;
 };
 struct rd_image {
    struct vk_image vk;
@@ -177,6 +183,16 @@ struct rd_image {
    VkDeviceSize memory_offset, size;
 };
 #include "image_pitch_under_test.h"
+
+/* Registry extension numbers normally supplied by Mesa's generated headers. */
+#define _VK_KHR_sampler_ycbcr_conversion_number VK_ENUM_EXTENSION(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
+#define _VK_EXT_ycbcr_2plane_444_formats_number VK_ENUM_EXTENSION(VK_FORMAT_G8_B8R8_2PLANE_444_UNORM)
+static unsigned u_minify(unsigned value, unsigned levels)
+{
+   value >>= levels;
+   return value ? value : 1;
+}
+#include "ycbcr_formats_under_test.h"
 
 enum vk_sync_flags { VK_SYNC_IS_TIMELINE = 1 };
 struct vk_sync { enum vk_sync_flags flags; };
@@ -200,7 +216,9 @@ struct vk_sampler_state {
    struct vk_ycbcr_conversion_state ycbcr_conversion;
    uint32_t words[4];
 };
+struct vk_descriptor_set_layout { uint32_t unused; };
 struct rd_set_layout {
+   struct vk_descriptor_set_layout vk;
    uint32_t descriptor_count, binding_count, immutable_count;
    struct vk_sampler_state *immutable_sampler_states;
    struct rd_binding bindings[8];
@@ -277,12 +295,16 @@ static void mesa_loge(const char *format, const char *reason)
 #include "../radish/rd_nir_resources.h"
 struct rd_pipeline {
    const struct ir3_shader_variant *variant;
+   const struct vk_pipeline_layout *layout;
    const void *sampling_nir, *sampling_variants, *private_bo;
    bool batch_local_memory, linear_subgroups, linear_barriers;
    uint32_t descriptor_count, resource_count, buffer_count, sampling_mask;
    uint64_t used_descriptors;
    struct rd_nir_resource_binding resources[RD_MAX_ACTIVE_RESOURCES];
    struct rd_nir_resource_usage resource_usage;
+   uint32_t texture_descriptors[16], sampler_descriptors[16], image_descriptors[16];
+   uint8_t texture_planes[16];
+   uint32_t buffer_descriptors[32];
 };
 struct rd_dispatch_record {
    const struct rd_pipeline *pipeline;
@@ -380,9 +402,16 @@ struct rd_command_buffer {
 };
 
 struct vk_pipeline_layout {
+   uint32_t set_count;
+   const struct vk_descriptor_set_layout *set_layouts[RD_MAX_SETS];
    uint32_t push_range_count;
    VkPushConstantRange push_ranges[3];
 };
+
+typedef struct { unsigned sampler_index; } nir_tex_instr;
+struct rd_resource_lower { struct rd_nir_resource_usage *usage; };
+#include "sampler_slots_under_test.h"
+
 static struct rd_command *rd_command_append(struct rd_command_buffer *command,
                                             enum rd_command_type type)
 {
@@ -844,6 +873,246 @@ static void test_descriptor_span(void)
    assert(!rd_descriptor_span_valid(&layout, 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3));
    assert(!rd_descriptor_span_valid(&layout, 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0));
    assert(rd_descriptor_span_valid(&layout, 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0));
+}
+
+static void test_ycbcr_formats(void)
+{
+   const struct {
+      VkFormat format, luma, chroma;
+      unsigned planes, chroma_width, chroma_height;
+   } formats[] = {
+      {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, 2, 9, 7},
+      {VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, 3, 9, 7},
+      {VK_FORMAT_G8_B8R8_2PLANE_422_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, 2, 9, 14},
+      {VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, 3, 9, 14},
+      {VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, 3, 18, 14},
+      {VK_FORMAT_G16_B16R16_2PLANE_420_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, 2, 9, 7},
+      {VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, 3, 9, 7},
+      {VK_FORMAT_G16_B16R16_2PLANE_422_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, 2, 9, 14},
+      {VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, 3, 9, 14},
+      {VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, 3, 18, 14},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(formats); i++) {
+      VkFormat format = formats[i].format;
+      const struct rd_image image = { .vk = { .format = format, .extent = {18, 14, 1} } };
+      assert(rd_ycbcr_format_supported(format));
+      assert(vk_format_get_plane_count(format) == formats[i].planes);
+      const struct vk_format_ycbcr_info *info = vk_format_get_ycbcr_info(format);
+      assert(info->planes[0].ycbcr_swizzle[0] == VK_COMPONENT_SWIZZLE_G);
+      assert(info->planes[1].ycbcr_swizzle[0] == VK_COMPONENT_SWIZZLE_B);
+      assert(formats[i].planes == 2 ? info->planes[1].ycbcr_swizzle[1] == VK_COMPONENT_SWIZZLE_R :
+                                    info->planes[2].ycbcr_swizzle[0] == VK_COMPONENT_SWIZZLE_R);
+      for (unsigned p = 0; p < formats[i].planes; p++) {
+         assert(rd_image_aspect_plane(format, VK_IMAGE_ASPECT_PLANE_0_BIT << p) == p);
+         assert(vk_format_get_plane_format(format, p) == (p ? formats[i].chroma : formats[i].luma));
+         VkExtent3D extent = rd_image_plane_extent(&image, p, 0);
+         assert(extent.width == (p ? formats[i].chroma_width : 18));
+         assert(extent.height == (p ? formats[i].chroma_height : 14));
+         assert(extent.depth == 1);
+      }
+      if (formats[i].planes == 2)
+         assert(rd_image_aspect_plane(format, VK_IMAGE_ASPECT_PLANE_2_BIT) == UINT32_MAX);
+   }
+
+   assert(!rd_ycbcr_format_supported(VK_FORMAT_R16_UNORM));
+   assert(!rd_ycbcr_format_supported(VK_FORMAT_G8B8G8R8_422_UNORM));
+   assert(!rd_ycbcr_format_supported(VK_FORMAT_G16B16G16R16_422_UNORM));
+   assert(!rd_ycbcr_format_supported(VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16));
+   assert(!rd_ycbcr_format_supported(VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16));
+   assert(!rd_ycbcr_format_supported(VK_FORMAT_G8_B8R8_2PLANE_444_UNORM));
+   assert(!rd_ycbcr_format_supported(VK_FORMAT_G16_B16R16_2PLANE_444_UNORM));
+}
+
+static void test_ycbcr_sampler_slots(void)
+{
+   struct vk_sampler_state samplers[] = {
+      { .has_ycbcr_conversion = true, .ycbcr_conversion.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM },
+      { .has_ycbcr_conversion = true, .ycbcr_conversion.format = VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM },
+   };
+   struct rd_set_layout set = {
+      .binding_count = 4, .descriptor_count = 29,
+      .immutable_count = ARRAY_SIZE(samplers), .immutable_sampler_states = samplers,
+      .bindings = {
+         { .binding = 0, .count = 12, .slot = 0, .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+           .immutable_offset = UINT32_MAX },
+         { .binding = 1, .count = 14, .slot = 12, .type = VK_DESCRIPTOR_TYPE_SAMPLER,
+           .immutable_offset = UINT32_MAX },
+         { .binding = 2, .count = 2, .slot = 26, .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+           .immutable_offset = 0 },
+         { .binding = 3, .count = 1, .slot = 28, .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+           .immutable_offset = UINT32_MAX },
+      },
+   };
+   const struct vk_pipeline_layout layout = { .set_count = 1, .set_layouts = { &set.vk } };
+   struct rd_pipeline pipeline = { .layout = &layout };
+   struct rd_resource_lower lower = { .usage = &pipeline.resource_usage };
+   nir_tex_instr tex = {0};
+   const struct rd_nir_resource_binding *plain = rd_pipeline_resource(&pipeline, 0, 3, 0);
+   assert(plain && plain->texture_slot == 0 && plain->sampler_slot == 0 && plain->plane_count == 1);
+   assert(rd_lower_texture_sampler(&tex, &lower, plain, 0, 0) && tex.sampler_index == 0);
+   assert(!rd_lower_texture_sampler(&tex, &lower, plain, 0, 1));
+
+   const struct rd_nir_resource_binding *two = rd_pipeline_resource(&pipeline, 0, 2, 0);
+   assert(two && two->texture_slot == 1 && two->sampler_slot == 1 && two->plane_count == 2);
+   const struct rd_nir_resource_binding *separate = rd_pipeline_resource(&pipeline, 0, 1, 0);
+   assert(separate && separate->texture_slot == UINT32_MAX && separate->sampler_slot == 2);
+   assert(rd_lower_texture_sampler(&tex, &lower, separate, 0, 0) && tex.sampler_index == 2);
+   const struct rd_nir_resource_binding *three = rd_pipeline_resource(&pipeline, 0, 2, 1);
+   assert(three && three->texture_slot == 3 && three->sampler_slot == 3 && three->plane_count == 3);
+
+   const struct rd_nir_resource_binding *converted[] = {two, three};
+   for (unsigned i = 0; i < ARRAY_SIZE(converted); i++) {
+      const struct rd_nir_resource_binding *entry = converted[i];
+      assert(pipeline.sampler_descriptors[entry->sampler_slot] == entry->descriptor_slot);
+      for (uint32_t p = 0; p < entry->plane_count; p++) {
+         assert(pipeline.texture_descriptors[entry->texture_slot + p] == entry->descriptor_slot);
+         assert(pipeline.texture_planes[entry->texture_slot + p] == p);
+         assert(rd_lower_texture_sampler(&tex, &lower, entry, 0, p));
+         assert(tex.sampler_index == entry->sampler_slot);
+      }
+      assert(!rd_lower_texture_sampler(&tex, &lower, entry, 0, entry->plane_count));
+   }
+   assert(pipeline.resource_usage.samplers == 0xf && pipeline.resource_usage.sampler_count == 4);
+   assert(pipeline.resource_usage.descriptors == 0xf);
+
+   for (uint32_t i = 0; i < 10; i++) {
+      const struct rd_nir_resource_binding *entry = rd_pipeline_resource(&pipeline, 0, 0, i);
+      assert(entry && entry->texture_slot == 6 + i && entry->sampler_slot == UINT32_MAX);
+   }
+   assert(!rd_pipeline_resource(&pipeline, 0, 0, 10));
+   for (uint32_t i = 1; i < 13; i++) {
+      const struct rd_nir_resource_binding *entry = rd_pipeline_resource(&pipeline, 0, 1, i);
+      assert(entry && entry->sampler_slot == 3 + i);
+   }
+   assert(!rd_pipeline_resource(&pipeline, 0, 1, 13));
+   assert(rd_pipeline_resource(&pipeline, 0, 2, 1) == three);
+}
+
+enum a4xx_state_block { SB4_FS_TEX = 4, SB4_CS_TEX = 5 };
+enum a4xx_state_type { ST4_CONSTANTS = 1 };
+
+/* Packet fields for the host test; the driver uses generated A5xx headers. */
+#define COND(c, v) ((c) ? (v) : 0)
+#define CP_LOAD_STATE4 0x30u
+#define SS4_DIRECT 0u
+#define CP_LOAD_STATE4_0_DST_OFF(v) (v)
+#define CP_LOAD_STATE4_0_STATE_SRC(v) ((v) << 16)
+#define CP_LOAD_STATE4_0_STATE_BLOCK(v) ((uint32_t)(v) << 18)
+#define CP_LOAD_STATE4_0_NUM_UNIT(v) ((v) << 22)
+#define CP_LOAD_STATE4_1_STATE_TYPE(v) (v)
+#define A5XX_TEX_CONST_0_MIPLVLS(v) ((v) << 16)
+#define A5XX_TEX_CONST_1_WIDTH(v) (v)
+#define A5XX_TEX_CONST_1_HEIGHT(v) ((v) << 15)
+#define A5XX_TEX_CONST_2_BUFFER (1u << 4)
+#define A5XX_TEX_CONST_2_TYPE(v) ((uint32_t)(v) << 29)
+#define A5XX_TEX_CONST_2_PITCHALIGN(v) (v)
+#define A5XX_TEX_CONST_2_PITCH(v) ((v) << 7)
+#define A5XX_TEX_CONST_3_ARRAY_PITCH(v) ((v) >> 12)
+#define A5XX_TEX_CONST_3_MIN_LAYERSZ(v) (((v) >> 12) << 23)
+#define A5XX_TEX_CONST_5_DEPTH(v) ((v) << 17)
+
+static void OUT_RING(struct fd_ringbuffer *ring, uint32_t word)
+{
+   assert(ring->cur < ring->end);
+   *ring->cur++ = word;
+}
+
+static void OUT_PKT7(struct fd_ringbuffer *ring, uint32_t opcode, uint32_t dwords)
+{
+   assert((size_t)(ring->end - ring->cur) >= dwords + 1u);
+   OUT_RING(ring, (opcode << 16) | dwords); /* Parity is handled by Freedreno. */
+}
+
+static void OUT_RELOC(struct fd_ringbuffer *ring, struct fd_bo *bo, uint32_t offset,
+                      uint64_t orval, int32_t shift)
+{
+   assert(bo == &border_bo && !shift);
+   uint64_t address = (fd_bo_get_iova(bo) + offset) | orval;
+   OUT_RING(ring, (uint32_t)address);
+   OUT_RING(ring, address >> 32);
+}
+
+static bool rd_make_resource(const struct rd_descriptor *desc, struct rd_resource *resource,
+                             uint32_t plane)
+{
+   if (!desc->image_view || plane >= vk_format_get_plane_count(desc->image_view->conversion.format))
+      return false;
+   *resource = (struct rd_resource) {
+      .bo = &border_bo, .offset = 64 + 4096 * plane, .type = A5XX_TEX_2D,
+      .width = 18 - 4 * plane, .height = 14, .depth = 2, .row_pitch = 128,
+      .array_pitch = 4096 * (plane + 1), .format_word = (0x15u + plane) << 22,
+   };
+   return true;
+}
+#include "sampled_textures_under_test.h"
+
+static const uint32_t *check_texture_packet(const uint32_t *words, enum a4xx_state_block sb,
+                                            unsigned slot, unsigned count, unsigned first_plane,
+                                            uint32_t size_only_mask)
+{
+   assert(words[0] == ((CP_LOAD_STATE4 << 16) | (3 + 12 * count)));
+   assert(words[1] == (((uint32_t)sb << 18) | (count << 22) | slot));
+   assert(words[2] == 1 && words[3] == 0);
+   words += 4;
+   for (unsigned i = 0; i < count; i++, words += 12) {
+      unsigned plane = first_plane + i;
+      assert(words[0] == (0x15u + plane) << 22);
+      assert(words[1] == ((14u << 15) | (18 - 4 * plane)));
+      assert(words[2] == ((1u << 29) | (128u << 7)));
+      assert(words[3] == ((size_only_mask & (1u << (slot + i))) ? 0 : plane + 1));
+      assert(words[4] == 8192 + 64 + 4096 * plane && words[5] == 2u << 17);
+      for (unsigned j = 6; j < 12; j++)
+         assert(words[j] == 0);
+   }
+   return words;
+}
+
+static void test_ycbcr_texture_packets(void)
+{
+   struct rd_image_view three = { .ycbcr = true, .conversion.format = VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM };
+   struct rd_image_view two = { .ycbcr = true, .conversion.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM };
+   struct rd_image_view plain = { .conversion.format = VK_FORMAT_R8_UNORM };
+   const struct rd_descriptor descriptors[] = {
+      { .image_view = &three }, { .image_view = &two }, { .image_view = &plain },
+   };
+   struct rd_pipeline pipeline = {
+      .resource_usage = { .textures = 0x3f, .texture_count = 6 },
+      .texture_descriptors = {0, 0, 0, 1, 1, 2},
+      .texture_planes = {0, 1, 2, 0, 1, 0},
+   };
+   uint32_t words[6 * 16];
+   struct fd_ringbuffer ring = { .start = words, .cur = words, .end = words + ARRAY_SIZE(words) };
+
+   rd_emit_sampled_textures(&ring, SB4_FS_TEX, &pipeline, descriptors);
+   const uint32_t *next = check_texture_packet(words, SB4_FS_TEX, 0, 3, 0, 0);
+   next = check_texture_packet(next, SB4_FS_TEX, 3, 2, 0, 0);
+   assert(ring.cur == check_texture_packet(next, SB4_FS_TEX, 5, 1, 0, 0));
+
+   struct rd_resource resource;
+   assert(rd_make_resource(&descriptors[2], &resource, 0));
+   uint32_t single[16];
+   struct fd_ringbuffer single_ring = { .start = single, .cur = single, .end = single + 16 };
+   rd_emit_resource_texture_sb(&single_ring, 5, &resource, SB4_FS_TEX);
+   assert(single_ring.cur == single + 16 && !memcmp(next, single, sizeof(single)));
+
+   /* Inactive plane 1 breaks the run; the software size query on plane 2
+    * still gets a descriptor, but without the native array pitch. */
+   pipeline.resource_usage.textures &= ~(1u << 1);
+   pipeline.sampling_mask = 1u << 2;
+   ring.cur = words;
+   rd_emit_sampled_textures(&ring, SB4_CS_TEX, &pipeline, descriptors);
+   next = check_texture_packet(words, SB4_CS_TEX, 0, 1, 0, 0);
+   next = check_texture_packet(next, SB4_CS_TEX, 2, 1, 2, pipeline.sampling_mask);
+   next = check_texture_packet(next, SB4_CS_TEX, 3, 2, 0, 0);
+   assert(ring.cur == check_texture_packet(next, SB4_CS_TEX, 5, 1, 0, 0));
+
+   /* A failed plane must not be counted in a packet or suppress a later slot. */
+   pipeline.resource_usage.textures = 0x07;
+   pipeline.texture_planes[1] = 3;
+   ring.cur = words;
+   rd_emit_sampled_textures(&ring, SB4_CS_TEX, &pipeline, descriptors);
+   next = check_texture_packet(words, SB4_CS_TEX, 0, 1, 0, 0);
+   assert(ring.cur == check_texture_packet(next, SB4_CS_TEX, 2, 1, 2, pipeline.sampling_mask));
 }
 
 static void test_descriptor_ycbcr_conversion(void)
@@ -1332,7 +1601,8 @@ int main(void)
    test_ring_backings(); test_copy_side();
    test_render_query_before_work(); test_drain_index(); test_submit_diag_commands();
    test_descriptor_layout_bindings(); test_descriptor_span(); test_descriptor_template_data();
-   test_descriptor_ycbcr_conversion();
+   test_ycbcr_formats(); test_descriptor_ycbcr_conversion();
+   test_ycbcr_sampler_slots(); test_ycbcr_texture_packets();
    test_clear_ds_recording();
    test_query_range(); test_vertex_input(); test_push_constants();
    test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();

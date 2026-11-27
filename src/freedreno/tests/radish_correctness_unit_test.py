@@ -9,8 +9,10 @@ import tempfile
 def extract(source, name, cpp=False):
     prefix = r'^static bool ' if cpp else (
         r'^(?:VKAPI_ATTR void VKAPI_CALL|(?:static (?:inline )?)?'
-        r'(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|VkImageUsageFlags2KHR|nir_mem_access_size_align|'
-        r'const struct (?:rd_binding|vk_sampler_state|vk_ycbcr_conversion_state) \*))\n')
+        r'(?:void|bool|unsigned|uint32_t|uint64_t|VkResult|VkFormat|VkExtent3D|VkImageAspectFlags|'
+        r'VkImageUsageFlags2KHR|nir_mem_access_size_align|'
+        r'const struct (?:rd_binding|rd_nir_resource_binding|vk_sampler_state|'
+        r'vk_ycbcr_conversion_state|vk_format_ycbcr_info) \*))\n')
     match = re.search(prefix + re.escape(name) + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
     return source[match.start():source.index('\n}', match.end()) + 3] + '\n'
@@ -101,6 +103,29 @@ def main():
         (directory / 'image_pitch_under_test.h').write_text(
             extract((driver / 'rd_image.c').read_text(), 'rd_image_sampled_pitch_supported'))
         image_h = (vk_runtime / 'vk_image.h').read_text()
+        vk_util = vk_runtime.parent / 'util'
+        format_h = (vk_util / 'vk_format.h').read_text()
+        format_c = (vk_util / 'vk_format.c').read_text()
+        util_h = (vk_util / 'vk_util.h').read_text()
+        enum_helpers = util_h.index('#define VK_EXT_OFFSET')
+        (directory / 'ycbcr_formats_under_test.h').write_text(
+            util_h[enum_helpers:util_h.index('\n\n', enum_helpers)] + '\n' +
+            format_h[format_h.index('struct vk_format_ycbcr_plane {'):
+                     format_h.index('const struct vk_format_ycbcr_info *vk_format_get_ycbcr_info')] + '\n' +
+            format_c[format_c.index('#define fmt_unsupported'):
+                     format_c.index('const struct vk_format_ycbcr_info *\nvk_format_get_ycbcr_info')] +
+            ''.join(extract(format_c, name) for name in ('vk_format_get_ycbcr_info', 'vk_format_aspects')) +
+            extract(format_h, 'vk_format_get_plane_count') + extract(format_c, 'vk_format_get_plane_format') +
+            extract(image_h, 'vk_image_mip_level_extent') + ''.join(
+                extract(image_src, name) for name in ('rd_ycbcr_format_supported',
+                                                     'rd_image_aspect_plane', 'rd_image_plane_extent')))
+        nir_resources = (driver / 'rd_nir_resources.c').read_text()
+        (directory / 'sampler_slots_under_test.h').write_text(
+            extract(pipeline, 'rd_pipeline_resource') + extract(nir_resources, 'rd_mark_resource') +
+            extract(nir_resources, 'rd_lower_texture_sampler'))
+        (directory / 'sampled_textures_under_test.h').write_text(''.join(
+            extract(resources, name) for name in ('rd_resource_packet', 'rd_emit_resource_texture_words',
+                                                   'rd_emit_resource_texture_sb', 'rd_emit_sampled_textures')))
         layers = image_h.index('#define vk_image_subresource_layer_count(')
         (directory / 'clear_ds_under_test.h').write_text(
             image_h[layers:image_h.index('\n\n', layers)] + '\n' +

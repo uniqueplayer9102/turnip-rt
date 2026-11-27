@@ -16,7 +16,7 @@ static constexpr size_t meta_a = offsetof(rd_pipeline, descriptor_count);
 static constexpr size_t meta_a_size = offsetof(rd_pipeline, sampling_nir) - meta_a;
 static constexpr size_t meta_b = offsetof(rd_pipeline, sampling_mask);
 static constexpr size_t meta_b_size = sizeof(rd_pipeline) - meta_b;
-static constexpr uint32_t cache_version = 4;
+static constexpr uint32_t cache_version = 5;
 static constexpr size_t cache_max_entry = 64 * 1024 * 1024;
 struct rd_cache_object {
    vk_pipeline_cache_object base;
@@ -212,13 +212,10 @@ static bool resource_metadata_valid(const rd_pipeline *saved,
       }
       if (sampler) {
          uint32_t slot = resource->sampler_slot;
-         if (slot >= 16 || planes > 16 - slot)
+         if (slot >= 16 || saved->sampler_descriptors[slot] != i ||
+             (sampler_slots & (1u << slot)))
             return false;
-         for (uint32_t p = 0; p < planes; p++) {
-            if (saved->sampler_descriptors[slot + p] != i || (sampler_slots & (1u << (slot + p))))
-               return false;
-            sampler_slots |= 1u << (slot + p);
-         }
+         sampler_slots |= 1u << slot;
       } else if (resource->sampler_slot != UINT32_MAX) {
          return false;
       }
