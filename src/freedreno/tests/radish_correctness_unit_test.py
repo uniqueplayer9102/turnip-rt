@@ -32,6 +32,7 @@ def main():
     instance = (driver / 'rd_instance.c').read_text()
     queue = (driver / 'rd_queue.c').read_text()
     descriptor = (driver / 'rd_descriptor.c').read_text()
+    command = (driver / 'rd_command.c').read_text()
     image_src = (driver / 'rd_image.c').read_text()
     device_src = (driver / 'rd_device.c').read_text()
     private = (driver / 'rd_private.h').read_text()
@@ -110,6 +111,9 @@ def main():
             extract(graphics, 'rd_vertex_input_valid'))
         (directory / 'query_range_under_test.h').write_text(
             extract(query, 'rd_query_range'))
+        (directory / 'push_constants_under_test.h').write_text(
+            extract(command, 'rd_push_constants_covered') +
+            extract(command, 'rd_CmdPushConstants'))
         set_version = private[private.index('struct rd_descriptor_set_version {'):
                               private.index('struct rd_descriptor_set {')]
         (directory / 'descriptor_set_version_under_test.h').write_text(set_version)
@@ -119,7 +123,7 @@ def main():
                     'rd_find_binding', 'rd_descriptor_span_valid', 'rd_immutable_sampler',
                     'rd_descriptor_set_init_version', 'rd_validate_descriptor_conversion',
                     'rd_write_descriptor', 'rd_UpdateDescriptorSets',
-                    'rd_UpdateDescriptorSetWithTemplate')))
+                    'rd_descriptor_template_data_valid', 'rd_UpdateDescriptorSetWithTemplate')))
         (directory / 'dispatch_preflight_under_test.h').write_text(
             extract(descriptor, 'rd_descriptor_dynamic_offset_valid') +
             ''.join(extract(queue, name) for name in ('rd_window_pipeline',

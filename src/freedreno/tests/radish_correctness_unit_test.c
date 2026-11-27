@@ -203,6 +203,7 @@ struct rd_buffer { struct vk_buffer vk; struct rd_memory *memory; VkDeviceSize o
 #define RD_MAX_SETS 4
 #define RD_MAX_BINDINGS 1024
 #define RD_MAX_ACTIVE_RESOURCES 64
+#define RD_MAX_PUSH_CONSTANTS_SIZE 256
 #define FD_VERSION_SOFTPIN 4
 struct ir3_shader_variant {
    uint32_t local_size[3], shared_size, num_ssbos, pvtmem_size, constant_data_size, halfregs;
@@ -346,7 +347,9 @@ static void test_dispatch_preflight(void)
 
 #include "draw_descriptor_cache_types_under_test.h"
 struct rd_command_buffer {
-   struct { VkCommandBufferLevel level; } vk;
+   struct { VkCommandBufferLevel level; VkResult error; } vk;
+   uint32_t push[RD_MAX_PUSH_CONSTANTS_SIZE / 4];
+   uint32_t gfx_push[RD_MAX_PUSH_CONSTANTS_SIZE / 4];
    struct rd_render *render;
    const struct rd_pipeline *gfx_pipeline;
    uint64_t gfx_descriptor_bind_generation;
@@ -356,6 +359,58 @@ struct rd_command_buffer {
       uint32_t dynamic_offsets[RD_MAX_SETS][RD_MAX_BINDINGS];
    } bind[2];
 };
+
+struct vk_pipeline_layout {
+   uint32_t push_range_count;
+   VkPushConstantRange push_ranges[3];
+};
+#define rd_set_error(command_vk, result) ((command_vk)->error = (result))
+#include "push_constants_under_test.h"
+#undef rd_set_error
+
+static void test_push_constants(void)
+{
+   const VkShaderStageFlags graphics = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+   struct vk_pipeline_layout layout = {
+      .push_range_count = 3,
+      .push_ranges = {
+         { .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 4, .size = 8 },
+         { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 12 },
+         { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+           .offset = RD_MAX_PUSH_CONSTANTS_SIZE - 4, .size = 4 },
+      },
+   };
+   struct rd_command_buffer command = {0};
+   VkCommandBuffer cmd = RD_TEST_HANDLE(VkCommandBuffer, &command);
+   VkPipelineLayout pipeline_layout = RD_TEST_HANDLE(VkPipelineLayout, &layout);
+   const uint32_t values[] = { 5, 17, 23 };
+
+   rd_CmdPushConstants(cmd, pipeline_layout, graphics, 4, 8, values);
+   assert(command.vk.error == VK_SUCCESS);
+   assert(!command.gfx_push[0] && command.gfx_push[1] == 5 && command.gfx_push[2] == 17);
+   assert(!command.push[1] && !command.push[2]);
+
+   rd_CmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                      RD_MAX_PUSH_CONSTANTS_SIZE - 4, 4, values);
+   assert(command.vk.error == VK_SUCCESS);
+   assert(command.push[RD_MAX_PUSH_CONSTANTS_SIZE / 4 - 1] == 5);
+   assert(!command.gfx_push[RD_MAX_PUSH_CONSTANTS_SIZE / 4 - 1]);
+
+   /* The vertex range covers all bytes, but the fragment range does not. */
+   rd_CmdPushConstants(cmd, pipeline_layout, graphics, 0, 12, values);
+   assert(command.vk.error == VK_ERROR_FEATURE_NOT_PRESENT);
+   assert(!command.gfx_push[0] && command.gfx_push[1] == 5 && command.gfx_push[2] == 17);
+
+   command.vk.error = VK_SUCCESS;
+   rd_CmdPushConstants(cmd, pipeline_layout, graphics | VK_SHADER_STAGE_COMPUTE_BIT, 4, 8, values);
+   assert(command.vk.error == VK_ERROR_FEATURE_NOT_PRESENT);
+   assert(!command.push[1] && !command.push[2]);
+
+   command.vk.error = VK_SUCCESS;
+   rd_CmdPushConstants(cmd, pipeline_layout, graphics, 5, 4, values);
+   assert(command.vk.error == VK_ERROR_FEATURE_NOT_PRESENT);
+   assert(command.gfx_push[1] == 5 && command.gfx_push[2] == 17);
+}
 
 static bool draw_descriptor_cache_option = true;
 static bool debug_get_option_draw_descriptor_cache(void)
@@ -662,6 +717,67 @@ static void test_descriptor_span(void)
    assert(!rd_descriptor_span_valid(&layout, 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3));
    assert(!rd_descriptor_span_valid(&layout, 7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0));
    assert(rd_descriptor_span_valid(&layout, 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0));
+}
+
+static void test_descriptor_template_data(void)
+{
+   const VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+   const size_t info_size = sizeof(VkDescriptorBufferInfo);
+   struct vk_descriptor_update_template update = {
+      .entry_count = 1, .entries = {{ .type = type, .array_count = 2,
+                                     .offset = 1, .stride = info_size + 3 }},
+   };
+   struct vk_descriptor_template_entry *entry = &update.entries[0];
+   struct rd_set_layout layout = {
+      .descriptor_count = 2, .binding_count = 1,
+      .bindings = {{ .count = 2, .type = type, .immutable_offset = UINT32_MAX }},
+   };
+   struct rd_descriptor_set set = { .layout = &layout };
+   struct rd_buffer buffer = { .vk.size = 128 };
+   VkDescriptorBufferInfo info = {
+      .buffer = RD_TEST_HANDLE(VkBuffer, &buffer), .offset = 16, .range = 32,
+   };
+   uint8_t data[1 + 2 * sizeof(VkDescriptorBufferInfo) + 3];
+   memcpy(data + entry->offset, &info, info_size);
+   info.offset = 64;
+   memcpy(data + entry->offset + entry->stride, &info, info_size);
+
+   VkDescriptorSet set_handle = RD_TEST_HANDLE(VkDescriptorSet, &set);
+   VkDescriptorUpdateTemplate update_handle = RD_TEST_HANDLE(VkDescriptorUpdateTemplate, &update);
+   rd_UpdateDescriptorSetWithTemplate(VK_NULL_HANDLE, set_handle, update_handle, data);
+   assert(set.descriptors[0].buffer == &buffer && set.descriptors[0].offset == 16);
+   assert(set.descriptors[1].buffer == &buffer && set.descriptors[1].offset == 64);
+   assert(set.version.generation == 1);
+
+   /* Reject the entire entry if its last element would overflow. */
+   info.offset = 96;
+   memcpy(data + entry->offset, &info, info_size);
+   entry->stride = SIZE_MAX;
+   rd_UpdateDescriptorSetWithTemplate(VK_NULL_HANDLE, set_handle, update_handle, data);
+   assert(set.descriptors[0].offset == 16 && set.descriptors[1].offset == 64);
+   assert(set.version.generation == 1);
+
+   entry->array_count = 3;
+   entry->offset = 0;
+   assert(!rd_descriptor_template_data_valid(entry, 0)); /* stride product */
+   entry->array_count = 1;
+   entry->offset = SIZE_MAX - info_size + 1;
+   assert(!rd_descriptor_template_data_valid(entry, 0)); /* last element's read */
+   entry->offset = 0;
+   assert(rd_descriptor_template_data_valid(entry, UINTPTR_MAX - info_size));
+   assert(!rd_descriptor_template_data_valid(entry, UINTPTR_MAX - info_size + 1));
+
+   /* A single element ignores stride; a zero stride reuses an element. */
+   entry->offset = 1;
+   entry->array_element = 1;
+   rd_UpdateDescriptorSetWithTemplate(VK_NULL_HANDLE, set_handle, update_handle, data);
+   assert(set.descriptors[1].offset == 96 && set.version.generation == 2);
+   entry->array_count = 2;
+   entry->array_element = 0;
+   entry->stride = 0;
+   rd_UpdateDescriptorSetWithTemplate(VK_NULL_HANDLE, set_handle, update_handle, data);
+   assert(set.descriptors[0].offset == 96 && set.descriptors[1].offset == 96);
+   assert(set.version.generation == 3);
 }
 
 static void test_query_range(void)
@@ -975,8 +1091,8 @@ int main(void)
    test_growth(); test_restart(); test_vertex_bounds(); test_texture_pitch(); test_image_pitch();
    test_ring_backings(); test_copy_side();
    test_render_query_before_work(); test_drain_index(); test_submit_diag_commands();
-   test_descriptor_span();
-   test_query_range(); test_vertex_input();
+   test_descriptor_span(); test_descriptor_template_data();
+   test_query_range(); test_vertex_input(); test_push_constants();
    test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();
    test_dispatch_preflight(); test_draw_descriptor_cache_enabled();
    test_draw_descriptor_cache(); test_draw_descriptor_set_generations();
@@ -987,6 +1103,6 @@ int main(void)
    struct rd_device device = {0};
    assert(rd_init_border_colors(&device) == VK_ERROR_OUT_OF_HOST_MEMORY);
    assert(!device.border_colors && deleted_bos == 1);
-   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans, draw descriptor cache and set generations, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, multiview, trace wrap, creation errors");
+   puts("CORRECTNESS_UNIT PASS: OOM, restart, binding bounds, descriptor spans and template data, draw descriptor cache and set generations, texture/image pitch, device extensions, blit capabilities, subword widening, fence export, sync policy, compute tail batch, dispatch preflight, empty-render queries, waits, submit diagnostics, query range, copy direction, ring backings, vertex input, push constants, multiview, trace wrap, creation errors");
    return 0;
 }

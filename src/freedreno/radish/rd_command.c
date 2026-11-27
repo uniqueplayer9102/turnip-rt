@@ -301,32 +301,41 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
       rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
 }
 
+static bool
+rd_push_constants_covered(const struct vk_pipeline_layout *layout,
+                          VkShaderStageFlags stages, uint32_t offset, uint32_t size)
+{
+   if (!layout || !stages)
+      return false;
+
+   /* Each stage occurs in at most one layout range, but different stages
+    * covering the same bytes need not be declared in the same range. */
+   for (uint32_t i = 0; i < layout->push_range_count; i++) {
+      const VkPushConstantRange *range = &layout->push_ranges[i];
+      if (offset >= range->offset && offset - range->offset < range->size &&
+          size <= range->size - (offset - range->offset)) {
+         stages &= ~range->stageFlags;
+         if (!stages)
+            return true;
+      }
+   }
+   return false;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
    VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void *values)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
-   bool covered = size == 0;
-   if (size && pipeline_layout) {
-      for (uint32_t i = 0; i < pipeline_layout->push_range_count; i++) {
-         const VkPushConstantRange *range = &pipeline_layout->push_ranges[i];
-         if (offset >= range->offset && offset - range->offset <= range->size &&
-             size <= range->size - (offset - range->offset) &&
-             (stages & ~range->stageFlags) == 0) {
-            covered = true;
-            break;
-         }
-      }
-   }
-   if (!covered || (!values && size) || offset > RD_MAX_PUSH_CONSTANTS_SIZE ||
-       size > RD_MAX_PUSH_CONSTANTS_SIZE - offset) {
+   if (!values || !size || ((offset | size) & 3) ||
+       offset >= RD_MAX_PUSH_CONSTANTS_SIZE || size > RD_MAX_PUSH_CONSTANTS_SIZE - offset ||
+       !rd_push_constants_covered(pipeline_layout, stages, offset, size)) {
       if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
-         VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
          fprintf(stderr,
                  "radish: rejected push constants offset=%u size=%u stages=0x%x max=%u\n",
                  offset, size, stages, RD_MAX_PUSH_CONSTANTS_SIZE);
-         for (uint32_t i = 0; i < pipeline_layout->push_range_count; i++) {
+         for (uint32_t i = 0; pipeline_layout && i < pipeline_layout->push_range_count; i++) {
             const VkPushConstantRange *range = &pipeline_layout->push_ranges[i];
             fprintf(stderr,
                     "radish: push range[%u] offset=%u size=%u stages=0x%x\n",

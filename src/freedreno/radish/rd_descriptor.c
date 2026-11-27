@@ -489,6 +489,45 @@ rd_UpdateDescriptorSets(UNUSED VkDevice handle, uint32_t write_count,
    }
 }
 
+static bool
+rd_descriptor_template_data_valid(const struct vk_descriptor_template_entry *entry,
+                                  uintptr_t address)
+{
+   if (!entry->array_count)
+      return false;
+
+   size_t element_size;
+   switch (entry->type) {
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+      element_size = sizeof(VkDescriptorBufferInfo);
+      break;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      element_size = sizeof(VkBufferView);
+      break;
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      element_size = sizeof(VkDescriptorImageInfo);
+      break;
+   default:
+      return false;
+   }
+
+   /* pData has no size parameter; only check that the full byte span is
+    * representable, including the bytes read by the last memcpy. */
+   size_t last, end;
+   return !__builtin_mul_overflow((size_t)(entry->array_count - 1), entry->stride, &last) &&
+          !__builtin_add_overflow(entry->offset, last, &last) &&
+          !__builtin_add_overflow(last, element_size, &end) &&
+          end <= UINTPTR_MAX - address;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 rd_UpdateDescriptorSetWithTemplate(UNUSED VkDevice handle, VkDescriptorSet set_handle,
    VkDescriptorUpdateTemplate template_handle, const void *data)
@@ -504,11 +543,14 @@ rd_UpdateDescriptorSetWithTemplate(UNUSED VkDevice handle, VkDescriptorSet set_h
       if (!binding || entry->type != binding->type ||
           entry->array_element > set->layout->descriptor_count - binding->slot ||
           !rd_descriptor_span_valid(set->layout, binding->slot + entry->array_element,
-                                     entry->type, entry->array_count))
+                                    entry->type, entry->array_count) ||
+          !rd_descriptor_template_data_valid(entry, (uintptr_t)data))
          continue;
-      for (uint32_t j = 0; j < entry->array_count; j++)
+      for (uint32_t j = 0; j < entry->array_count; j++) {
+         size_t offset = entry->offset + j * entry->stride;
          written |= rd_write_descriptor(set, binding->slot + entry->array_element + j,
-                                        entry->type, (const uint8_t *)data + entry->offset + j * entry->stride);
+                                        entry->type, (const uint8_t *)data + offset);
+      }
    }
    if (written)
       set->version.generation++;
