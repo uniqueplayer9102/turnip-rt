@@ -94,6 +94,7 @@ static const struct vk_instance_extension_table rd_instance_extensions = {
 static const struct vk_device_extension_table rd_device_extensions = {
    .KHR_swapchain = true,
    .KHR_incremental_present = true,
+   .GOOGLE_display_timing = true,
    .KHR_device_group = true,
    .KHR_descriptor_update_template = true,
    .KHR_maintenance1 = true,

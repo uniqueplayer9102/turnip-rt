@@ -48,6 +48,7 @@ def main():
     assert 'q.zero |= i != 0;' in graphics
     assert '.pipelineStatisticsQuery = false' in instance
     assert '#ifdef VK_USE_PLATFORM_XCB_KHR' in instance
+    assert '.GOOGLE_display_timing = true,' in instance
     assert '.KHR_xcb_surface = true,' in instance
     assert 'util_dynarray_append(' not in graphics
     pipeline = (driver / 'rd_pipeline.c').read_text()
