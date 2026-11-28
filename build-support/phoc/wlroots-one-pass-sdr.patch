@@ -1,0 +1,71 @@
+--- a/include/render/vulkan.h
++++ b/include/render/vulkan.h
+@@ -295,6 +295,8 @@
+ 	struct wlr_renderer wlr_renderer;
+ 	struct wlr_backend *backend;
+ 	struct wlr_vk_device *dev;
++	bool prefer_one_pass_srgb;
++	bool prefer_one_pass_raw;
+ 
+ 	VkCommandPool command_pool;
+ 
+--- a/render/vulkan/renderer.c
++++ b/render/vulkan/renderer.c
+@@ -27,6 +27,7 @@
+ #include "render/vulkan/shaders/quad.frag.h"
+ #include "render/vulkan/shaders/output.frag.h"
+ #include "types/wlr_buffer.h"
++#include "util/env.h"
+ #include "util/time.h"
+ 
+ // TODO:
+@@ -2528,6 +2529,8 @@
+ 	}
+ 
+ 	renderer->dev = dev;
++	renderer->prefer_one_pass_srgb = env_parse_bool("PHOC_VULKAN_ONE_PASS_SDR");
++	renderer->prefer_one_pass_raw = env_parse_bool("PHOC_VULKAN_ONE_PASS_RAW");
+ 	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
+ 	renderer->wlr_renderer.features.input_color_transform = true;
+ 	renderer->wlr_renderer.features.output_color_transform = true;
+--- a/render/vulkan/pass.c
++++ b/render/vulkan/pass.c
+@@ -851,7 +851,10 @@
+ 		tex_transform = WLR_VK_TEXTURE_TRANSFORM_ST2084_PQ;
+ 		break;
+ 	case WLR_COLOR_TRANSFER_FUNCTION_GAMMA22:
+-		tex_transform = WLR_VK_TEXTURE_TRANSFORM_GAMMA22;
++		/* The raw one-pass target already stores gamma-encoded values. */
++		tex_transform = renderer->prefer_one_pass_raw &&
++			pass->render_buffer_out == &pass->render_buffer->linear.out ?
++			WLR_VK_TEXTURE_TRANSFORM_IDENTITY : WLR_VK_TEXTURE_TRANSFORM_GAMMA22;
+ 		break;
+ 	case WLR_COLOR_TRANSFER_FUNCTION_BT1886:
+ 		tex_transform = WLR_VK_TEXTURE_TRANSFORM_BT1886;
+@@ -1228,6 +1231,13 @@
+ 			// Color transform is not an inverse EOTF
+ 			inv_eotf = 0;
+ 		}
++	} else if (renderer->prefer_one_pass_raw) {
++		// Keep one pass and let the texture shader preserve encoded values.
++		inv_eotf = WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR;
++	} else if (renderer->prefer_one_pass_srgb &&
++			buffer->srgb.out.framebuffer != VK_NULL_HANDLE) {
++		// Only replace the default if this buffer has a direct sRGB target.
++		inv_eotf = WLR_COLOR_TRANSFER_FUNCTION_SRGB;
+ 	} else {
+ 		// This is the default when unspecified
+ 		inv_eotf = WLR_COLOR_TRANSFER_FUNCTION_GAMMA22;
+@@ -1290,6 +1300,12 @@
+ 	wlr_render_pass_init(&pass->base, &render_pass_impl);
+ 	pass->renderer = renderer;
+ 	pass->two_pass = using_two_pass_pathway;
++	if ((renderer->prefer_one_pass_srgb || renderer->prefer_one_pass_raw) &&
++			!buffer_out->transitioned && (options == NULL || options->color_transform == NULL)) {
++		wlr_log(WLR_DEBUG, "%s for %dx%d output buffer",
++			pass->two_pass ? "Default two-pass Vulkan output" : "Direct Vulkan pass",
++			buffer->wlr_buffer->width, buffer->wlr_buffer->height);
++	}
+ 	if (options != NULL && options->color_transform != NULL) {
+ 		pass->color_transform = wlr_color_transform_ref(options->color_transform);
+ 	}
