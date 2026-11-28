@@ -35,6 +35,11 @@ gradient and gamma strip. Build it against `wayland-client` and
 `xdg-shell-client-protocol.[ch]`. `compare-ppm.py` compares two `grim -t ppm`
 captures and reports mean/p95/max absolute differences per channel.
 
+`present-stream.c` commits every frame callback instead of waiting for
+presentation feedback before submitting the next frame. It measures actual
+vsync intervals and avoids the extra misses caused by feedback-gated probes.
+Build it with `presentation-time-client-protocol.[ch]` as well.
+
 ## Validation
 
 On an Adreno 506 with Radish, the raw one-pass output was pixel-identical to
