@@ -1132,6 +1132,27 @@ rd_render_batch_count(struct rd_device *device, const struct rd_command *first,
    return count;
 }
 
+static unsigned
+rd_gmem_next_subpass(const struct rd_command *first, const struct rd_command *end)
+{
+   if (first->render->gmem_subpass_role != RD_GMEM_SUBPASS_PRODUCER)
+      return 0;
+   const struct rd_command *second = first + 1;
+   while (second < end && second->type == RD_CMD_BARRIER && second->render_pass_barrier)
+      second++;
+   return second < end && second->type == RD_CMD_RENDER &&
+      second->render->gmem_subpass_role == RD_GMEM_SUBPASS_CONSUMER ? second - first : 0;
+}
+
+/* Use the submitting command's fence only if no other work follows it. */
+static bool
+rd_render_tail_fence(const struct rd_command *render, const struct rd_command *last_work,
+                     bool async, uint32_t signal_count)
+{
+   return async && signal_count && render == last_work &&
+      rd_render_exports_fence(render->render) && debug_get_option_async_render_fence();
+}
+
 static bool
 rd_sync_value_supported(struct rd_device *device, struct vk_sync *sync,
                         uint64_t value, bool export)
@@ -3057,11 +3078,26 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             result = rd_execute_query(device, recorded->type, &recorded->query);
          } else if (recorded->type == RD_CMD_RENDER) {
             int64_t render_start = debug_get_option_submit_timing() ? os_time_get_nano() : 0;
+            const struct rd_render *render = recorded->render;
+            const struct rd_command *end = util_dynarray_end(&command->commands);
+            const bool render_async = can_defer && async && i == last_work_buffer;
+            unsigned subpass = 0;
+            if (can_defer && !device->trace && render->gmem_subpass_role == RD_GMEM_SUBPASS_PRODUCER)
+               subpass = rd_gmem_next_subpass(recorded, end);
+            if (subpass) {
+               const struct rd_command *next = &recorded[subpass];
+               device->submit_out_fence = rd_render_tail_fence(next, last_work, render_async,
+                                                              submit->signal_count);
+               result = rd_try_gmem_fp16_subpasses(device, render, next->render, window);
+               if (result == VK_NOT_READY)
+                  subpass = 0;
+            }
             unsigned batched = 0, batched_renders = 0;
-            if (debug_get_option_render_batch() && can_defer && !device->trace)
-               batched = rd_render_batch_count(device, recorded,
-                  util_dynarray_end(&command->commands), &batched_renders);
-            if (batched && batched_renders > 1) {
+            if (!subpass && debug_get_option_render_batch() && can_defer && !device->trace)
+               batched = rd_render_batch_count(device, recorded, end, &batched_renders);
+            if (subpass) {
+               recorded += subpass;
+            } else if (batched_renders > 1) {
                if (debug_get_option_render_batch_debug())
                   fprintf(stderr, "RADISH_RENDER_BATCH commands=%u renders=%u\n",
                           batched, batched_renders);
@@ -3076,18 +3112,15 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
                                                 can_defer ? window : NULL);
                recorded += batched - 1;
             } else {
-               device->submit_out_fence = can_defer && async && submit->signal_count &&
-                  i == last_work_buffer && recorded == last_work &&
-                  rd_render_exports_fence(recorded->render) &&
-                  debug_get_option_async_render_fence();
-               result = rd_execute_render(device, recorded->render,
-                                          can_defer ? window : NULL);
+               device->submit_out_fence = rd_render_tail_fence(recorded, last_work, render_async,
+                                                              submit->signal_count);
+               result = rd_execute_render(device, render, can_defer ? window : NULL);
             }
             device->submit_out_fence = false;
             if (debug_get_option_submit_timing())
                fprintf(stderr, "RADISH_RENDER_TIMING ns=%" PRId64 " depth_stencil=%u async=%u result=%d\n",
                        os_time_get_nano() - render_start,
-                       recorded->render->depth.view != NULL || recorded->render->stencil.view != NULL,
+                       render->depth.view != NULL || render->stencil.view != NULL,
                        async, result);
          } else if (recorded->type == RD_CMD_BLIT) {
             result = rd_execute_blit(device, &recorded->blit);

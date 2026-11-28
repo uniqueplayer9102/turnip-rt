@@ -513,8 +513,11 @@ rd_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
     * for the attachment writes before it and reads them through textures */
    rd_render_barrier(command);
    if (!command->render &&
-       (info->memoryBarrierCount || info->bufferMemoryBarrierCount || info->imageMemoryBarrierCount))
-      rd_command_append(command, RD_CMD_BARRIER);
+       (info->memoryBarrierCount || info->bufferMemoryBarrierCount || info->imageMemoryBarrierCount)) {
+      struct rd_command *recorded = rd_command_append(command, RD_CMD_BARRIER);
+      if (recorded)
+         recorded->render_pass_barrier = command->vk.runtime_rp_barrier;
+   }
 }
 
 struct rd_command *

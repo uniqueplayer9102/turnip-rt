@@ -80,12 +80,15 @@ struct rd_draw {
    struct rd_query_pool *occlusion_pool;
    uint32_t occlusion_query;
 };
-struct rd_render_attachment { void *resolve, *view; };
+#include "gmem_subpass_roles_under_test.h"
+struct rd_image_view;
+struct rd_render_attachment { void *resolve; struct rd_image_view *view; };
 struct rd_render {
    struct util_dynarray draws, queries;
    uint32_t view_mask, layers, color_count;
    struct rd_render_attachment color[8], depth, stencil;
-   bool descriptor_arena;
+   enum rd_gmem_subpass_role gmem_subpass_role;
+   bool descriptor_arena, gmem_discard;
 };
 struct rd_device {
    struct rd_trace *trace;
@@ -249,7 +252,12 @@ static unsigned fd_pipe_dev_id(const void *pipe) { return *(const unsigned *)pip
 static unsigned fd_dev_gpu_id(unsigned id) { return id; }
 static unsigned fd_device_version(const void *fd) { return *(const unsigned *)fd; }
 
-struct rd_image_view { bool ycbcr; struct vk_ycbcr_conversion_state conversion; };
+struct vk_image_view { int unused; };
+struct rd_image_view {
+   struct vk_image_view vk;
+   bool ycbcr;
+   struct vk_ycbcr_conversion_state conversion;
+};
 struct rd_sampler { struct vk_sampler_state state; };
 struct rd_descriptor {
    VkDescriptorType type;
@@ -385,7 +393,105 @@ static void test_dispatch_preflight(void)
 
 #include "clear_ds_types_under_test.h"
 #include "draw_descriptor_cache_types_under_test.h"
-struct rd_command { enum rd_command_type type; struct rd_blit blit; };
+struct rd_command {
+   enum rd_command_type type;
+   union { struct rd_blit blit; struct rd_render *render; bool render_pass_barrier; };
+};
+
+struct vk_subpass_attachment { uint32_t attachment; };
+struct vk_subpass {
+   uint32_t color_count, input_count;
+   struct vk_subpass_attachment *color_attachments, *input_attachments;
+};
+struct vk_render_pass_attachment { VkFormat format; VkAttachmentStoreOp store_op; };
+struct vk_subpass_dependency {
+   VkDependencyFlags flags;
+   uint32_t src_subpass, dst_subpass;
+   VkPipelineStageFlags2 src_stage_mask, dst_stage_mask;
+   VkAccessFlags2 src_access_mask, dst_access_mask;
+};
+struct vk_render_pass {
+   bool is_multiview;
+   uint32_t attachment_count, subpass_count, dependency_count;
+   struct vk_render_pass_attachment *attachments;
+   struct vk_subpass *subpasses;
+   struct vk_subpass_dependency *dependencies;
+};
+struct vk_attachment_state { struct vk_image_view *image_view; };
+struct vk_command_buffer {
+   struct vk_render_pass *render_pass;
+   uint32_t subpass_idx;
+   struct vk_attachment_state *attachments;
+};
+#include "gmem_subpass_under_test.h"
+
+static void test_gmem_subpasses(void)
+{
+   struct rd_image_view views[2] = {0};
+   struct vk_attachment_state bound[] = { {&views[0].vk}, {&views[1].vk} };
+   struct vk_subpass_attachment fp16 = {0}, bgra = {1};
+   struct vk_subpass subpasses[] = {
+      { .color_count = 1, .color_attachments = &fp16 },
+      { .color_count = 1, .color_attachments = &bgra, .input_count = 1, .input_attachments = &fp16 },
+   };
+   struct vk_render_pass_attachment attachments[] = {
+      { VK_FORMAT_R16G16B16A16_SFLOAT, VK_ATTACHMENT_STORE_OP_STORE },
+      { VK_FORMAT_B8G8R8A8_UNORM, VK_ATTACHMENT_STORE_OP_STORE },
+   };
+   struct vk_subpass_dependency deps[] = {
+      { .src_subpass = VK_SUBPASS_EXTERNAL, .dst_subpass = 0 },
+      { .src_subpass = 0, .dst_subpass = 1, .flags = VK_DEPENDENCY_BY_REGION_BIT,
+        .src_stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dst_stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .src_access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        .dst_access_mask = VK_ACCESS_2_SHADER_READ_BIT },
+      { .src_subpass = 1, .dst_subpass = VK_SUBPASS_EXTERNAL },
+   };
+   struct vk_render_pass pass = { .attachment_count = 2, .subpass_count = 2,
+      .attachments = attachments, .subpasses = subpasses,
+      .dependency_count = ARRAY_SIZE(deps), .dependencies = deps };
+   struct vk_command_buffer cmd = { .render_pass = &pass, .attachments = bound };
+   struct rd_render src = { .color_count = 1, .color[0].view = &views[0] };
+   struct rd_render dst = { .color_count = 1, .color[0].view = &views[1] };
+   rd_gmem_tag_subpass(&src, &cmd);
+   cmd.subpass_idx = 1;
+   rd_gmem_tag_subpass(&dst, &cmd);
+   assert(src.gmem_subpass_role == RD_GMEM_SUBPASS_PRODUCER && !src.gmem_discard);
+   assert(dst.gmem_subpass_role == RD_GMEM_SUBPASS_CONSUMER && !dst.gmem_discard);
+
+   struct rd_command commands[] = {
+      { .type = RD_CMD_RENDER, .render = &src },
+      { .type = RD_CMD_BARRIER, .render_pass_barrier = true },
+      { .type = RD_CMD_RENDER, .render = &dst },
+      { .type = RD_CMD_IMAGE_COPY },
+   };
+   assert(rd_gmem_next_subpass(commands, commands + ARRAY_SIZE(commands)) == 2);
+   assert(!rd_gmem_next_subpass(commands, commands + 2));
+   commands[1].render_pass_barrier = false;
+   assert(!rd_gmem_next_subpass(commands, commands + ARRAY_SIZE(commands)));
+   commands[1].type = RD_CMD_EVENT_WAIT;
+   assert(!rd_gmem_next_subpass(commands, commands + ARRAY_SIZE(commands)));
+
+   cmd.subpass_idx = 0;
+   attachments[0].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   src.gmem_subpass_role = RD_GMEM_SUBPASS_NONE;
+   rd_gmem_tag_subpass(&src, &cmd);
+   assert(src.gmem_subpass_role == RD_GMEM_SUBPASS_PRODUCER && src.gmem_discard);
+
+   src.gmem_subpass_role = RD_GMEM_SUBPASS_NONE;
+   deps[1].flags = 0;
+   rd_gmem_tag_subpass(&src, &cmd);
+   assert(src.gmem_subpass_role == RD_GMEM_SUBPASS_NONE);
+   deps[1].flags = VK_DEPENDENCY_BY_REGION_BIT;
+   deps[2].src_subpass = 0;
+   rd_gmem_tag_subpass(&src, &cmd);
+   assert(src.gmem_subpass_role == RD_GMEM_SUBPASS_NONE);
+   deps[2].src_subpass = 1;
+   src.color[0].view = &views[1];
+   rd_gmem_tag_subpass(&src, &cmd);
+   assert(src.gmem_subpass_role == RD_GMEM_SUBPASS_NONE);
+}
+
 struct rd_command_buffer {
    struct { VkCommandBufferLevel level; VkResult error; } vk;
    uint32_t push[RD_MAX_PUSH_CONSTANTS_SIZE / 4];
@@ -1010,6 +1116,18 @@ enum a4xx_state_type { ST4_CONSTANTS = 1 };
 #define CP_LOAD_STATE4_0_NUM_UNIT(v) ((v) << 22)
 #define CP_LOAD_STATE4_1_STATE_TYPE(v) (v)
 #define A5XX_TEX_CONST_0_MIPLVLS(v) ((v) << 16)
+#define A5XX_TEX_CONST_0_TILE_MODE(v) (v)
+#define A5XX_TEX_CONST_0_FMT(v) ((v) << 22)
+#define A5XX_TEX_CONST_0_SWIZ_X(v) ((v) << 4)
+#define A5XX_TEX_CONST_0_SWIZ_Y(v) ((v) << 7)
+#define A5XX_TEX_CONST_0_SWIZ_Z(v) ((v) << 10)
+#define A5XX_TEX_CONST_0_SWIZ_W(v) ((v) << 13)
+#define A5XX_TEX_X 0u
+#define A5XX_TEX_Y 1u
+#define A5XX_TEX_Z 2u
+#define A5XX_TEX_W 3u
+#define TILE5_2 2u
+#define TFMT5_16_16_16_16_FLOAT 0x62u
 #define A5XX_TEX_CONST_1_WIDTH(v) (v)
 #define A5XX_TEX_CONST_1_HEIGHT(v) ((v) << 15)
 #define A5XX_TEX_CONST_2_BUFFER (1u << 4)
@@ -1018,6 +1136,7 @@ enum a4xx_state_type { ST4_CONSTANTS = 1 };
 #define A5XX_TEX_CONST_2_PITCH(v) ((v) << 7)
 #define A5XX_TEX_CONST_3_ARRAY_PITCH(v) ((v) >> 12)
 #define A5XX_TEX_CONST_3_MIN_LAYERSZ(v) (((v) >> 12) << 23)
+#define A5XX_TEX_CONST_3_TILE_ALL (1u << 27)
 #define A5XX_TEX_CONST_5_DEPTH(v) ((v) << 17)
 
 static void OUT_RING(struct fd_ringbuffer *ring, uint32_t word)
@@ -1092,7 +1211,7 @@ static void test_ycbcr_texture_packets(void)
    uint32_t words[6 * 16];
    struct fd_ringbuffer ring = { .start = words, .cur = words, .end = words + ARRAY_SIZE(words) };
 
-   rd_emit_sampled_textures(&ring, SB4_FS_TEX, &pipeline, descriptors);
+   rd_emit_sampled_textures(&ring, SB4_FS_TEX, &pipeline, descriptors, UINT32_MAX);
    const uint32_t *next = check_texture_packet(words, SB4_FS_TEX, 0, 3, 0, 0);
    next = check_texture_packet(next, SB4_FS_TEX, 3, 2, 0, 0);
    assert(ring.cur == check_texture_packet(next, SB4_FS_TEX, 5, 1, 0, 0));
@@ -1109,7 +1228,7 @@ static void test_ycbcr_texture_packets(void)
    pipeline.resource_usage.textures &= ~(1u << 1);
    pipeline.sampling_mask = 1u << 2;
    ring.cur = words;
-   rd_emit_sampled_textures(&ring, SB4_CS_TEX, &pipeline, descriptors);
+   rd_emit_sampled_textures(&ring, SB4_CS_TEX, &pipeline, descriptors, UINT32_MAX);
    next = check_texture_packet(words, SB4_CS_TEX, 0, 1, 0, 0);
    next = check_texture_packet(next, SB4_CS_TEX, 2, 1, 2, pipeline.sampling_mask);
    next = check_texture_packet(next, SB4_CS_TEX, 3, 2, 0, 0);
@@ -1119,9 +1238,35 @@ static void test_ycbcr_texture_packets(void)
    pipeline.resource_usage.textures = 0x07;
    pipeline.texture_planes[1] = 3;
    ring.cur = words;
-   rd_emit_sampled_textures(&ring, SB4_CS_TEX, &pipeline, descriptors);
+   rd_emit_sampled_textures(&ring, SB4_CS_TEX, &pipeline, descriptors, UINT32_MAX);
    next = check_texture_packet(words, SB4_CS_TEX, 0, 1, 0, 0);
    assert(ring.cur == check_texture_packet(next, SB4_CS_TEX, 2, 1, 2, pipeline.sampling_mask));
+
+   /* The tile-local slot is programmed separately and must not get a
+    * system-memory relocation, even in the middle of a texture packet. */
+   pipeline.texture_planes[1] = 1;
+   ring.cur = words;
+   rd_emit_sampled_textures(&ring, SB4_FS_TEX, &pipeline, descriptors, 1);
+   next = check_texture_packet(words, SB4_FS_TEX, 0, 1, 0, 0);
+   assert(ring.cur == check_texture_packet(next, SB4_FS_TEX, 2, 1, 2, pipeline.sampling_mask));
+}
+
+static void test_gmem_input_packet(void)
+{
+   uint32_t words[16];
+   struct fd_ringbuffer ring = { .cur = words, .end = words + ARRAY_SIZE(words) };
+   rd_emit_gmem_fp16_input(&ring, 3, UINT64_C(0x32100100000), 64, 96, 512);
+   assert(ring.cur == words + ARRAY_SIZE(words));
+   assert(words[0] == (CP_LOAD_STATE4 << 16 | 15));
+   assert(words[1] == (1u << 22 | SB4_FS_TEX << 18 | 3));
+   assert(words[2] == ST4_CONSTANTS && !words[3]);
+   assert(words[4] == (0x62u << 22 | 3u << 13 | 2u << 10 | 1u << 7 | 2));
+   assert(words[5] == (96u << 15 | 64));
+   assert(words[6] == (1u << 29 | 512u << 7 | 3));
+   assert(words[7] == 1u << 27);
+   assert(words[8] == 0x00100000 && words[9] == (1u << 17 | 0x321));
+   for (unsigned i = 10; i < ARRAY_SIZE(words); i++)
+      assert(!words[i]);
 }
 
 static void test_descriptor_ycbcr_conversion(void)
@@ -1611,7 +1756,7 @@ int main(void)
    test_render_query_before_work(); test_drain_index(); test_submit_diag_commands();
    test_descriptor_layout_bindings(); test_descriptor_span(); test_descriptor_template_data();
    test_ycbcr_formats(); test_descriptor_ycbcr_conversion();
-   test_ycbcr_sampler_slots(); test_ycbcr_texture_packets();
+   test_ycbcr_sampler_slots(); test_ycbcr_texture_packets(); test_gmem_input_packet(); test_gmem_subpasses();
    test_clear_ds_recording();
    test_query_range(); test_vertex_input(); test_push_constants();
    test_fence_export(); test_sync_policy(); test_compute_tail_batch(); test_sync_waits();

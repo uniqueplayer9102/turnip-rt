@@ -109,6 +109,7 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_QUERY_FREE_RENDER` | `1` | allow the query-free render fast path |
 | `RADISH_RENDER_BATCH` | `0` | `1`: combine consecutive query-free color-only renders into one GPU submit when async sync is enabled |
 | `RADISH_RENDER_BATCH_DEBUG` | `0` | log batched render groups |
+| `RADISH_GMEM_FP16_SUBPASS` | `0` | experimental: run an eligible FP16 → BGRA8 two-subpass render tile by tile and fetch the FP16 input from GMEM |
 | `RADISH_NO_COVERAGE_PASS` | `0` | disable the coverage pass used by some query paths |
 
 ### Transfers / copies
@@ -202,6 +203,13 @@ attachments, a single layer, no multiview, and at least `RADISH_GMEM_MIN_DRAWS`
 draws. Everything else keeps using bypass. Within a GMEM render, program and
 linkage state is cached across consecutive draws with the same pipeline; any
 draw that emits program state is pinned so tile culling cannot skip it.
+
+`RADISH_GMEM_FP16_SUBPASS=1` is a separate A506 prototype for a single-sample
+FP16 color subpass followed by a BGRA8 subpass with a framebuffer-local input
+dependency. It removes the sysmem input fetch between subpasses, but still
+stores the FP16 image when later `LOAD` operations need it. Use
+`RADISH_GMEM_DUMP=1` to see `RADISH_GMEM_FP16_SUBPASS` tile and store counts.
+See the [on-device pixel tests](docs/radish-benchmark-matrix.md) before enabling it.
 
 ## Supported extensions
 

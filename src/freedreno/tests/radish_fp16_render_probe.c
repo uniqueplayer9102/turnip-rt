@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,9 +42,15 @@ static VkShaderModule shader(const char *path)
 }
 int main(int argc,char **argv)
 {
-   if (argc!=3 && argc!=4 && argc!=5) return 2;
-   int gpu=argc==5;
-   int mixed=gpu && getenv("RADISH_PROBE_MIXED");
+    if (argc!=3 && argc!=4 && argc!=5) return 2;
+    int gpu=argc==5;
+    const char *subpass_mode = getenv("RADISH_PROBE_GMEM_SUBPASSES");
+    bool subpasses = subpass_mode != NULL;
+    bool discard = subpasses && !strcmp(subpass_mode, "discard");
+    bool nonlocal = subpasses && !strcmp(subpass_mode, "nonlocal");
+    if (subpasses && (!gpu || (!discard && !nonlocal && strcmp(subpass_mode, "retain"))))
+       return 2;
+    int mixed=gpu && !discard && getenv("RADISH_PROBE_MIXED");
    int empty=mixed && getenv("RADISH_PROBE_EMPTY");
    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
    VkInstanceCreateInfo instance_info={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
@@ -97,7 +104,8 @@ int main(int argc,char **argv)
    VkDescriptorSetAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=pool,.descriptorSetCount=1,.pSetLayouts=&layout};
    VkDescriptorSet set;
    CHECK(vkAllocateDescriptorSets(device,&ai,&set));
-   VkDescriptorImageInfo image_info={.imageView=views[0],.imageLayout=VK_IMAGE_LAYOUT_GENERAL};
+    VkImageLayout input_layout = subpasses ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo image_info={.imageView=views[0],.imageLayout=input_layout};
    VkWriteDescriptorSet write={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=0,.descriptorCount=1,
       .descriptorType=VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,.pImageInfo=&image_info};
    vkUpdateDescriptorSets(device,1,&write,0,NULL);
@@ -105,21 +113,28 @@ int main(int argc,char **argv)
    VkPipelineLayout pl;
    CHECK(vkCreatePipelineLayout(device,&pli,NULL,&pl));
    VkAttachmentDescription attachments[2]={0};
-   for (unsigned i=0;i<2;i++) {
+    for (unsigned i=0;i<2;i++) {
       attachments[i]=(VkAttachmentDescription){.format=formats[i],.samples=VK_SAMPLE_COUNT_1_BIT,
          .loadOp=i?VK_ATTACHMENT_LOAD_OP_DONT_CARE:VK_ATTACHMENT_LOAD_OP_LOAD,.storeOp=VK_ATTACHMENT_STORE_OP_STORE,
          .stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,
          .initialLayout=VK_IMAGE_LAYOUT_GENERAL,.finalLayout=VK_IMAGE_LAYOUT_GENERAL};
-   }
-   VkAttachmentReference source={0,VK_IMAGE_LAYOUT_GENERAL},target={1,VK_IMAGE_LAYOUT_GENERAL};
-   VkSubpassDescription subpasses[2]={
-      {.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=1,.pColorAttachments=&source},
-      {.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=1,.pColorAttachments=&target,.inputAttachmentCount=1,.pInputAttachments=&source}};
+    }
+    if (subpasses)
+       attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (discard) {
+       attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+       attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
+    VkAttachmentReference source={0,VK_IMAGE_LAYOUT_GENERAL},target={1,VK_IMAGE_LAYOUT_GENERAL};
+    VkAttachmentReference input = {0, input_layout};
+    VkSubpassDescription passes[2]={
+       {.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=1,.pColorAttachments=&source},
+       {.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=1,.pColorAttachments=&target,.inputAttachmentCount=1,.pInputAttachments=&input}};
    VkSubpassDependency dependency={.srcSubpass=0,.dstSubpass=1,.srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
       .dstStageMask=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,.dstAccessMask=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
-      .dependencyFlags=VK_DEPENDENCY_BY_REGION_BIT};
+       .dependencyFlags=nonlocal ? 0 : VK_DEPENDENCY_BY_REGION_BIT};
    VkRenderPassCreateInfo ri={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=2,.pAttachments=attachments,
-      .subpassCount=2,.pSubpasses=subpasses,.dependencyCount=1,.pDependencies=&dependency};
+       .subpassCount=2,.pSubpasses=passes,.dependencyCount=1,.pDependencies=&dependency};
    VkRenderPass pass;
    CHECK(vkCreateRenderPass(device,&ri,NULL,&pass));
    VkFramebufferCreateInfo fi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=pass,.attachmentCount=2,.pAttachments=views,.width=W,.height=H,.layers=1};
@@ -205,11 +220,16 @@ int main(int argc,char **argv)
          vkCmdCopyBufferToImage(command,buffers[0],images[0],VK_IMAGE_LAYOUT_GENERAL,1,&copy);
       VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,.dstAccessMask=VK_ACCESS_INPUT_ATTACHMENT_READ_BIT};
       vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,1,&barrier,0,NULL,0,NULL);
-      VkRenderPassBeginInfo bi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=pass,.framebuffer=framebuffer,.renderArea={{0,0},{W,H}}};
-      if (gpu && frame)
-         bi.renderArea=(VkRect2D){{13,19},{W-40,H-60}};
-      vkCmdBeginRenderPass(command,&bi,VK_SUBPASS_CONTENTS_INLINE);
-      if (gpu && !frame) {
+       VkRenderPassBeginInfo bi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=pass,.framebuffer=framebuffer,.renderArea={{0,0},{W,H}}};
+       const VkClearValue black = { .color.float32 = {0, 0, 0, 1} };
+       if (discard) {
+          bi.clearValueCount = 1;
+          bi.pClearValues = &black;
+       }
+       if (gpu && frame)
+          bi.renderArea=(VkRect2D){{13,19},{W-40,H-60}};
+       vkCmdBeginRenderPass(command,&bi,VK_SUBPASS_CONTENTS_INLINE);
+       if (gpu && (!frame || discard)) {
          vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,pattern_pipeline);
          vkCmdDraw(command,3,1,0,0);
       }

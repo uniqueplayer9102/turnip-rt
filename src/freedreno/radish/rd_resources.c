@@ -485,11 +485,12 @@ rd_emit_resource_texture_sb(struct fd_ringbuffer *ring, uint32_t slot,
 
 static void
 rd_emit_sampled_textures(struct fd_ringbuffer *ring, enum a4xx_state_block sb,
-                         const struct rd_pipeline *pipeline, const struct rd_descriptor *descriptors)
+                         const struct rd_pipeline *pipeline, const struct rd_descriptor *descriptors,
+                         uint32_t skip_slot)
 {
    const struct rd_nir_resource_usage *usage = &pipeline->resource_usage;
    for (uint32_t slot = 0; slot < usage->texture_count;) {
-      if (!(usage->textures & (1u << slot))) {
+      if (slot == skip_slot || !(usage->textures & (1u << slot))) {
          slot++;
          continue;
       }
@@ -507,7 +508,8 @@ rd_emit_sampled_textures(struct fd_ringbuffer *ring, enum a4xx_state_block sb,
       if (descriptor->image_view && descriptor->image_view->ycbcr) {
          for (; count < ARRAY_SIZE(resources) && slot + count < usage->texture_count; count++) {
             uint32_t next = slot + count;
-            if (!(usage->textures & (1u << next)) || pipeline->texture_descriptors[next] != index ||
+            if (next == skip_slot || !(usage->textures & (1u << next)) ||
+                pipeline->texture_descriptors[next] != index ||
                 !rd_make_resource(descriptor, &resources[count], pipeline->texture_planes[next]))
                break;
          }
@@ -655,7 +657,7 @@ rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
       for (uint32_t j = 0; j < 4; j++)
          OUT_RING(ring, words[j]);
    }
-   rd_emit_sampled_textures(ring, SB4_CS_TEX, pipeline, dispatch->descriptors);
+   rd_emit_sampled_textures(ring, SB4_CS_TEX, pipeline, dispatch->descriptors, UINT32_MAX);
    for (uint32_t i = 0; i < usage->image_count; i++) {
       if (!(usage->images & (1u << i)))
          continue;
@@ -797,7 +799,7 @@ rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,
 void
 rd_emit_stage_textures(struct rd_device *device, struct fd_ringbuffer *ring,
                        enum a4xx_state_block sb, const struct rd_pipeline *stage,
-                       const struct rd_descriptor *descriptors)
+                        const struct rd_descriptor *descriptors, uint32_t skip_slot)
 {
    const struct rd_nir_resource_usage *usage = &stage->resource_usage;
    if (usage->sampler_count) {
@@ -813,5 +815,27 @@ rd_emit_stage_textures(struct rd_device *device, struct fd_ringbuffer *ring,
       for (uint32_t j = 0; j < 4; j++)
          OUT_RING(ring, words[j]);
    }
-   rd_emit_sampled_textures(ring, sb, stage, descriptors);
+   rd_emit_sampled_textures(ring, sb, stage, descriptors, skip_slot);
+}
+
+void
+rd_emit_gmem_fp16_input(struct fd_ringbuffer *ring, uint32_t slot, uint64_t address,
+                        uint32_t width, uint32_t height, uint32_t pitch)
+{
+   /* UCHE's GMEM window is programmed by MSM. Unlike a render target's
+    * tile offset, the texture address includes the base of that window. */
+   rd_resource_packet(ring, slot, SB4_FS_TEX, ST4_CONSTANTS, 1, 12);
+   OUT_RING(ring, A5XX_TEX_CONST_0_TILE_MODE(TILE5_2) |
+                  A5XX_TEX_CONST_0_FMT(TFMT5_16_16_16_16_FLOAT) |
+                  A5XX_TEX_CONST_0_SWIZ_X(A5XX_TEX_X) | A5XX_TEX_CONST_0_SWIZ_Y(A5XX_TEX_Y) |
+                  A5XX_TEX_CONST_0_SWIZ_Z(A5XX_TEX_Z) | A5XX_TEX_CONST_0_SWIZ_W(A5XX_TEX_W));
+   OUT_RING(ring, A5XX_TEX_CONST_1_WIDTH(width) | A5XX_TEX_CONST_1_HEIGHT(height));
+   /* Tile widths align to 64 pixels, or 512 bytes for FP16 RGBA. */
+   OUT_RING(ring, A5XX_TEX_CONST_2_TYPE(A5XX_TEX_2D) |
+                  A5XX_TEX_CONST_2_PITCHALIGN(3) | A5XX_TEX_CONST_2_PITCH(pitch));
+   OUT_RING(ring, A5XX_TEX_CONST_3_TILE_ALL);
+   OUT_RING(ring, (uint32_t)address);
+   OUT_RING(ring, (address >> 32) | A5XX_TEX_CONST_5_DEPTH(1));
+   for (unsigned i = 6; i < 12; i++)
+      OUT_RING(ring, 0);
 }

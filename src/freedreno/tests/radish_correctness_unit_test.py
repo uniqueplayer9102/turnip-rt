@@ -94,6 +94,10 @@ def main():
                  'rd_restart_counts', 'rd_vertex_fetch_size', 'rd_render_query_op',
                  'rd_render_needs_query_accounting', 'rd_account_draw')
         (directory / 'graphics_under_test.h').write_text(''.join(extract(graphics, name) for name in names))
+        (directory / 'gmem_subpass_roles_under_test.h').write_text(
+            private[private.index('enum rd_gmem_subpass_role {'):private.index('/* One dynamic-rendering')])
+        (directory / 'gmem_subpass_under_test.h').write_text(
+            extract(graphics, 'rd_gmem_tag_subpass') + extract(queue, 'rd_gmem_next_subpass'))
         names = ('rd_trace_accumulate', 'rd_trace_submit_begin', 'rd_trace_submit_end',
                  'rd_trace_needs_resolve', 'rd_trace_command_begin', 'rd_trace_command_end',
                  'rd_trace_resolve')
@@ -135,8 +139,9 @@ def main():
             extract(pipeline, 'rd_pipeline_resource') + extract(nir_resources, 'rd_mark_resource') +
             extract(nir_resources, 'rd_lower_texture_sampler'))
         (directory / 'sampled_textures_under_test.h').write_text(''.join(
-            extract(resources, name) for name in ('rd_resource_packet', 'rd_emit_resource_texture_words',
-                                                   'rd_emit_resource_texture_sb', 'rd_emit_sampled_textures')))
+             extract(resources, name) for name in ('rd_resource_packet', 'rd_emit_resource_texture_words',
+                                                    'rd_emit_resource_texture_sb', 'rd_emit_sampled_textures',
+                                                    'rd_emit_gmem_fp16_input')))
         layers = image_h.index('#define vk_image_subresource_layer_count(')
         (directory / 'clear_ds_under_test.h').write_text(
             image_h[layers:image_h.index('\n\n', layers)] + '\n' +

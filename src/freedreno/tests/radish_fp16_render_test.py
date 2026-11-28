@@ -9,6 +9,34 @@ import subprocess
 import tempfile
 
 
+def test_gmem_subpasses(command, width, height, environment):
+    for mode in ('retain', 'discard', 'nonlocal'):
+        hashes = []
+        for enabled in (0, 1):
+            env = dict(environment, RADISH_GMEM_FP16_SUBPASS=str(enabled),
+                       RADISH_PROBE_GMEM_SUBPASSES=mode, RADISH_PROBE_FRAMES='3')
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            text = result.stdout + result.stderr
+            if result.returncode:
+                raise RuntimeError(text[-6000:])
+            frames = re.findall(rf'CONVERSION_READBACK frame=\d+ pixels={width*height} hash=([0-9a-f]+) PASS', text)
+            if len(frames) != 3:
+                raise RuntimeError(text[-6000:])
+            hashes.append(frames)
+            tiles = re.findall(r'RADISH_GMEM_FP16_SUBPASS tiles=(\d+) bin=\d+x\d+ source_stores=(\d+)', text)
+            if enabled and mode != 'nonlocal':
+                if len(tiles) != 3 or any(int(count) <= 1 for count, _ in tiles):
+                    raise RuntimeError('Expected three multi-tile GMEM passes:\n' + text[-6000:])
+                stored = [int(stores) > 0 for _, stores in tiles]
+                if stored != ([True, True, False] if mode == 'retain' else [False] * 3):
+                    raise RuntimeError('Unexpected FP16 tile stores:\n' + text[-6000:])
+            elif tiles:
+                raise RuntimeError('Unexpected GMEM fusion:\n' + text[-6000:])
+        if hashes[0] != hashes[1]:
+            raise RuntimeError(f'{width}x{height} {mode}: GMEM and sysmem pixels differ')
+        print(f'{width}x{height} GMEM subpasses ({mode}): pixel readback PASS', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cc', default=os.environ.get('CC', 'cc'))
@@ -19,7 +47,10 @@ def main():
     parser.add_argument('--rgba8', action='store_true')
     parser.add_argument('--fs-wavesize', choices=('single', 'double', 'any'), default='single')
     parser.add_argument('--disk-cache', action='store_true')
+    parser.add_argument('--gmem-subpasses', action='store_true', help='test FP16-to-BGRA8 tile-local subpasses on Radish')
     args = parser.parse_args()
+    if args.gmem_subpasses and (args.benchmark or args.rgba8 or args.disk_cache):
+        parser.error('--gmem-subpasses is a standalone FP16 correctness run')
     tests = Path(__file__).resolve().parent
     includes = ['-I', str(args.include)] if args.include else []
     with tempfile.TemporaryDirectory(prefix='radish-fp16-render-test-') as directory:
@@ -40,6 +71,16 @@ def main():
                             *includes, '-o', str(binary),
                             str(tests / 'radish_fp16_render_probe.c'),
                             *shlex.split(args.vulkan_library)], check=True)
+            if args.gmem_subpasses:
+                env = dict(os.environ, RADISH_GMEM='1', RADISH_GMEM_MIN_DRAWS='100',
+                           RADISH_GMEM_DISABLE_FILE=str(directory / 'enable-gmem'),
+                           RADISH_GMEM_DUMP='1', RADISH_GMEM_CONVERSION_PASS='0',
+                           RADISH_TILED_FP16='0', RADISH_RENDER_BATCH='0', RADISH_ASYNC_QUEUE_SYNC='0',
+                           RADISH_PROFILE='0', RADISH_RENDER_GPU_TIMING='0', RADISH_RENDER_GPU_DETAIL='0',
+                           RADISH_GMEM_STOP='-1', RADISH_PROBE_MIXED='1', RADISH_PROBE_EMPTY='1')
+                env.pop('RADISH_TRACE', None)
+                test_gmem_subpasses([str(binary), *shaders[:2], 'gpu', shaders[2]], width, height, env)
+                continue
             combinations = ((1, 0, 0, 1), (1, 0, 1, 1), (1, 1, 1, 1), (1, 1, 0, 1)) if args.benchmark else (
                 (0, 0, 0, 0), (0, 1, 0, 0), (1, 0, 0, 0), (1, 0, 1, 0),
                 (1, 0, 1, 1), (1, 1, 0, 0), (1, 1, 1, 0), (1, 1, 1, 1))
@@ -47,6 +88,7 @@ def main():
             frames = 20 if args.benchmark else 3
             for arm, (gmem, tiled, skip, cull) in enumerate(combinations):
                 env = dict(os.environ, RADISH_GMEM=str(gmem), RADISH_GMEM_MIN_DRAWS='1',
+                    RADISH_GMEM_FP16_SUBPASS='0',
                     RADISH_TILED_FP16=str(tiled), RADISH_TILED_FP16_DEBUG='1',
                     RADISH_GMEM_DAMAGE_TILES=str(skip), RADISH_GMEM_CULL=str(cull),
                     RADISH_GMEM_DUMP='1', RADISH_GMEM_ELIDE_CLEAR_LOAD='0',
@@ -55,6 +97,7 @@ def main():
                     RADISH_GMEM_FP16_BIN_W='0', RADISH_GMEM_FP16_BIN_H='0',
                     RADISH_FS_WAVESIZE=args.fs_wavesize, RADISH_PROBE_FRAMES=str(frames),
                     RADISH_SHADER_DISK_CACHE='1' if args.disk_cache else '0')
+                env.pop('RADISH_PROBE_GMEM_SUBPASSES', None)
                 if args.disk_cache:
                     env.pop('MESA_SHADER_CACHE_DISABLE', None)
                     env.update(MESA_SHADER_CACHE_DIR=str(directory / 'cache'),
@@ -117,7 +160,8 @@ def main():
                 raise RuntimeError('Transfer fallback failed:\n' + text[-6000:])
             print('Transfer fallback PASS' if args.rgba8 else
                   'Transfer-capable FP16 image remains linear PASS', flush=True)
-        print('FP16_RENDER PASS: tiling, partial updates, mixed pipelines, clipping and retained pixels', flush=True)
+        if not args.gmem_subpasses:
+            print('FP16_RENDER PASS: tiling, partial updates, mixed pipelines, clipping and retained pixels', flush=True)
 
 
 if __name__ == '__main__':

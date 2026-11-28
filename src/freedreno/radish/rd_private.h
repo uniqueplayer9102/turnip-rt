@@ -350,6 +350,9 @@ struct rd_render_query {
    uint32_t draw_index; /* takes effect before this draw of the render */
    bool zero;
 };
+enum rd_gmem_subpass_role {
+   RD_GMEM_SUBPASS_NONE, RD_GMEM_SUBPASS_PRODUCER, RD_GMEM_SUBPASS_CONSUMER,
+};
 /* One dynamic-rendering instance: its attachments and its draws. */
 struct rd_render {
    VkRect2D area;
@@ -362,7 +365,8 @@ struct rd_render {
    struct util_dynarray draws;
    struct util_dynarray queries; /* struct rd_render_query */
    struct rd_descriptor_block *descriptor_blocks;
-   bool descriptor_arena;
+   enum rd_gmem_subpass_role gmem_subpass_role;
+   bool descriptor_arena, gmem_discard;
 };
 struct rd_query_command {
    struct rd_query_pool *pool;
@@ -409,6 +413,7 @@ struct rd_command {
       struct rd_query_command query;
       struct rd_render *render;
       struct rd_blit blit;
+      bool render_pass_barrier;
    };
 };
 struct rd_stage_dynamic_offsets {
@@ -492,7 +497,10 @@ VkResult rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
                           struct rd_gpu_elapsed *sample);
 void rd_emit_stage_textures(struct rd_device *device, struct fd_ringbuffer *ring,
                             enum a4xx_state_block sb, const struct rd_pipeline *stage,
-                            const struct rd_descriptor *descriptors);
+                            const struct rd_descriptor *descriptors,
+                            uint32_t skip_slot);
+void rd_emit_gmem_fp16_input(struct fd_ringbuffer *ring, uint32_t slot, uint64_t address,
+                            uint32_t width, uint32_t height, uint32_t pitch);
 const struct rd_nir_resource_binding *rd_pipeline_resource(void *data, uint32_t set,
                                                            uint32_t binding, uint32_t element);
 const struct vk_ycbcr_conversion_state *rd_pipeline_ycbcr_conversion(const void *data,
@@ -505,6 +513,8 @@ void rd_wsi_finish(struct rd_physical_device *physical);
 void rd_meta_finish(struct rd_device *device);
 VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render,
                            struct rd_submit_window *window);
+VkResult rd_try_gmem_fp16_subpasses(struct rd_device *device, const struct rd_render *src,
+                                    const struct rd_render *dst, struct rd_submit_window *window);
 bool rd_render_batch_supported(struct rd_device *device, const struct rd_render *render);
 VkResult rd_execute_render_batch(struct rd_device *device, const struct rd_command *commands,
                                  unsigned count, struct rd_submit_window *window);
@@ -561,6 +571,7 @@ extern "C" {
 #endif
 enum ir3_wavesize_option rd_real_wavesize(void);
 enum ir3_wavesize_option rd_fragment_wavesize(void);
+bool rd_gmem_fp16_subpass_enabled(void);
 bool rd_pipeline_cache_restore(struct rd_device *device, struct rd_pipeline *pipeline,
    VkPipelineCache cache, const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
 void rd_pipeline_cache_store(struct rd_device *device, struct rd_pipeline *pipeline,

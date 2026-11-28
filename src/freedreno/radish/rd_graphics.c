@@ -49,6 +49,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(no_coverage_pass, "RADISH_NO_COVERAGE_PASS", false)
 DEBUG_GET_ONCE_BOOL_OPTION(render_query_debug, "RADISH_RENDER_QUERY_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(debug_queries, "RADISH_DEBUG_QUERIES", false)
 DEBUG_GET_ONCE_BOOL_OPTION(gmem_conversion_pass, "RADISH_GMEM_CONVERSION_PASS", false)
+DEBUG_GET_ONCE_BOOL_OPTION(gmem_fp16_subpass, "RADISH_GMEM_FP16_SUBPASS", false)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_stop, "RADISH_GMEM_STOP", -1)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_min_draws, "RADISH_GMEM_MIN_DRAWS", 4)
 DEBUG_GET_ONCE_NUM_OPTION(gmem_fp16_bin_w, "RADISH_GMEM_FP16_BIN_W", 0)
@@ -73,6 +74,12 @@ bool
 rd_graphics_enabled(void)
 {
    return debug_get_bool_option("RADISH_GRAPHICS", true);
+}
+
+bool
+rd_gmem_fp16_subpass_enabled(void)
+{
+   return debug_get_option_gmem_fp16_subpass();
 }
 
 /* --- pipelines ------------------------------------------------------------ */
@@ -101,7 +108,7 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
  * advertised.
  */
 #define RD_GFX_PUSH_DWORDS RD_MAX_PUSH_CONSTANTS_DWORDS
-/* one vec4 after the buffer addresses: x = view index (multiview replay) */
+/* One vec4 after the buffer addresses: x = view index, yz = input tile origin. */
 #define RD_GFX_VIEW_DWORD (RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS)
 #define RD_GFX_BUFFER_SIZE_DWORD (RD_GFX_VIEW_DWORD + 4)
 #define RD_GFX_CONST_VEC4 ((RD_GFX_BUFFER_SIZE_DWORD + RD_GFX_MAX_BUFFERS) / 4)
@@ -216,6 +223,11 @@ rd_lower_subpass_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *pos = nir_f2i32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
    pos = nir_iadd(b, pos, nir_trim_vector(b, intr->src[1].ssa, 2));
+   if (!ms && rd_gmem_fp16_subpass_enabled()) {
+      /* Zero for ordinary renders; in GMEM the descriptor covers one tile. */
+      nir_def *params = nir_load_const_ir3(b, 4, 32, nir_imm_int(b, 0), .base = RD_GFX_VIEW_DWORD);
+      pos = nir_isub(b, pos, nir_vec2(b, nir_channel(b, params, 1), nir_channel(b, params, 2)));
+   }
    /* the layer is the view (multiview), 0 otherwise */
    pos = nir_vec3(b, nir_channel(b, pos, 0), nir_channel(b, pos, 1), nir_load_view_index(b));
    nir_tex_instr *tex = nir_tex_instr_create(b->shader, 3);
@@ -679,6 +691,48 @@ static bool rd_render_add_clear(struct rd_command_buffer *command, struct rd_ren
                                 VkRect2D rect, int color, VkImageAspectFlags aspects,
                                 VkClearValue value, uint32_t layer_first, uint32_t layer_count);
 
+static void
+rd_gmem_tag_subpass(struct rd_render *render, const struct vk_command_buffer *cmd)
+{
+   const struct vk_render_pass *pass = cmd->render_pass;
+   if (!pass || pass->is_multiview || pass->subpass_count != 2 || pass->attachment_count != 2 ||
+       cmd->subpass_idx > 1 || render->color_count != 1 || !render->color[0].view)
+      return;
+
+   const struct vk_subpass *src = &pass->subpasses[0], *dst = &pass->subpasses[1];
+   if (src->color_count != 1 || src->input_count || dst->color_count != 1 || dst->input_count != 1)
+      return;
+   uint32_t a = src->color_attachments[0].attachment;
+   uint32_t b = dst->color_attachments[0].attachment;
+   if (a >= 2 || b >= 2 || a == b || dst->input_attachments[0].attachment != a ||
+       pass->attachments[a].format != VK_FORMAT_R16G16B16A16_SFLOAT ||
+       pass->attachments[b].format != VK_FORMAT_B8G8R8A8_UNORM ||
+       &render->color[0].view->vk != cmd->attachments[cmd->subpass_idx ? b : a].image_view)
+      return;
+
+   /* Only a framebuffer-local edge can be reordered across tiles. */
+   bool local = false;
+   for (unsigned i = 0; i < pass->dependency_count; i++) {
+      const struct vk_subpass_dependency *dep = &pass->dependencies[i];
+      if ((dep->src_subpass == VK_SUBPASS_EXTERNAL && dep->dst_subpass == 0) ||
+          (dep->src_subpass == 1 && dep->dst_subpass == VK_SUBPASS_EXTERNAL))
+         continue;
+      if (dep->src_subpass != 0 || dep->dst_subpass != 1 ||
+          dep->flags != VK_DEPENDENCY_BY_REGION_BIT ||
+          dep->src_stage_mask != VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT ||
+          dep->dst_stage_mask != VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT ||
+          (dep->src_access_mask & ~VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT) ||
+          (dep->dst_access_mask & ~(VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT)))
+         return;
+      local |= (dep->src_access_mask & VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT) && dep->dst_access_mask;
+   }
+   if (!local)
+      return;
+   render->gmem_subpass_role = cmd->subpass_idx ? RD_GMEM_SUBPASS_CONSUMER : RD_GMEM_SUBPASS_PRODUCER;
+   render->gmem_discard = !cmd->subpass_idx &&
+      pass->attachments[a].store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
 {
@@ -712,6 +766,9 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
       render->samples = MAX2(render->samples, render->depth.view->vk.image->samples);
    if (render->stencil.view)
       render->samples = MAX2(render->samples, render->stencil.view->vk.image->samples);
+   if ((info->flags & VK_RENDERING_LOCAL_READ_CONCURRENT_ACCESS_CONTROL_BIT_KHR) &&
+       rd_gmem_fp16_subpass_enabled())
+      rd_gmem_tag_subpass(render, &command->vk);
    struct rd_command *recorded = rd_command_append(command, RD_CMD_RENDER);
    if (!recorded) {
       rd_render_free(command, render);
@@ -1947,14 +2004,14 @@ static void
 rd_gfx_consts(struct fd_ringbuffer *ring, struct rd_device *device,
               const struct rd_gfx_shader *shader, enum a4xx_state_block sb,
               const struct rd_draw *draw, const struct rd_descriptor *descriptors,
-              int32_t vertex_base, uint32_t view_index)
+               int32_t vertex_base, uint32_t view_index, bool load_view)
 {
    const struct ir3_shader_variant *v = shader->v;
    const struct ir3_const_state *state = ir3_const_state(v);
    unsigned constlen = v->constlen * 4;
    /* push constants */
    rd_gfx_const(ring, sb, 0, MIN2(RD_GFX_PUSH_DWORDS, constlen), draw->push);
-   if (RD_GFX_VIEW_DWORD < constlen) {
+   if (load_view && RD_GFX_VIEW_DWORD < constlen) {
       const uint32_t view[4] = { view_index };
       rd_gfx_const(ring, sb, RD_GFX_VIEW_DWORD, 4, view);
    }
@@ -2174,10 +2231,28 @@ rd_gfx_viewport(struct fd_ringbuffer *ring, const VkViewport *vp)
    OUT_RING(ring, A5XX_GRAS_CL_VPORT_ZSCALE_0(vp->maxDepth - vp->minDepth));
 }
 
+static uint32_t
+rd_gfx_draw_initiator(const struct rd_draw *draw)
+{
+   return CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(rd_primtype(draw->pipeline->gfx->dynamic.ia.primitive_topology)) |
+          CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY);
+}
+
+static void
+rd_gfx_draw_auto(struct fd_ringbuffer *ring, const struct rd_draw *draw)
+{
+   OUT_PKT7(ring, CP_DRAW_INDX_OFFSET, 3);
+   OUT_RING(ring, rd_gfx_draw_initiator(draw) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
+                  CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT));
+   OUT_RING(ring, draw->instance_count);
+   OUT_RING(ring, draw->vertex_count);
+}
+
 static bool
 rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
             const struct rd_render *render, const struct rd_draw *draw,
-            struct rd_gfx_program_cache *program_cache, bool emit_viewport)
+             struct rd_gfx_program_cache *program_cache, bool emit_viewport,
+             uint32_t gmem_input_slot)
 {
    const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
    const struct vk_dynamic_graphics_state *dyn = &gfx->dynamic;
@@ -2307,9 +2382,9 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
 
    int32_t vertex_base = draw->indexed ? draw->vertex_offset : (int32_t)draw->first_vertex;
    rd_gfx_consts(ring, device, &gfx->vs, SB4_VS_SHADER, draw, draw->descriptors[0], vertex_base,
-                 render->view_index);
+                  render->view_index, true);
    rd_gfx_consts(ring, device, &gfx->fs, SB4_FS_SHADER, draw, draw->descriptors[1], 0,
-                 render->view_index);
+                  render->view_index, gmem_input_slot == UINT32_MAX);
 
    /* blending */
    uint32_t mrt_blend = 0;
@@ -2358,8 +2433,8 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    }
 
    const struct rd_pipeline *vres = gfx->vs.res, *fres = gfx->fs.res;
-   rd_emit_stage_textures(device, ring, SB4_VS_TEX, vres, draw->descriptors[0]);
-   rd_emit_stage_textures(device, ring, SB4_FS_TEX, fres, draw->descriptors[1]);
+   rd_emit_stage_textures(device, ring, SB4_VS_TEX, vres, draw->descriptors[0], UINT32_MAX);
+   rd_emit_stage_textures(device, ring, SB4_FS_TEX, fres, draw->descriptors[1], gmem_input_slot);
    if (fres->buffer_count || fres->resource_usage.image_count)
       rd_emit_stage_ibos(device, ring, fres, gfx->fs.v, draw->descriptors[1]);
    OUT_PKT4(ring, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
@@ -2391,8 +2466,12 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_PKT4(ring, REG_A5XX_GRAS_SC_CNTL, 1);
    OUT_RING(ring, 0x8);
 
-   uint32_t initiator = CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(rd_primtype(dyn->ia.primitive_topology)) |
-                        CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY);
+   /* In the tiled consumer IB, emit setup only. The caller programs the
+    * input attachment and coordinates after switching shaders, then draws. */
+   if (gmem_input_slot != UINT32_MAX) {
+      assert(!draw->indexed);
+      return true;
+   }
    if (draw->indexed) {
       const struct rd_buffer *ib = draw->index_buffer;
       VkDeviceSize first_offset = (VkDeviceSize)draw->first_index * index_size;
@@ -2405,7 +2484,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
       if (draw->vertex_count > max_indices)
          return false;
       OUT_PKT7(ring, CP_DRAW_INDX_OFFSET, 7);
-      OUT_RING(ring, initiator | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) |
+      OUT_RING(ring, rd_gfx_draw_initiator(draw) | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) |
                      CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(index_size == 2 ? INDEX4_SIZE_16_BIT :
                                                                         INDEX4_SIZE_32_BIT));
       OUT_RING(ring, draw->instance_count);
@@ -2414,11 +2493,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
       OUT_RELOC(ring, ib->memory->bo, ib->offset + offset, 0, 0);
       OUT_RING(ring, max_indices);
    } else {
-      OUT_PKT7(ring, CP_DRAW_INDX_OFFSET, 3);
-      OUT_RING(ring, initiator | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
-                     CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT));
-      OUT_RING(ring, draw->instance_count);
-      OUT_RING(ring, draw->vertex_count);
+      rd_gfx_draw_auto(ring, draw);
    }
    return true;
 }
@@ -3167,7 +3242,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          for (unsigned j = 0; j < ARRAY_SIZE(pass.cb.attachments); j++)
             pass.cb.attachments[j].write_mask = 0;
          rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2) * 16);
-         rd_gfx_draw(ring, device, render, &pass, &program_cache, true);
+         rd_gfx_draw(ring, device, render, &pass, &program_cache, true, UINT32_MAX);
          rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2 + 1) * 16);
       }
       if (queries && slots[i] >= 0)
@@ -3178,7 +3253,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          OUT_WFI5(ring);
       uint32_t detail = rd_render_detail_begin(ring, timer_bo,
          draw->pipeline == device->clear_pipeline ? RD_RENDER_DETAIL_CLEAR : RD_RENDER_DETAIL_DRAW, i);
-      previous = rd_gfx_draw(ring, device, render, draw, &program_cache, emit_vp) ?
+      previous = rd_gfx_draw(ring, device, render, draw, &program_cache, emit_vp, UINT32_MAX) ?
          recorded : NULL;
       rd_render_detail_end(ring, timer_bo, detail);
       if (queries && slots[i] >= 0)
@@ -3728,7 +3803,319 @@ rd_gmem_emit_msaa_once(struct fd_ringbuffer *ring)
    OUT_PKT4(ring, REG_A5XX_GRAS_SC_RAS_MSAA_CNTL, 2);
    OUT_RING(ring, A5XX_GRAS_SC_RAS_MSAA_CNTL_SAMPLES(MSAA_ONE));
    OUT_RING(ring, A5XX_GRAS_SC_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
-                  A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
+                   A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
+}
+
+static bool
+rd_gmem_fp16_view(const struct rd_render *render, VkFormat format)
+{
+   if (render->layers != 1 || render->view_mask || render->depth.view ||
+       render->stencil.view || render->color_count != 1 || render->color[0].resolve ||
+       render->trailing_barrier ||
+       render->samples != VK_SAMPLE_COUNT_1_BIT || !render->color[0].view)
+      return false;
+   const struct vk_image_view *view = &render->color[0].view->vk;
+   const struct rd_image *image = container_of(view->image, struct rd_image, vk);
+   return view->format == format && image->vk.format == format &&
+      image->vk.samples == VK_SAMPLE_COUNT_1_BIT && image->vk.image_type == VK_IMAGE_TYPE_2D &&
+      image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+      view->view_type == VK_IMAGE_VIEW_TYPE_2D && view->aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+      view->level_count == 1 && view->layer_count == 1 &&
+      !view->base_mip_level && !view->base_array_layer &&
+      image->memory && image->memory->bo && image->memory->bo->handle &&
+      image->native_layout.tile_mode == TILE5_LINEAR;
+}
+
+static bool
+rd_gmem_fp16_draw(const struct rd_draw *draw, const struct rd_image *src,
+                 const struct rd_image *dst, uint32_t *input_slot)
+{
+   const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
+   const struct rd_pipeline *fs = gfx->fs.res;
+   if (draw->barrier || draw->indexed || draw->indirect ||
+       (gfx->state.vi && gfx->state.vi->attributes_valid) ||
+       gfx->vs.res->resource_count || fs->buffer_count || fs->resource_usage.image_count ||
+       fs->sampling_mask || !gfx->fs.v->has_no_side_effects)
+      return false;
+
+   /* The producer cannot read either render target. The consumer may only
+    * read the producer through the one pixel-local input attachment. */
+   uint32_t input = UINT32_MAX;
+   for (unsigned i = 0; i < fs->resource_count; i++) {
+      if (!(fs->resource_usage.descriptors & (UINT64_C(1) << i)))
+         continue;
+      if (!draw->descriptors[1])
+         return false;
+      const struct rd_descriptor *desc = &draw->descriptors[1][i];
+      if (fs->resources[i].type == VK_DESCRIPTOR_TYPE_SAMPLER)
+         continue;
+      if (!desc->image_view)
+         return false;
+      const struct vk_image_view *view = &desc->image_view->vk;
+      if (fs->resources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+         if (!input_slot || input != UINT32_MAX || view->image != &src->vk ||
+             view->format != VK_FORMAT_R16G16B16A16_SFLOAT ||
+             view->aspects != VK_IMAGE_ASPECT_COLOR_BIT || view->view_type != VK_IMAGE_VIEW_TYPE_2D ||
+             view->level_count != 1 || view->layer_count != 1 ||
+             view->base_mip_level || view->base_array_layer ||
+             view->swizzle.r != VK_COMPONENT_SWIZZLE_R || view->swizzle.g != VK_COMPONENT_SWIZZLE_G ||
+             view->swizzle.b != VK_COMPONENT_SWIZZLE_B || view->swizzle.a != VK_COMPONENT_SWIZZLE_A)
+            return false;
+         input = i;
+      } else if (fs->resources[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                 fs->resources[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+         const struct rd_image *image = container_of(view->image, struct rd_image, vk);
+         if (!image->memory || !image->memory->bo || !image->memory->bo->handle ||
+             image->memory->bo->handle == src->memory->bo->handle ||
+             image->memory->bo->handle == dst->memory->bo->handle)
+            return false;
+      } else {
+         return false;
+      }
+   }
+
+   if (!input_slot)
+      return true;
+   if (input == UINT32_MAX || gfx->fs.v->constlen * 4 < RD_GFX_VIEW_DWORD + 4)
+      return false;
+   *input_slot = UINT32_MAX;
+   for (unsigned slot = 0; slot < fs->resource_usage.texture_count; slot++) {
+      if (!(fs->resource_usage.textures & (1u << slot)) || fs->texture_descriptors[slot] != input)
+         continue;
+      if (*input_slot != UINT32_MAX || fs->texture_planes[slot])
+         return false;
+      *input_slot = slot;
+   }
+   return *input_slot != UINT32_MAX;
+}
+
+static void
+rd_gmem_emit_tile(struct fd_ringbuffer *ring, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+   OUT_PKT4(ring, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
+   OUT_RING(ring, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(x) | A5XX_GRAS_SC_WINDOW_SCISSOR_TL_Y(y));
+   OUT_RING(ring, A5XX_GRAS_SC_WINDOW_SCISSOR_BR_X(x + w - 1) |
+                  A5XX_GRAS_SC_WINDOW_SCISSOR_BR_Y(y + h - 1));
+   OUT_PKT4(ring, REG_A5XX_RB_RESOLVE_CNTL_1, 2);
+   OUT_RING(ring, A5XX_RB_RESOLVE_CNTL_1_X(x) | A5XX_RB_RESOLVE_CNTL_1_Y(y));
+   OUT_RING(ring, A5XX_RB_RESOLVE_CNTL_2_X(x + w - 1) | A5XX_RB_RESOLVE_CNTL_2_Y(y + h - 1));
+   OUT_PKT7(ring, CP_SET_VISIBILITY_OVERRIDE, 1);
+   OUT_RING(ring, 0x1);
+   OUT_PKT4(ring, REG_A5XX_RB_WINDOW_OFFSET, 1);
+   OUT_RING(ring, A5XX_RB_WINDOW_OFFSET_X(x) | A5XX_RB_WINDOW_OFFSET_Y(y));
+}
+
+static void
+rd_gmem_bind_tile_target(struct fd_ringbuffer *ring, struct rd_device *device,
+                         const struct rd_render *render, const struct rd_gmem_layout *layout, bool load)
+{
+   uint32_t bin = A5XX_RB_CNTL_WIDTH(layout->bin_w) | A5XX_RB_CNTL_HEIGHT(layout->bin_h);
+   if (load) {
+      OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
+      OUT_RING(ring, bin | A5XX_RB_CNTL_BYPASS);
+      rd_gmem_emit_mrt(ring, device, render, layout, false);
+      rd_gmem_blit(ring, device, render, layout, false);
+      OUT_WFI5(ring);
+   }
+   OUT_PKT4(ring, REG_A5XX_RB_CNTL, 1);
+   OUT_RING(ring, bin);
+   rd_gmem_emit_mrt(ring, device, render, layout, true);
+}
+
+VkResult
+rd_try_gmem_fp16_subpasses(struct rd_device *device, const struct rd_render *src,
+                           const struct rd_render *dst, struct rd_submit_window *window)
+{
+   enum { MAX_DRAWS = 16 };
+   assert(src->gmem_subpass_role == RD_GMEM_SUBPASS_PRODUCER &&
+          dst->gmem_subpass_role == RD_GMEM_SUBPASS_CONSUMER);
+   unsigned draws = util_dynarray_num_elements(&src->draws, struct rd_draw);
+   if (!rd_gmem_enabled(device) || debug_get_option_gmem_stop() > 0 ||
+       !device->gmem_size_valid || !device->gmem_base || (device->gmem_base & 0xfff) ||
+       device->gmem_base >= (UINT64_C(1) << 49) ||
+       device->gmem_size > (UINT64_C(1) << 49) - device->gmem_base ||
+       fd_device_version(device->fd) < FD_VERSION_SOFTPIN ||
+       !device->info.gmem_align_w || !device->info.gmem_align_h ||
+       !draws || draws > MAX_DRAWS || util_dynarray_num_elements(&dst->draws, struct rd_draw) != 1 ||
+       !rd_gmem_fp16_view(src, VK_FORMAT_R16G16B16A16_SFLOAT) ||
+       !rd_gmem_fp16_view(dst, VK_FORMAT_B8G8R8A8_UNORM) ||
+       rd_render_needs_query_accounting(device, src) || rd_render_needs_query_accounting(device, dst))
+      return VK_NOT_READY;
+
+   const struct vk_image_view *sv = &src->color[0].view->vk, *dv = &dst->color[0].view->vk;
+   const struct rd_image *si = container_of(sv->image, struct rd_image, vk);
+   const struct rd_image *di = container_of(dv->image, struct rd_image, vk);
+   const VkImageUsageFlags2KHR src_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+   if (si->vk.create_flags || si->vk.external_handle_types || si->vk.wsi_legacy_scanout ||
+       (si->vk.usage & ~src_usage) || si->memory->bo->handle == di->memory->bo->handle ||
+       sv->extent.width != dv->extent.width || sv->extent.height != dv->extent.height ||
+       (!src->gmem_discard && src->color[0].store != VK_ATTACHMENT_STORE_OP_STORE) ||
+       dst->color[0].load != VK_ATTACHMENT_LOAD_OP_LOAD ||
+       dst->color[0].store != VK_ATTACHMENT_STORE_OP_STORE)
+      return VK_NOT_READY;
+   if (src->color[0].load != VK_ATTACHMENT_LOAD_OP_LOAD && src->color[0].load != VK_ATTACHMENT_LOAD_OP_CLEAR)
+      return VK_NOT_READY;
+
+   const VkRect2D *area = &src->area;
+   if (area->offset.x != dst->area.offset.x || area->offset.y != dst->area.offset.y ||
+       area->extent.width != dst->area.extent.width || area->extent.height != dst->area.extent.height ||
+       area->offset.x < 0 || area->offset.y < 0 || !area->extent.width || !area->extent.height ||
+       (uint64_t)area->offset.x + area->extent.width > sv->extent.width ||
+       (uint64_t)area->offset.y + area->extent.height > sv->extent.height)
+      return VK_NOT_READY;
+
+   const struct rd_draw *convert = util_dynarray_begin(&dst->draws);
+   uint32_t slot;
+   if (!convert->vertex_count || !convert->instance_count || !rd_gmem_fp16_draw(convert, si, di, &slot))
+      return VK_NOT_READY;
+   util_dynarray_foreach(&src->draws, struct rd_draw, draw) {
+      if (!rd_gmem_fp16_draw(draw, si, di, NULL))
+         return VK_NOT_READY;
+   }
+
+   const struct fd_dev_info *info = &device->info;
+   uint32_t minx = area->offset.x & ~(info->gmem_align_w - 1);
+   uint32_t miny = area->offset.y & ~(info->gmem_align_h - 1);
+   uint32_t maxx = MIN2(align(area->offset.x + area->extent.width, info->gmem_align_w), sv->extent.width);
+   uint32_t maxy = MIN2(align(area->offset.y + area->extent.height, info->gmem_align_h), sv->extent.height);
+   struct rd_gmem_layout a;
+   if (!rd_gmem_layout_init(&a, 12, maxx - minx, maxy - miny, info, device->gmem_size))
+      return VK_NOT_READY;
+   a.cpp = 8;
+   struct rd_gmem_layout b = { .bin_w = a.bin_w, .bin_h = a.bin_h, .cpp = 4,
+      .cbuf_base = a.bin_w * a.bin_h * a.cpp };
+   /* The A506's 64x32 tile alignment keeps the second target 16 KiB aligned. */
+   assert(!(b.cbuf_base % (16 * 1024)) && rd_gmem_layout_fits(&b, device->gmem_size));
+
+   struct fd_submit *submit = fd_submit_new(device->pipe);
+   if (!submit)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct fd_ringbuffer *ring = fd_submit_new_ringbuffer(submit, 0, FD_RINGBUFFER_PRIMARY | FD_RINGBUFFER_GROWABLE);
+   struct fd_ringbuffer *produce = fd_submit_new_ringbuffer(submit, 0, FD_RINGBUFFER_GROWABLE);
+   struct fd_ringbuffer *consume = fd_submit_new_ringbuffer(submit, 0, FD_RINGBUFFER_GROWABLE);
+   VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (!ring || !produce || !consume)
+      goto fail;
+   uint32_t *initial_ring_start = ring->start;
+
+   struct rd_gmem_draw_seg src_bounds[MAX_DRAWS], dst_bounds;
+   unsigned nr = 0;
+   struct rd_gfx_program_cache cache = {0};
+   util_dynarray_foreach(&src->draws, struct rd_draw, draw) {
+      if (draw->vertex_count && draw->instance_count &&
+          rd_gfx_draw(produce, device, src, draw, &cache, true, UINT32_MAX))
+         rd_gmem_draw_bounds(src, draw, &src_bounds[nr++]);
+   }
+   if (!rd_gfx_draw(consume, device, dst, convert, NULL, true, slot)) {
+      result = VK_NOT_READY;
+      goto fail;
+   }
+   rd_gmem_draw_bounds(dst, convert, &dst_bounds);
+
+   rd_gfx_restore(ring, device);
+   rd_gfx_depth_buffer(ring, src);
+   OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+   OUT_RING(ring, 0);
+   OUT_PKT4(ring, REG_A5XX_GRAS_CL_CNTL, 1);
+   OUT_RING(ring, 0x00000080);
+   OUT_PKT4(ring, REG_A5XX_PC_POWER_CNTL, 1);
+   OUT_RING(ring, info->num_sp_cores - 1);
+   OUT_PKT4(ring, REG_A5XX_VFD_POWER_CNTL, 1);
+   OUT_RING(ring, info->num_sp_cores - 1);
+   OUT_WFI5(ring);
+   OUT_PKT4(ring, REG_A5XX_RB_CCU_CNTL, 1);
+   OUT_RING(ring, 0x7c13c080);
+   OUT_PKT7(ring, CP_SET_RENDER_MODE, 5);
+   OUT_RING(ring, CP_SET_RENDER_MODE_0_MODE(GMEM));
+   OUT_RING(ring, 0);
+   OUT_RING(ring, 0);
+   OUT_RING(ring, CP_SET_RENDER_MODE_3_GMEM_ENABLE);
+   OUT_RING(ring, 0x1);
+   rd_gmem_emit_msaa_once(ring);
+   rd_gmem_emit_mrt_disabled(ring);
+
+   unsigned tiles = 0, stores = 0;
+   int64_t timer_start = 0;
+   struct fd_bo *timer = rd_render_timer_prepare(device, ring, &timer_start, dv->format,
+      area->extent.width, area->extent.height);
+   for (uint32_t y = miny; y < maxy; y += a.bin_h) {
+      for (uint32_t x = minx; x < maxx; x += a.bin_w) {
+         uint32_t w = MIN2(a.bin_w, maxx - x), h = MIN2(a.bin_h, maxy - y);
+         bool write = rd_gmem_tile_has_draws(src_bounds, nr, x, y, w, h);
+         bool read = rd_gmem_tile_has_draws(&dst_bounds, 1, x, y, w, h);
+         if (!write && !read)
+            continue;
+         rd_gmem_emit_tile(ring, x, y, w, h);
+
+         bool edge = x < (uint32_t)area->offset.x || y < (uint32_t)area->offset.y ||
+            x + w > area->offset.x + area->extent.width || y + h > area->offset.y + area->extent.height;
+         rd_gmem_bind_tile_target(ring, device, src, &a, edge || src->color[0].load == VK_ATTACHMENT_LOAD_OP_LOAD);
+         if (write)
+            rd_gmem_emit_draw_ib(ring, produce);
+         if (write && !src->gmem_discard) {
+            rd_gmem_blit(ring, device, src, &a, true);
+            stores++;
+         }
+         if (read) {
+            /* Make the RB's GMEM writes visible through UCHE. The same
+             * texture address is reused, so evict the preceding tile. */
+            rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
+            rd_flush(device, ring);
+            OUT_PKT4(ring, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN, 5);
+            for (unsigned j = 0; j < 4; j++)
+               OUT_RING(ring, 0);
+            OUT_RING(ring, 0x00000012);
+            OUT_WFI5(ring);
+
+            rd_gmem_bind_tile_target(ring, device, dst, &b, true);
+            rd_gmem_emit_draw_ib(ring, consume);
+            const uint32_t coords[4] = { 0, x, y, 0 };
+            rd_gfx_const(ring, SB4_FS_SHADER, RD_GFX_VIEW_DWORD, 4, coords);
+            rd_emit_gmem_fp16_input(ring, slot, device->gmem_base, a.bin_w, a.bin_h, a.bin_w * a.cpp);
+            rd_gfx_draw_auto(ring, convert);
+            rd_gmem_blit(ring, device, dst, &b, true);
+         }
+         OUT_WFI5(ring);
+         tiles++;
+      }
+   }
+   rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
+   OUT_PKT7(ring, CP_SET_RENDER_MODE, 5);
+   OUT_RING(ring, CP_SET_RENDER_MODE_0_MODE(BYPASS));
+   for (unsigned i = 0; i < 4; i++)
+      OUT_RING(ring, 0);
+   rd_flush(device, ring);
+   if (timer)
+      rd_render_timestamp_emit(ring, timer, 16);
+   rd_submit_classify_render(device, submit, src, NULL);
+   rd_submit_classify_render(device, submit, dst, NULL);
+   fd_ringbuffer_del(produce);
+   fd_ringbuffer_del(consume);
+   if (debug_get_option_gmem_dump())
+      fprintf(stderr, "RADISH_GMEM_FP16_SUBPASS tiles=%u bin=%ux%u source_stores=%u\n",
+              tiles, a.bin_w, a.bin_h, stores);
+   device->render_timing_bo = timer;
+   device->render_timing_start_ns = timer_start;
+   device->render_timing_gmem = true;
+   result = rd_finish_window_submit(device, submit, ring, window, initial_ring_start, true);
+   device->render_timing_bo = NULL;
+   if (timer) {
+      if (!window)
+         rd_render_timing_report(device, timer, timer_start, true, result);
+      fd_bo_del(timer);
+   }
+   return result;
+
+fail:
+   if (produce)
+      fd_ringbuffer_del(produce);
+   if (consume)
+      fd_ringbuffer_del(consume);
+   if (ring)
+      fd_ringbuffer_del(ring);
+   fd_submit_del(submit);
+   return result;
 }
 
 static const struct rd_draw *
@@ -3842,7 +4229,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
       seg->first_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->first_offset = draw_ring->cur - draw_ring->start;
       const struct rd_gfx_pipeline *cached = program_cache.pipeline;
-      rd_gfx_draw(draw_ring, device, render, d, &program_cache, !viewport_reuse);
+      rd_gfx_draw(draw_ring, device, render, d, &program_cache, !viewport_reuse, UINT32_MAX);
       seg->last_chunk = fd_ringbuffer_cmd_count(draw_ring) - 1;
       seg->last_offset = draw_ring->cur - draw_ring->start;
       rd_gmem_draw_bounds(render, d, seg);
@@ -3941,19 +4328,7 @@ rd_execute_render_gmem(struct rd_device *device, const struct rd_render *render,
             continue;
          }
 
-         OUT_PKT4(ring, REG_A5XX_GRAS_SC_WINDOW_SCISSOR_TL, 2);
-         OUT_RING(ring, A5XX_GRAS_SC_WINDOW_SCISSOR_TL_X(x1) |
-                           A5XX_GRAS_SC_WINDOW_SCISSOR_TL_Y(y1));
-         OUT_RING(ring, A5XX_GRAS_SC_WINDOW_SCISSOR_BR_X(x1 + tw - 1) |
-                           A5XX_GRAS_SC_WINDOW_SCISSOR_BR_Y(y1 + th - 1));
-         OUT_PKT4(ring, REG_A5XX_RB_RESOLVE_CNTL_1, 2);
-         OUT_RING(ring, A5XX_RB_RESOLVE_CNTL_1_X(x1) | A5XX_RB_RESOLVE_CNTL_1_Y(y1));
-         OUT_RING(ring, A5XX_RB_RESOLVE_CNTL_2_X(x1 + tw - 1) |
-                           A5XX_RB_RESOLVE_CNTL_2_Y(y1 + th - 1));
-         OUT_PKT7(ring, CP_SET_VISIBILITY_OVERRIDE, 1);
-         OUT_RING(ring, 0x1);
-         OUT_PKT4(ring, REG_A5XX_RB_WINDOW_OFFSET, 1);
-         OUT_RING(ring, A5XX_RB_WINDOW_OFFSET_X(x1) | A5XX_RB_WINDOW_OFFSET_Y(y1));
+          rd_gmem_emit_tile(ring, x1, y1, tw, th);
 
          RD_GMEM_STAGE(tile_prep)
          bool preserve = x1 < (uint32_t)render->area.offset.x ||

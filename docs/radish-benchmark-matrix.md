@@ -13,6 +13,20 @@ process for each row; restart the compositor too when changing its driver option
 | Wave size | Compare `RADISH_WAVESIZE` unset, `double`, and `any`. |
 | Workgroups per chunk | Sweep `RADISH_SHARED_GROUPS` (default `1`, eligible barrier kernels), `RADISH_GROUPS` (default `0`, plain kernels), and `RADISH_BARRIER_GROUPS` (default `0`, barrier kernels) one at a time. The barrier override takes precedence over the shared setting. |
 | Draw snapshots | Compare `RADISH_DRAW_DESCRIPTOR_CACHE=0/1` with `RADISH_DESCRIPTOR_ARENA=1` on a graphics workload. |
+| Tile-local FP16 input | After the pixel test below passes, compare `RADISH_GMEM_FP16_SUBPASS=0/1` with `RADISH_RENDER_BATCH=1` in an isolated Phoc session, then on the real panel. |
+
+**FP16 correctness on the A506:** with the staged Radish ICD selected in
+`VK_DRIVER_FILES`, run:
+
+```sh
+python3 src/freedreno/tests/radish_fp16_render_test.py --include include --gmem-subpasses
+```
+
+Use `--vulkan-library=-l:libvulkan.so.1` if only the versioned loader is
+installed. The probe compares sysmem and GMEM pixels across partial updates,
+verifies that the FP16 attachment can skip stores when allowed, and checks
+that a nonlocal dependency stays on the regular path. Do not enable the
+prototype in the login session if a test fails or the kernel reports a GPU fault.
 
 **Record:** wall-clock time to completion, latency to the first usable result
 from the same start point, Vulkan and low-level submit counts, compute chunk
