@@ -138,7 +138,8 @@ values; a running compositor can also be switched to bypass with a marker file
 | `RADISH_COMPUTE_TAIL_FENCE` | `0` | request a fence fd only on the final batch of an eligible direct compute dispatch at the end of a non-async submit |
 | `RADISH_SUBMIT_DIAG` | `0` | per-submit CPU summary: async selection, fence outcomes, command time, and submit/wait costs |
 | `RADISH_SUBMIT_DIAG_EVERY` | `1` | log only every Nth submit when `RADISH_SUBMIT_DIAG` is on |
-| `RADISH_PENDING_BLOCKING_WAIT` | `0` | block on binary-fence publication instead of polling with 1 ms sleeps; opt-in prototype |
+| `RADISH_PENDING_KERNEL_WAIT` | `1` | where supported, sleep in the kernel until a binary fence is installed, without waiting for GPU completion; `0` uses the legacy fallback |
+| `RADISH_PENDING_BLOCKING_WAIT` | `0` | legacy fallback only: yield while checking for binary-fence publication instead of sleeping 1 ms between checks |
 | `RADISH_BATCH_CHUNKS` | `1` | max compute chunks per submit; `2`/`4`/`8` batch multiple chunks, while eligible dispatches still defer at `1` when async sync is enabled |
 | `RADISH_WINDOW_WAIT_OLDEST` | `1` | drain only the oldest submit-window slot instead of the whole window |
 | `RADISH_GROUPS` | `0` | plain workgroup batching override |

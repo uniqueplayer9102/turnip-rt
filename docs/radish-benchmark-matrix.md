@@ -8,7 +8,7 @@ process for each row; restart the compositor too when changing its driver option
 | Sweep | Settings |
 | --- | --- |
 | Compute batching | `RADISH_BATCH_CHUNKS=1/2/4/8`, with async sync and tail fences off initially. |
-| Queue sync | Repeat the batching rows with `RADISH_ASYNC_QUEUE_SYNC=1`; compare `RADISH_PENDING_BLOCKING_WAIT=0/1` on a workload that waits on pending binary fences. |
+| Queue sync | Repeat the batching rows with `RADISH_ASYNC_QUEUE_SYNC=1`. On a workload with pending binary fences, compare `RADISH_PENDING_KERNEL_WAIT=1` against `=0`. With `=0`, `RADISH_PENDING_BLOCKING_WAIT=0/1` selects the legacy sleep/yield fallback. Include CPU time as well as frame intervals. |
 | Tail fence | Compare `RADISH_COMPUTE_TAIL_FENCE=0/1` with `RADISH_BATCH_CHUNKS=8` and async sync off, using an eligible final direct dispatch and an importable signal sync. |
 | Wave size | Compare `RADISH_WAVESIZE` unset, `double`, and `any`. |
 | Workgroups per chunk | Sweep `RADISH_SHARED_GROUPS` (default `1`, eligible barrier kernels), `RADISH_GROUPS` (default `0`, plain kernels), and `RADISH_BARRIER_GROUPS` (default `0`, barrier kernels) one at a time. The barrier override takes precedence over the shared setting. |

@@ -148,6 +148,9 @@ def main():
             private[private.index('enum rd_command_type {'):private.index('struct rd_transfer {')])
         (directory / 'sync_waits_under_test.h').write_text(
             extract(sync_header, 'vk_sync_waits_have_timeline'))
+        (directory / 'pending_wait_under_test.h').write_text(''.join(
+            extract(device_src, name) for name in ('rd_sync_wait_binary_available',
+                                                    'rd_sync_wait_many')))
         (directory / 'sync_policy_under_test.h').write_text(''.join(
             extract(queue, name) for name in ('rd_compute_can_defer', 'rd_publish_signal_fences',
                                               'rd_compute_tail_batch',
@@ -203,6 +206,7 @@ def main():
         if args.include:
             includes += ['-I', str(args.include)]
         for compiler, source, standard in ((args.cc, 'radish_correctness_unit_test.c', '-std=gnu11'),
+                                            (args.cc, 'radish_pending_wait_test.c', '-std=gnu11'),
                                             (args.cxx, 'radish_cache_metadata_test.cpp', '-std=c++17')):
             binary = directory / Path(source).stem
             subprocess.run([*shlex.split(compiler), standard, '-Wall', '-Wextra', '-Werror', '-O2',

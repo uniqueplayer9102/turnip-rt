@@ -1,9 +1,16 @@
 #include "rd_private.h"
 #include "vk_common_entrypoints.h"
 #include "rd_trace.h"
+#include "drm-uapi/drm.h"
 #include "util/os_time.h"
+#include "util/stack_array.h"
+#include "util/u_sync_provider.h"
+#include <errno.h>
 #include <time.h>
 #include <pwd.h>
+
+DEBUG_GET_ONCE_BOOL_OPTION(pending_kernel_wait, "RADISH_PENDING_KERNEL_WAIT", true)
+DEBUG_GET_ONCE_BOOL_OPTION(pending_blocking_wait, "RADISH_PENDING_BLOCKING_WAIT", false)
 
 static VkResult
 rd_device_get_timestamp(struct vk_device *vk_device, uint64_t *timestamp)
@@ -24,6 +31,64 @@ rd_wake_device_waiters(struct vk_device *device)
    }
 }
 
+static VkResult
+rd_sync_wait_binary_available(struct util_sync_provider *sync, uint32_t count,
+                              const struct vk_sync_wait *waits,
+                              enum vk_sync_wait_flags flags, uint64_t deadline)
+{
+   if (!sync || !sync->timeline_wait)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   STACK_ARRAY(uint32_t, handles, count);
+   STACK_ARRAY(uint64_t, points, count);
+   VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (!handles || !points)
+      goto done;
+
+   for (uint32_t i = 0; i < count; i++) {
+      const struct vk_drm_syncobj *obj = vk_sync_as_drm_syncobj(waits[i].sync);
+      if (!obj) {
+         result = VK_ERROR_FEATURE_NOT_PRESENT;
+         goto done;
+      }
+      handles[i] = obj->syncobj;
+      points[i] = 0;
+   }
+
+   /* Point zero is the binary payload even for the timeline ioctl. Wait
+    * for a fence to be installed, not for the GPU to signal that fence. */
+   unsigned wait_flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE |
+                         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+   if (!(flags & VK_SYNC_WAIT_ANY))
+      wait_flags |= DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
+   int ret = sync->timeline_wait(sync, handles, points, count,
+                                 MIN2(deadline, (uint64_t)INT64_MAX), wait_flags, NULL);
+   switch (ret) {
+   case 0:
+      result = VK_SUCCESS;
+      break;
+   case -ETIME:
+      result = VK_TIMEOUT;
+      break;
+   case -EINVAL:
+   case -ENOTTY:
+   case -EOPNOTSUPP:
+   case -ENOSYS:
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
+      break;
+   case -ENOMEM:
+      break;
+   default:
+      result = VK_ERROR_UNKNOWN;
+      break;
+   }
+
+done:
+   STACK_ARRAY_FINISH(points);
+   STACK_ARRAY_FINISH(handles);
+   return result;
+}
+
 VkResult
 rd_sync_wait_many(struct vk_device *device, uint32_t count,
                    const struct vk_sync_wait *waits,
@@ -33,10 +98,10 @@ rd_sync_wait_many(struct vk_device *device, uint32_t count,
       container_of(device->physical, struct rd_physical_device, vk);
    if (!physical->sync_wait_many)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   bool poll_pending = count && (flags & VK_SYNC_WAIT_PENDING) &&
-      !vk_sync_waits_have_timeline(count, waits);
-   if (poll_pending && debug_get_bool_option("RADISH_PENDING_BLOCKING_WAIT", false))
-      poll_pending = false;
+   bool binary_pending = count && (flags & VK_SYNC_WAIT_PENDING) &&
+       !vk_sync_waits_have_timeline(count, waits);
+   bool kernel_pending = binary_pending && debug_get_option_pending_kernel_wait();
+   bool poll_pending = binary_pending && !debug_get_option_pending_blocking_wait();
    for (;;) {
       if (vk_device_is_lost_no_report(device)) {
          rd_wake_device_waiters(device);
@@ -47,8 +112,15 @@ rd_sync_wait_many(struct vk_device *device, uint32_t count,
                        now + 100000000ull;
       if (slice > deadline)
          slice = deadline;
-      VkResult result = physical->sync_wait_many(device, count, waits, flags,
-                                                 poll_pending ? 0 : slice);
+      VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
+      if (kernel_pending) {
+         result = rd_sync_wait_binary_available(device->sync, count, waits, flags, slice);
+         if (result == VK_ERROR_FEATURE_NOT_PRESENT)
+            kernel_pending = false;
+      }
+      bool poll = !kernel_pending && poll_pending;
+      if (!kernel_pending)
+         result = physical->sync_wait_many(device, count, waits, flags, poll ? 0 : slice);
       if (vk_device_is_lost_no_report(device)) {
          rd_wake_device_waiters(device);
          return VK_ERROR_DEVICE_LOST;
@@ -58,9 +130,9 @@ rd_sync_wait_many(struct vk_device *device, uint32_t count,
          rd_wake_device_waiters(device);
          return VK_ERROR_DEVICE_LOST;
       }
-      if (result != VK_TIMEOUT || (!poll_pending && slice == deadline))
+      if (result != VK_TIMEOUT || (!poll && slice == deadline))
          return result;
-      if (poll_pending) {
+      if (poll) {
          now = os_time_get_nano();
          if (now >= deadline)
             return VK_TIMEOUT;
